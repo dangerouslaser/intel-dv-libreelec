@@ -15,6 +15,23 @@ FFmpeg, libplacebo and the hardware decoder retain their qualified patch series.
 The complete index, including each changed file's purpose, is in
 `config/patch-index.json`. This release contains 31 patches. LibreELEC Settings is unmodified.
 
+### Native DV modesets and the audio engine
+
+`kodi-9999-dv-announce-audio-modeset.patch` tells ActiveAE about the full HDMI
+modesets that enter and leave native DV. These happen on a transactional flip,
+not through `SetFullScreen()`, so the audio engine did not know the display had
+HDMI audio disabled. At stop it reopened the sink during the modeset; the open
+failed and the error state retried it every 500 ms while the display changed
+mode again for the refresh-rate restore. The following refresh-rate
+`OnLostDisplay()` then blocked for 5 s, because ActiveAE only answers it in the
+configured states.
+
+The winsystem now sends display lost to ActiveAE only (not to VideoPlayer,
+which would flush the renderer during teardown) before a flip that changes the
+DV signal, and queues the display reset for the next presented frame. ActiveAE
+answers display lost in every state and, in the error state, stops retrying the
+sink until the display reset arrives.
+
 ### FEL presentation pairing
 
 `kodi-9993-fel-presentation-pairing.patch` fixes stalls and back-and-forth motion
