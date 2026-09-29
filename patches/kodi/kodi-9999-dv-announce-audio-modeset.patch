@@ -40,7 +40,7 @@ index d7af839..b7fe82a 100644
          switch (signal)
          {
 diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
-index fd2d856..c640d96 100644
+index fd2d856..fb7e1bc 100644
 --- a/xbmc/windowing/gbm/WinSystemGbm.cpp
 +++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
 @@ -12,6 +12,7 @@
@@ -67,51 +67,26 @@ index fd2d856..c640d96 100644
    const bool accepted = drm->FlipPageTransactional(valid ? bo : nullptr, restore);
    surface.CompleteTransactionalBuffer(accepted);
    if (accepted && restore)
-@@ -355,8 +365,31 @@ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore)
+@@ -355,6 +365,14 @@ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore)
      surface.EndTransactionalMode();
      state.Restored();
    }
 +  if (accepted && valid)
 +    m_dvSignaled = !restore;
 +
++  // The atomic commit is synchronous: the new signal, including HDMI audio,
++  // is up. Reset directly rather than from the render loop, because at stop
++  // the main thread is blocked in CloseFile() waiting for the audio thread.
 +  if (audio)
-+  {
-+    // Reopen the sink only after the new signal is up (see PresentRender).
-+    auto delay = std::chrono::milliseconds(
-+        CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
-+            "videoscreen.delayrefreshchange") *
-+        100);
-+    m_dvAudioResetTimer.Set(std::max(delay, std::chrono::milliseconds(500)));
-+    m_dvAudioReset = true;
-+  }
++    audio->OnResetDisplay();
    return accepted;
  }
-+
-+void CWinSystemGbm::DispatchDVAudioReset()
-+{
-+  if (!m_dvAudioReset || !m_dvAudioResetTimer.IsTimePast())
-+    return;
-+
-+  m_dvAudioReset = false;
-+  if (auto* audio = dynamic_cast<IDispResource*>(CServiceBroker::GetActiveAE()))
-+    audio->OnResetDisplay();
-+}
  #endif
- 
- void CWinSystemGbm::FlipPage(bool rendered, bool videoLayer, bool async)
 diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
-index 335b3e6..b91d535 100644
+index 335b3e6..77a6cd6 100644
 --- a/xbmc/windowing/gbm/WinSystemGbm.h
 +++ b/xbmc/windowing/gbm/WinSystemGbm.h
-@@ -54,6 +54,7 @@ public:
- #ifdef HAVE_DVBRIDGE
-   bool FlipDVBridgePage(CDVBridgeState& state, bool restore);
-   bool SupportsNativeDVOutput() const;
-+  void DispatchDVAudioReset();
- #endif
- 
-   bool CanDoWindowed() override { return false; }
-@@ -101,6 +102,14 @@ protected:
+@@ -101,6 +101,12 @@ protected:
  
    bool m_dispReset = false;
    XbmcThreads::EndTime<> m_dispResetTimer;
@@ -120,23 +95,7 @@ index 335b3e6..b91d535 100644
 +  // Only ActiveAE is told about it, so it closes the HDMI sink across the
 +  // modeset instead of reopening it while the display has audio disabled.
 +  bool m_dvSignaled = false;
-+  bool m_dvAudioReset = false;
-+  XbmcThreads::EndTime<> m_dvAudioResetTimer;
 +#endif
    std::unique_ptr<CLibInputHandler> m_libinput;
  
  private:
-diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
-index 77d238a..77d6859 100644
---- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
-+++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
-@@ -156,6 +156,9 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
-     return;
- 
- #ifdef HAVE_DVBRIDGE
-+  // The DV branches below return before the ordinary display reset dispatch.
-+  DispatchDVAudioReset();
-+
-   if (m_hdrConversion)
-   {
-     bool presented = false;

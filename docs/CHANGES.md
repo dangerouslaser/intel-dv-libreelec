@@ -28,7 +28,9 @@ configured states.
 
 The winsystem now sends display lost to ActiveAE only (not to VideoPlayer,
 which would flush the renderer during teardown) before a flip that changes the
-DV signal, and queues the display reset for the next presented frame. ActiveAE
+DV signal, and display reset right after the synchronous commit. The reset is
+not left to the render loop: at stop the main thread is blocked in
+`CloseFile()` waiting for the audio thread, which waits for ActiveAE. ActiveAE
 answers display lost in every state and, in the error state, stops retrying the
 sink until the display reset arrives.
 

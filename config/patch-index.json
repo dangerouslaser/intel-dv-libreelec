@@ -346,9 +346,8 @@
     "component": "kodi",
     "summary": "Announce native DV signal modesets to the audio engine",
     "files": {
-      "xbmc/windowing/gbm/WinSystemGbm.cpp": "Send display lost to ActiveAE before a flip that enters or leaves native DV and queue the display reset after it.",
-      "xbmc/windowing/gbm/WinSystemGbm.h": "Track the native DV signal state and the pending audio display reset.",
-      "xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp": "Dispatch the queued audio display reset before the DV presentation paths return.",
+      "xbmc/windowing/gbm/WinSystemGbm.cpp": "Send display lost to ActiveAE before a flip that enters or leaves native DV and display reset right after the synchronous commit.",
+      "xbmc/windowing/gbm/WinSystemGbm.h": "Track the native DV signal state.",
       "xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp": "Answer display lost in every state and stop sink retries in the error state until the display is reset."
     }
   }
