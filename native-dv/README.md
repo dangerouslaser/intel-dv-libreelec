@@ -1,5 +1,8 @@
 # Native source-domain renderer — integration staging
 
+See [LICENSE](LICENSE) and [source references](SOURCES.md) for distribution
+terms, implementation scope and limitations.
+
 This directory is a selected C/OpenCL renderer source set, not a complete Kodi
 or LibreELEC image. It keeps decoded VAAPI surfaces on the GPU, reconstructs
 the source signal, and packs frames with matching metadata for TV-led output.

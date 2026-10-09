@@ -49,6 +49,8 @@ if(NATIVE_DV_BUILD_RENDERER)
     src/source_overlay.cl src/source_tunnel.cl DESTINATION ${CMAKE_INSTALL_DATADIR}/native-dv)
   install(FILES src/dv_source_renderer.h src/source_geometry.h src/source_input.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/native-dv)
+  install(FILES LICENSE SOURCES.md DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/native-dv)
+  install(DIRECTORY LICENSES/ DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/native-dv)
 endif()
 
 if(BUILD_TESTING)
