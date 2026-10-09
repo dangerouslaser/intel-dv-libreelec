@@ -1,0 +1,29 @@
+Integration staging checks,2026-10-09
+
+The selected runtime source set builds with strict Clang C11/O2 warnings,
+ffp-contract=off,DV_PREPARED_CHROMA,DV_ENCODE_STEPS=256,DV_COLOUR_LUT,
+DV_FFMPEG_RAW_EXTENSIONS and matched raw-metadata headers. Link options are
+--no-undefined,-Bsymbolic,SONAME libdv_source_private.so.1.
+
+Rebuilt shared-library SHA256:
+b710a561e975c3234f1f3e9d797150718c187336418d9bab5a6722ef2dbf5be7
+This equals the shared library used in the qualified N150 runtime. The new
+CMake renderer configuration has not yet been used for this full-library
+build;the check used the existing qualified compiler/link command on only
+the exported sources. Do not claim full-image build reproducibility.
+
+Accepted tunnel resource SHA256:
+63789992c2cae2bcb3990e485ebe67f2f39cc0ce58f48f1f4eb4ccde2907d875
+This equals the qualified runtime resource. The optional GUI-tile prototype
+is not included in this resource;DV_OVERLAY_TILES must remain disabled.
+
+CPU tests pass with strict Clang on macOS and through the new CMake Release
+configuration with GCC14.2 on Linux. Assertions remain enabled with -UNDEBUG:
+- order2 structural admission:20 checks
+- geometry:138276 scaled intervals,metadata translation,rejection atomicity
+- output ownership:1000 transitions,quarantine and stale-lease rejection
+
+Required remaining checks include the full CMake renderer build,packaged
+runtime GL/VA sharing and playback,integrated Kodi/YBLOD features,and the
+source/provenance/license publication review. No new GPU accuracy or playback
+result is implied by these CPU/build checks.
