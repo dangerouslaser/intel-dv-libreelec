@@ -42,6 +42,30 @@ The renderer target explicitly retains the qualified O2 optimization level
 instead of CMake's default Release O3. Final CMake-installed library SHA256:
 1349909379b213a59d4bcfae94d1eb1ec65231835338c1f4f66e7bbcade58385
 This separately compiled/linked CMake artifact differs from the original
-single-command build;it is not yet playback-qualified. Its dependencies are
+single-command build. Its dependencies are
 libOpenCL.so.1,libm.so.6,libva.so.2,libc.so.6 with the expected SONAME and
 SYMBOLIC binding,no installed build-directory RUNPATH.
+
+N150 CMake-artifact playback follow-up
+The installed library above and all installed shader resources were selected
+with the packaged Intel runtime. During playback,process mappings confirmed
+the CMake engine,packaged loader,NEO,IGC,IGDFCL and OpenCL-Clang libraries.
+
+P5,P8.4 and P7 FEL each pass6packed-output checks of33177600bytes,zero byte
+differences against CPU packing. Expected final decoded/displayed PTS and
+successful EOF drain pass for all3. This validates packing,not independent
+Dolby reference reconstruction. Diagnostic readback changes playback cost
+and is disabled for performance measurements.
+
+Short controls/pause/paused-seek/resume tests then pass for P8.4 and P7.
+All6windows contain101distinct successful commits,with no backwards commits,
+route exits or queue skips. Maximum PTS gap41667us(P8.4),42001us(P7).
+Render busy percent,clean /controls /closed:
+                         Previous engine    CMake engine     CMake repeat
+P8.4                     50.08/59.51/50.03   50.02/61.29/49.93  not repeated
+P7 FEL                   61.92/73.28/63.49   64.54/73.82/65.33  62.75/70.98/63.13
+The repeated P7 run passes the same cadence/recovery checks. These short,
+approximately scene-matched windows show variability,not a packaging speedup.
+The original optimized-vs-general reconstruction accuracy gates are separate
+from these exported-build/driver checks. Complete image,Kodi integration,
+YBLOD-specific behavior and wider profile qualification remain required.
