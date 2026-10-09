@@ -1,4 +1,4 @@
-# Native source-domain renderer — integration staging
+# Native source-domain renderer — work in progress
 
 See [LICENSE](LICENSE) and [source references](SOURCES.md) for distribution
 terms, implementation scope and limitations.
@@ -7,6 +7,12 @@ This directory is a selected C/OpenCL renderer source set, not a complete Kodi
 or LibreELEC image. It keeps decoded VAAPI surfaces on the GPU, reconstructs
 the source signal, and packs frames with matching metadata for TV-led output.
 The existing library name is retained for adapter ABI compatibility.
+
+The standalone CMake build and short N150 playback/packing checks pass; see
+[BUILD-VALIDATION.txt](BUILD-VALIDATION.txt) for the exact scope and results.
+The Kodi adapter and normal LibreELEC image wiring are still being integrated.
+Building this branch's image does **not yet enable this new renderer**. No
+YBLOD merge or new pre-release image is included in this work-in-progress push.
 
 Build on Linux with CMake, OpenCL headers/loader, libva, and the matching modified
 FFmpeg headers from `CB1/patches/ffmpeg`:
@@ -33,7 +39,7 @@ remain necessary.
 
 The shader bundle pins the accepted tunnel packer, without the rejected GUI
 tile prototype. `DV_OVERLAY_TILES` must remain disabled. No arithmetic changes
-are intended by this export. A source/provenance and license review, a build of
-this exact exported set, and integrated playback qualification are required
-before publication. Do not substitute the earlier test binary as proof that
-this source set was built or qualified.
+are intended by this export. Source references and distribution terms accompany
+the code. The remaining Kodi/YBLOD integration still requires build, feature
+and publication review before an image release. Do not substitute the earlier
+test binary as proof that a future integrated image was built or qualified.
