@@ -1,5 +1,10 @@
 # LibreELEC with Dolby Vision support for Intel and AMD iGPU
 
+> Experimental branch: the [native source-domain engine](native-dv/README.md)
+> and its [Kodi adapter source](native-dv/integration/README.md) are available
+> for development. They are not yet enabled by a normal image build. The
+> existing build and features described below remain separate from that work.
+
 **R1.0.0 Beta1**
 
 LibreELEC Generic x86_64 community build with Dolby Vision playback and HDR10
