@@ -1,5 +1,5 @@
 foreach(name frame_geometry task3_native metadata_transport cm4_bounds presentation_transaction
-             placebo_mapping gles_pack gles_reshape render_lifecycle fel_queue dmabuf_layout metadata_bounds
+             placebo_mapping gles_pack gles_reshape render_lifecycle fel_queue fel_key_match dmabuf_layout metadata_bounds
              policy candidate_identity metadata_eligibility hdr10_ai_contract hdr10_ai_wire_order creative_mapping creative_descriptors creative_cm4)
   add_executable(${name} ${name}.c)
   target_link_libraries(${name} PRIVATE dvbridge_core)

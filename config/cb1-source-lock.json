@@ -160,11 +160,15 @@
     },
     "packages/mediacenter/kodi/cb1/src/dvbridge_fel_seek.h": {
       "source": "src/dvbridge_fel_seek.h",
-      "sha256": "312c117bf0890f2d4cbdd278497b689687ae97af2c43ab8e9a81f2dbb882be19"
+      "sha256": "a913805e13f5939225c7dec7d250fe1fa862efd4e7a801ed1fb971a1a6d7531f"
     },
     "packages/mediacenter/kodi/cb1/src/dvbridge_fel.c": {
       "source": "src/dvbridge_fel.c",
-      "sha256": "c61bd7a7f2f7dba5b134ef27c15ea6fc959e5489959ba25cc0440037e41b6b28"
+      "sha256": "7c6991db2cfff877e21e9110227e912def5d066d98a8166c33a179d9701d18f0"
+    },
+    "packages/mediacenter/kodi/cb1/src/dvbridge_fel_key_match.h": {
+      "source": "src/dvbridge_fel_key_match.h",
+      "sha256": "d8277b5fa1b9e3da16f39e504a0217ee6c3cf31720ba28c1e79bedfae2e0d5a8"
     },
     "packages/mediacenter/kodi/cb1/src/dvbridge_fel.h": {
       "source": "src/dvbridge_fel.h",

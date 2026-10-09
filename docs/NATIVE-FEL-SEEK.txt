@@ -1,0 +1,28 @@
+FEL seek integration checkpoint
+==============================
+
+The native-source branch includes bounded matching of base/enhancement
+picture-order sets when their random-access pictures arrive in different
+packets. Both the seek probe and decoder synchronization use the same helper.
+Pictures are still paired by exact presentation timestamp; neighbouring
+surfaces are never substituted. Existing queue and preroll bounds remain.
+
+Validation, 2026-10-09:
+- The standalone key-match test passed with Clang C11/O2 and strict warnings.
+  It covers reversed order for sizes 1 through 32, missing pictures,
+  duplicate pictures, invalid parser values, and rejected sizes 0 and 33.
+- The existing fel_queue test was cross-compiled with the LibreELEC SDK and
+  ran successfully on the N150 against the matched FFmpeg runtime. It checks
+  real synthetic HEVC splitting, immutable packets, exact timestamps, queue
+  bounds, frame ownership across reset, EOF, and injected decoder errors.
+  Decoder calls are deterministic test replacements, not a GPU performance
+  measurement. This fixture does not exercise staggered random-access points.
+- The source staging check passed for all 78 locked files.
+
+An initial queue-test run against a separate minimal FFmpeg build failed at
+setup because the required splitter was unavailable. That is not counted as
+a passing run; the matched LibreELEC run above is the qualification evidence.
+
+This checkpoint does not qualify the newly merged Kodi adapter or a complete
+LibreELEC image. Integrated startup, seek, controls, EOF, accuracy and P7
+performance checks remain required before releasing that image.

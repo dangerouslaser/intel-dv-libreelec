@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Split and hardware-decode the enhancement layer; pair surfaces by exact presentation time. */
 #include "dvbridge_fel.h"
+#include "dvbridge_fel_key_match.h"
 #include <libavcodec/bsf.h>
 #include <libavutil/hwcontext.h>
 #include <limits.h>
@@ -60,6 +61,11 @@ struct dvbridge_fel {
     bool synchronizing;
     int64_t anchor_pts;
     unsigned preroll_packets;
+    bool sync_key, sync_el_key;
+    unsigned sync_key_age;
+    int sync_key_poc;
+    int64_t sync_key_identity, sync_key_pts;
+    int sync_base_poc[QUEUE_MAX], sync_el_poc[QUEUE_MAX];
 };
 
 static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
@@ -83,16 +89,24 @@ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixe
     return AV_PIX_FMT_VAAPI;
 }
 
-static void clear_queues(struct dvbridge_fel *f)
+static void clear_packets(struct dvbridge_fel *f)
 {
     for (unsigned i = 0; i < f->num_packets; ++i)
         av_packet_free(&f->packets[i]);
+    f->num_packets = 0;
+    f->packet_bytes = 0;
+}
+
+static void clear_queues(struct dvbridge_fel *f)
+{
+    clear_packets(f);
     for (unsigned i = 0; i < f->num_frames; ++i)
         av_frame_free(&f->frames[i]);
     f->num_packets = f->num_frames = 0;
     f->packet_bytes = 0;
     f->failed = f->draining = f->sent_eof = f->eof = false;
     f->num_times = 0;
+    f->sync_key = f->sync_el_key = false;
 }
 
 void dvbridge_fel_reset(struct dvbridge_fel *f)
@@ -211,6 +225,8 @@ static bool pump(struct dvbridge_fel *f)
 {
     if (f->failed)
         return false;
+    if (f->synchronizing)
+        return true;
     if (!f->opened)
         return true;
     if (!receive_frames(f))
@@ -283,6 +299,27 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
     int64_t base_identity;
     if (f->num_times == MAP_MAX || !picture_identity(&f->base_order, packet, &base_identity))
         goto fail;
+    if (f->synchronizing) {
+        if (f->sync_el_key && ++f->sync_key_age >= QUEUE_MAX) {
+            clear_packets(f);
+            f->sync_key = f->sync_el_key = false;
+            f->num_times = 0;
+        }
+        /* An early EL candidate retains the timestamp map across the BL key. */
+        if (!f->sync_el_key && f->base_order.parser->key_frame == 1) {
+            f->sync_key = true;
+            f->sync_key_age = 0;
+            f->sync_key_poc = f->base_order.parser->output_picture_number;
+            f->sync_key_identity = base_identity;
+            f->sync_key_pts = packet->pts;
+            for (unsigned i = 0; i < QUEUE_MAX; ++i)
+                f->sync_base_poc[i] = f->sync_el_poc[i] = INT_MIN;
+            f->num_times = 0;
+        } else if (!f->sync_el_key && (!f->sync_key || ++f->sync_key_age >= QUEUE_MAX)) {
+            f->sync_key = false;
+            f->num_times = 0;
+        }
+    }
     for (unsigned i = 0; i < f->num_times; ++i)
         if (f->times[i].order == base_identity)
             goto fail;
@@ -306,34 +343,95 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
                 return pump(f);
             goto fail;
         }
+        int64_t enhancement_identity;
         if (f->num_packets == QUEUE_MAX || copy->size <= 0 ||
             (size_t)copy->size > PACKET_BYTES_MAX - f->packet_bytes ||
-            !picture_identity(&f->enhancement_order, copy, &f->packet_order[f->num_packets])) {
+            !picture_identity(&f->enhancement_order, copy, &enhancement_identity)) {
             av_packet_free(&copy);
             goto fail;
         }
         if (f->synchronizing) {
-            const AVCodecParserContext *bp = f->base_order.parser;
             const AVCodecParserContext *ep = f->enhancement_order.parser;
-            bool common_key = bp->key_frame == 1 && ep->key_frame == 1 &&
-                              bp->output_picture_number == ep->output_picture_number;
+            if (f->sync_key) {
+                f->sync_base_poc[f->sync_key_age] = f->base_order.parser->output_picture_number;
+                f->sync_el_poc[f->sync_key_age] = ep->output_picture_number;
+            }
+            bool common_key = f->sync_key && !f->sync_el_key && ep->key_frame == 1 &&
+                              f->sync_key_poc == ep->output_picture_number &&
+                              dvbridge_fel_key_match(f->sync_base_poc, f->sync_el_poc,
+                                                    f->sync_key_age + 1);
+            bool early_key = f->sync_key && f->sync_el_key &&
+                             f->base_order.parser->key_frame == 1 &&
+                             f->sync_key_poc == f->base_order.parser->output_picture_number &&
+                             dvbridge_fel_key_match(f->sync_base_poc, f->sync_el_poc,
+                                                   f->sync_key_age + 1);
             /* A non-reordered BL gives the IDR packet an unambiguous display
              * time. Never use this shortcut for a BL with reordered pictures. */
             bool el_idr = ep->key_frame == 1 && ep->output_picture_number == 0 &&
                           f->base_order.context->has_b_frames == 0;
-            if (!common_key && !el_idr) {
-                av_packet_free(&copy);
-                f->num_times = 0;
-                if (++f->preroll_packets > 1024)
+            if (!common_key && !early_key && !el_idr) {
+                if (++f->preroll_packets > 1024) {
+                    av_packet_free(&copy);
                     goto fail;
-                continue;
+                }
+                if (ep->key_frame == 1) {
+                    clear_packets(f);
+                    f->sync_key = f->sync_el_key = true;
+                    f->sync_key_age = 0;
+                    f->sync_key_poc = ep->output_picture_number;
+                    for (unsigned i = 0; i < QUEUE_MAX; ++i)
+                        f->sync_base_poc[i] = f->sync_el_poc[i] = INT_MIN;
+                    f->sync_base_poc[0] = f->base_order.parser->output_picture_number;
+                    f->sync_el_poc[0] = ep->output_picture_number;
+                    f->num_times = 1;
+                    f->times[0].order = base_identity;
+                    f->times[0].pts = packet->pts;
+                }
+                if (!f->sync_el_key) {
+                    av_packet_free(&copy);
+                    if (!f->sync_key) f->num_times = 0;
+                    continue;
+                }
+            } else if (early_key) {
+                if (f->num_packets != f->sync_key_age) {
+                    av_packet_free(&copy);
+                    goto fail;
+                }
+                /* All buffered pictures now have a proven BL identity. */
+                for (unsigned i = 0; i <= f->num_packets; ++i) {
+                    int64_t delta = (int64_t)f->sync_el_poc[i] - f->sync_key_poc;
+                    if ((delta > 0 && base_identity > INT64_MAX - delta) ||
+                        (delta < 0 && base_identity < INT64_MIN - delta)) {
+                        av_packet_free(&copy);
+                        goto fail;
+                    }
+                    f->packet_order[i] = base_identity + delta;
+                }
+                enhancement_identity = f->packet_order[f->num_packets];
+                int64_t delta = -(int64_t)f->sync_key_poc;
+                if ((delta > 0 && base_identity > INT64_MAX - delta) ||
+                    (delta < 0 && base_identity < INT64_MIN - delta)) {
+                    av_packet_free(&copy);
+                    goto fail;
+                }
+                f->enhancement_order.offset = base_identity + delta;
+                f->enhancement_order.maximum = base_identity;
+                for (unsigned i = 0; i <= f->num_packets; ++i)
+                    if (f->packet_order[i] > f->enhancement_order.maximum)
+                        f->enhancement_order.maximum = f->packet_order[i];
+                f->anchor_pts = packet->pts;
+                f->synchronizing = false;
+            } else {
+                clear_packets(f);
+                int64_t anchor = common_key ? f->sync_key_identity : base_identity;
+                f->enhancement_order.offset = anchor - ep->output_picture_number;
+                f->enhancement_order.maximum = anchor;
+                enhancement_identity = anchor;
+                f->anchor_pts = common_key ? f->sync_key_pts : packet->pts;
+                f->synchronizing = false;
             }
-            f->enhancement_order.offset = base_identity - ep->output_picture_number;
-            f->enhancement_order.maximum = base_identity;
-            f->packet_order[f->num_packets] = base_identity;
-            f->anchor_pts = packet->pts;
-            f->synchronizing = false;
         }
+        f->packet_order[f->num_packets] = enhancement_identity;
         f->packet_bytes += copy->size;
         f->packets[f->num_packets++] = copy;
     }

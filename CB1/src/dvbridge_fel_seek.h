@@ -6,6 +6,7 @@
 #include <libavutil/time.h>
 #include <limits.h>
 #include <stdbool.h>
+#include "dvbridge_fel_key_match.h"
 
 /* Header-only bounded random-access probe. The caller must perform its final
  * av_seek_frame after this probe, including on failure. No pixels are decoded.
@@ -30,6 +31,11 @@ static int64_t dvbridge_fel_seek_point(AVFormatContext *format, int video, int64
         AVCodecContext *bc = avcodec_alloc_context3(NULL), *ec = avcodec_alloc_context3(NULL);
         AVPacket *packet = av_packet_alloc(), *el = av_packet_alloc();
         int64_t base_key = AV_NOPTS_VALUE;
+        int64_t candidate_entry = AV_NOPTS_VALUE;
+        int base_key_poc = INT_MIN;
+        bool early_el = false;
+        unsigned key_age = 0, beyond_target = 0;
+        int base_pocs[32], el_pocs[32];
         if (!bp || !ep || !bc || !ec || !packet || !el ||
             av_bsf_list_parse_str("dovi_split=mode=el", &split) < 0 ||
             avcodec_parameters_copy(split->par_in, stream->codecpar) < 0)
@@ -48,28 +54,61 @@ static int64_t dvbridge_fel_seek_point(AVFormatContext *format, int video, int64
             if (packet->stream_index != video) { av_packet_unref(packet); continue; }
             int64_t pts = packet->pts;
             if (pts == AV_NOPTS_VALUE) { av_packet_unref(packet); break; }
-            if (pts > target) { av_packet_unref(packet); break; }
+            if (pts > target && ++beyond_target >= 32) { av_packet_unref(packet); break; }
             uint8_t *out; int size;
             bp->output_picture_number = INT_MIN;
             if (av_parser_parse2(bp,bc,&out,&size,packet->data,packet->size,
                                  pts,packet->dts,packet->pos) != packet->size ||
                 !size || bp->output_picture_number == INT_MIN)
                 break;
-            if (bp->key_frame == 1) base_key = pts;
+            bool base_is_key = bp->key_frame == 1 && pts <= target;
+            if (base_is_key)
+                base_key = pts;
+            if (early_el && ++key_age >= 32) {
+                early_el = false;
+                base_key_poc = INT_MIN;
+            }
+            if (!early_el && base_is_key) {
+                base_key_poc = bp->output_picture_number;
+                candidate_entry = pts;
+                key_age = 0;
+                for (unsigned i = 0; i < 32; ++i) base_pocs[i] = el_pocs[i] = INT_MIN;
+            } else if (!early_el && ++key_age >= 32) {
+                base_key_poc = INT_MIN;
+            }
             if (av_bsf_send_packet(split, packet) < 0) break;
             while (av_bsf_receive_packet(split, el) >= 0) {
                 ep->output_picture_number = INT_MIN;
                 int used = av_parser_parse2(ep,ec,&out,&size,el->data,el->size,pts,el->dts,el->pos);
-                bool common = bp->key_frame == 1 && ep->key_frame == 1 &&
-                              bp->output_picture_number == ep->output_picture_number;
-                bool idr = stream->codecpar->video_delay == 0 && ep->key_frame == 1 &&
+                if (base_key_poc != INT_MIN) {
+                    base_pocs[key_age] = bp->output_picture_number;
+                    el_pocs[key_age] = ep->output_picture_number;
+                }
+                bool common = base_key_poc != INT_MIN &&
+                              (early_el ? base_is_key && base_key_poc == bp->output_picture_number :
+                               ep->key_frame == 1 && base_key_poc == ep->output_picture_number) &&
+                              dvbridge_fel_key_match(base_pocs, el_pocs, key_age + 1);
+                bool idr = pts <= target && stream->codecpar->video_delay == 0 && ep->key_frame == 1 &&
                            ep->output_picture_number == 0;
-                if (used == el->size && size > 0 && base_key != AV_NOPTS_VALUE && (common || idr))
-                    found = base_key;
+                if (used == el->size && size > 0 && ep->output_picture_number != INT_MIN) {
+                    if (common && candidate_entry != AV_NOPTS_VALUE)
+                        found = candidate_entry;
+                    else if (idr && base_key != AV_NOPTS_VALUE)
+                        found = base_key;
+                    else if (ep->key_frame == 1) {
+                        early_el = true;
+                        base_key_poc = ep->output_picture_number;
+                        candidate_entry = base_key;
+                        key_age = 0;
+                        for (unsigned i = 0; i < 32; ++i) base_pocs[i] = el_pocs[i] = INT_MIN;
+                        base_pocs[0] = bp->output_picture_number;
+                        el_pocs[0] = ep->output_picture_number;
+                    }
+                }
                 av_packet_unref(el);
             }
             av_packet_unref(packet);
-            if (windows[attempt] == 0 || pts == target) break;
+            if (found != AV_NOPTS_VALUE || (windows[attempt] == 0 && count >= 31)) break;
         }
 cleanup:
         av_packet_free(&packet); av_packet_free(&el);
