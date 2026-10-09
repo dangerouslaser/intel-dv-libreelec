@@ -13,6 +13,9 @@ The standalone CMake build and short N150 playback/packing checks pass; see
 The Kodi adapter and normal LibreELEC image wiring are still being integrated.
 Building this branch's image does **not yet enable this new renderer**. No
 YBLOD merge or new pre-release image is included in this work-in-progress push.
+`packages/graphics/native-dv/package.mk` packages the bundled source and its
+runtime dependencies; it is not yet a dependency of Kodi. Changes under
+`native-dv/` participate in LibreELEC's package rebuild stamp.
 
 Build on Linux with CMake, OpenCL headers/loader, libva, and the matching modified
 FFmpeg headers from `CB1/patches/ffmpeg`:
