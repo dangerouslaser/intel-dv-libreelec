@@ -19,6 +19,10 @@ CPU contract tests can be built without those playback dependencies using
 specialization gate, geometry and output-slot ownership; they are not movie
 playback, GPU accuracy or Dolby conformance tests.
 
+If pkg-config points to stock FFmpeg headers, provide the matching include
+root with `-DNATIVE_DV_FFMPEG_INCLUDE_DIR=/path/to/matched/include`. It takes
+precedence for both the configuration probe and the renderer compilation.
+
 The renderer does not silently accept unmodified FFmpeg headers: the raw RPU
 extension fields are required to preserve metadata. Matching headers alone do
 not establish the decoder's runtime ABI; integrated producer/consumer tests

@@ -27,3 +27,21 @@ Required remaining checks include the full CMake renderer build,packaged
 runtime GL/VA sharing and playback,integrated Kodi/YBLOD features,and the
 source/provenance/license publication review. No new GPU accuracy or playback
 result is implied by these CPU/build checks.
+
+Full CMake build/install follow-up
+Clang21.1.8 with CMake4.4.3 now configures,builds all renderer objects and
+installs the shared library,5shader resources and3public headers. All3CTest
+contracts pass. An explicit NATIVE_DV_FFMPEG_INCLUDE_DIR supplies matching
+headers before stock pkg-config headers,for both probe and library. Removing
+that option from an already successful build fails the metadata probe as
+required;restoring it succeeds. The probe is rerun rather than cached across
+header changes. Use a fresh build directory after changing global compiler
+flags,since CMake caches compiler implicit include directories.
+
+The renderer target explicitly retains the qualified O2 optimization level
+instead of CMake's default Release O3. Final CMake-installed library SHA256:
+1349909379b213a59d4bcfae94d1eb1ec65231835338c1f4f66e7bbcade58385
+This separately compiled/linked CMake artifact differs from the original
+single-command build;it is not yet playback-qualified. Its dependencies are
+libOpenCL.so.1,libm.so.6,libva.so.2,libc.so.6 with the expected SONAME and
+SYMBOLIC binding,no installed build-directory RUNPATH.
