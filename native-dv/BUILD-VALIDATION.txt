@@ -1,0 +1,112 @@
+Integration staging checks,2026-10-09
+
+The selected runtime source set builds with strict Clang C11/O2 warnings,
+ffp-contract=off,DV_PREPARED_CHROMA,DV_ENCODE_STEPS=256,DV_COLOUR_LUT,
+DV_FFMPEG_RAW_EXTENSIONS and matched raw-metadata headers. Link options are
+--no-undefined,-Bsymbolic,SONAME libdv_source_private.so.1.
+
+Rebuilt shared-library SHA256:
+b710a561e975c3234f1f3e9d797150718c187336418d9bab5a6722ef2dbf5be7
+This equals the shared library used in the qualified N150 runtime. The new
+CMake renderer configuration has not yet been used for this full-library
+build;the check used the existing qualified compiler/link command on only
+the exported sources. Do not claim full-image build reproducibility.
+
+Accepted tunnel resource SHA256:
+63789992c2cae2bcb3990e485ebe67f2f39cc0ce58f48f1f4eb4ccde2907d875
+This equals the qualified runtime resource. The optional GUI-tile prototype
+is not included in this resource;DV_OVERLAY_TILES must remain disabled.
+
+CPU tests pass with strict Clang on macOS and through the new CMake Release
+configuration with GCC14.2 on Linux. Assertions remain enabled with -UNDEBUG:
+- order2 structural admission:20 checks
+- geometry:138276 scaled intervals,metadata translation,rejection atomicity
+- output ownership:1000 transitions,quarantine and stale-lease rejection
+
+Required remaining checks include the full CMake renderer build,packaged
+runtime GL/VA sharing and playback,integrated Kodi/YBLOD features,and the
+source/provenance/license publication review. No new GPU accuracy or playback
+result is implied by these CPU/build checks.
+
+Full CMake build/install follow-up
+Clang21.1.8 with CMake4.4.3 now configures,builds all renderer objects and
+installs the shared library,5shader resources and3public headers. All3CTest
+contracts pass. An explicit NATIVE_DV_FFMPEG_INCLUDE_DIR supplies matching
+headers before stock pkg-config headers,for both probe and library. Removing
+that option from an already successful build fails the metadata probe as
+required;restoring it succeeds. The probe is rerun rather than cached across
+header changes. Use a fresh build directory after changing global compiler
+flags,since CMake caches compiler implicit include directories.
+
+The renderer target explicitly retains the qualified O2 optimization level
+instead of CMake's default Release O3. Final CMake-installed library SHA256:
+1349909379b213a59d4bcfae94d1eb1ec65231835338c1f4f66e7bbcade58385
+This separately compiled/linked CMake artifact differs from the original
+single-command build. Its dependencies are
+libOpenCL.so.1,libm.so.6,libva.so.2,libc.so.6 with the expected SONAME and
+SYMBOLIC binding,no installed build-directory RUNPATH.
+
+N150 CMake-artifact playback follow-up
+The installed library above and all installed shader resources were selected
+with the packaged Intel runtime. During playback,process mappings confirmed
+the CMake engine,packaged loader,NEO,IGC,IGDFCL and OpenCL-Clang libraries.
+
+P5,P8.4 and P7 FEL each pass6packed-output checks of33177600bytes,zero byte
+differences against CPU packing. Expected final decoded/displayed PTS and
+successful EOF drain pass for all3. This validates packing,not independent
+Dolby reference reconstruction. Diagnostic readback changes playback cost
+and is disabled for performance measurements.
+
+Short controls/pause/paused-seek/resume tests then pass for P8.4 and P7.
+All6windows contain101distinct successful commits,with no backwards commits,
+route exits or queue skips. Maximum PTS gap41667us(P8.4),42001us(P7).
+Render busy percent,clean /controls /closed:
+                         Previous engine    CMake engine     CMake repeat
+P8.4                     50.08/59.51/50.03   50.02/61.29/49.93  not repeated
+P7 FEL                   61.92/73.28/63.49   64.54/73.82/65.33  62.75/70.98/63.13
+The repeated P7 run passes the same cadence/recovery checks. These short,
+approximately scene-matched windows show variability,not a packaging speedup.
+The original optimized-vs-general reconstruction accuracy gates are separate
+from these exported-build/driver checks. Complete image,Kodi integration,
+YBLOD-specific behavior and wider profile qualification remain required.
+
+2026-10-10 polynomial chroma with FEL residuals
+The dual-layer path now selects polynomial or MMR per chroma component.
+Polynomial tables preserve the mapped Q16 value and signed FEL residual;
+the existing GPU table-add kernel rounds/clamps to 12-bit only after addition.
+EL decoding, pairing, phase preparation and scaling are unchanged. There is
+no single-layer substitution or pixel readback in playback.
+
+CPU regression: 6,291,456 BL/EL combinations, covering identity/piecewise
+quadratic curves, endpoint clamps, signed correction and residual-disabled
+metadata. Independent identity/deadzone expectations also pass. Invalid
+mapping leaves prepared tables unchanged; the MMR preparer rejects polynomial.
+
+Intel GPU regression on 192.168.1.175: 32 combinations of half/equal EL size,
+both phase settings, polynomial/MMR channel pairings and piecewise curves.
+98,304 output samples match scalar spatial/composer reference exactly;
+16,344 polynomial chroma samples differ from their neutral-EL result.
+Both baseline and packaged optimization settings pass. Existing structural,
+geometry and scanout tests pass. This is implementation consistency, not
+licensed Dolby conformance or an independent HDMI capture comparison.
+
+Previously black DT/DL P7 CMV4.0 4000nits v3 clip: initial fixed candidate
+completed with processed=1458, presented=1458 and zero renderer rejections.
+Logged cumulative engine processing mean at frame1440: 7.502 ms/frame.
+This includes submit/present service, not complete decode-to-display latency;
+it is not an old-versus-new speed comparison (old build presented zero frames).
+Final library SHA256:
+c741e415b7d3023dd3d872cfb561284c11a687f72d8c28952331d6be0f99dbfc
+Final OpenCL source SHA256:
+afa2b7618d6584729add2e4d948a258ce5a0007ae001365dbb07423278c01027
+The shared table-add kernel rejects filter overshoot before indexing either
+1024-entry table. A deliberate ringing fixture returns DV_SAMPLE_RANGE;
+all 32 valid GPU cases still match with both optimization configurations.
+The final library/resources also pass a live replay: first480frames averaged
+7.626 ms engine processing, no renderer rejection, direct GPU surfaces and
+asynchronous prefetch active. Visual TV confirmation is a separate user check.
+That final replay completed: processed=1458, presented=1458, no renderer
+rejections; cumulative processing mean at frame1440 was7.562 ms. The exhaustive
+CPU regression also passes GCC AddressSanitizer/UndefinedBehaviorSanitizer
+on Ollie. The macOS ASan runtime stalled during initialization before main;
+that process was stopped and is not counted as a test result.

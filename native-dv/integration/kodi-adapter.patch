@@ -1,0 +1,2686 @@
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index 79cc9a92..a2985ef5 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -1536,6 +1536,8 @@ void CApplication::UnlockFrameMoveGuard()
+ void CApplication::FrameMove(bool processEvents, bool processGUI)
+ {
+   const auto appPlayer = GetComponent<CApplicationPlayer>();
++  bool nativeGuiSkip = false;
++  uint64_t nativeGuiGeneration = 0;
+   bool renderGUI = GetComponent<CApplicationPowerHandling>()->GetRenderGUI();
+   if (processEvents)
+   {
+@@ -1630,10 +1632,24 @@ void CApplication::FrameMove(bool processEvents, bool processGUI)
+     if (!m_skipGuiRender && appPlayer->IsRenderingVideoLayer() &&
+         !CServiceBroker::GetGUI()->GetWindowManager().HasDirtyRegions())
+       m_skipGuiRender = true;
++    if (!m_skipGuiRender &&
++        CServiceBroker::GetWinSystem()->GetGfxContext().IsFullScreenVideo() &&
++        CServiceBroker::GetWinSystem()->CanReuseGuiComposite() &&
++        !CServiceBroker::GetGUI()->GetWindowManager().HasDirtyRegions())
++    {
++      nativeGuiSkip = true;
++      m_skipGuiRender = true;
++      nativeGuiGeneration = CServiceBroker::GetGUI()->GetWindowManager().GetDirtyGeneration();
++    }
+     CServiceBroker::GetGUI()->GetWindowManager().FrameMove();
+   }
+ 
+   appPlayer->FrameMove();
++  // Subtitle preparation can invalidate the GUI after its Process pass.
++  if (nativeGuiSkip &&
++      (!CServiceBroker::GetWinSystem()->CanReuseGuiComposite() ||
++       nativeGuiGeneration != CServiceBroker::GetGUI()->GetWindowManager().GetDirtyGeneration()))
++    m_skipGuiRender = false;
+ 
+   // this will go away when render systems gets its own thread
+   CServiceBroker::GetWinSystem()->DriveRenderLoop();
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 153ae536..f473861d 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -441,6 +441,26 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+     }
+   }
+ 
++  if (hints.hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION)
++  {
++    size_t configSize = 0;
++    AVDOVIDecoderConfigurationRecord* config = av_dovi_alloc(&configSize);
++    if (!config)
++    {
++      avcodec_free_context(&m_pCodecContext);
++      return false;
++    }
++    *config = hints.dovi;
++    if (!av_packet_side_data_add(&m_pCodecContext->coded_side_data,
++                                 &m_pCodecContext->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF,
++                                 config, configSize, 0))
++    {
++      av_free(config);
++      avcodec_free_context(&m_pCodecContext);
++      return false;
++    }
++  }
++
+   // advanced setting override for skip loop filter (see avcodec.h for valid options)
+   //! @todo allow per video setting?
+   int iSkipLoopFilter = CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_iSkipLoopFilter;
+@@ -1000,6 +1020,10 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetBasePicture(VideoPicture* pVid
+         return VC_ERROR;
+     }
+ 
++    // A decoded frame was consumed, but hardware may still be filling its queue.
++    // During drain, continue until FFmpeg and the hardware reach their EOFs.
++    if (ret == VC_BUFFER && (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN))
++      return VC_NONE;
+     return ret;
+   }
+   // process filters for sw decoding
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 9381779b..7ae60f12 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -2406,6 +2406,15 @@ void CVideoPlayer::HandlePlaySpeed()
+       }
+ 
+       m_syncStartPtsWait.reset();
++#ifdef HAVE_DVBRIDGE
++      const char* startupTrace = std::getenv("DV_PRIVATE_FRAME_TIMING");
++      if (startupTrace && std::strcmp(startupTrace, "1") == 0)
++        CLog::Log(LOGINFO,
++            "Private source startup sync: clock={} video_start={} video_cache={} audio_start={} audio_cache={}",
++            clock, m_CurrentVideo.starttime, m_CurrentVideo.cachetime,
++            m_CurrentAudio.id >= 0 ? m_CurrentAudio.starttime : DVD_NOPTS_VALUE,
++            m_CurrentAudio.id >= 0 ? m_CurrentAudio.cachetime : 0.0);
++#endif
+       m_clock.Discontinuity(clock);
+       m_CurrentAudio.syncState = IDVDStreamPlayer::SYNC_INSYNC;
+       m_CurrentAudio.avsync = CCurrentStream::AV_SYNC_NONE;
+@@ -4538,6 +4547,17 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+ 
+   m_HasVideo = true;
+ 
++#ifdef HAVE_DVBRIDGE
++  const char* earlyFullscreen = std::getenv("DV_PRIVATE_STARTUP_FULLSCREEN");
++  if (m_CurrentVideo.id < 0 && m_playerOptions.fullscreen &&
++      DVBRIDGE::WantsNativeOutput(hint) && earlyFullscreen &&
++      std::strcmp(earlyFullscreen, "1") == 0)
++  {
++    // Prepare the playback GUI before native setup releases the playback clock.
++    CServiceBroker::GetAppMessenger()->PostMsg(TMSG_SWITCHTOFULLSCREEN);
++  }
++#endif
++
+   static_cast<IDVDStreamPlayerVideo*>(player)->SendMessage(
+       std::make_shared<CDVDMsg>(CDVDMsg::PLAYER_REQUEST_STATE), 1);
+ 
+@@ -5683,6 +5703,20 @@ void CVideoPlayer::UpdatePlayState(double timeout)
+ 
+   SPlayerState state(m_State);
+ 
++#ifdef HAVE_DVBRIDGE
++  const char* avTiming = std::getenv("DV_PRIVATE_AV_TIMING");
++  if (avTiming && std::strcmp(avTiming, "1") == 0 &&
++      m_CurrentAudio.id >= 0 && m_CurrentVideo.id >= 0)
++  {
++    const double audioPts = m_VideoPlayerAudio->GetCurrentPts();
++    const double videoPts = m_VideoPlayerVideo->GetCurrentPts();
++    if (audioPts != DVD_NOPTS_VALUE && videoPts != DVD_NOPTS_VALUE)
++      CLog::Log(LOGINFO,
++          "Private source AV timing: audio_pts={} video_pts={} delta_ms={} speed={}",
++          audioPts, videoPts, DVD_TIME_TO_MSEC(audioPts - videoPts), m_playSpeed);
++  }
++#endif
++
+   state.dts = DVD_NOPTS_VALUE;
+   if (m_CurrentVideo.dts != DVD_NOPTS_VALUE)
+     state.dts = m_CurrentVideo.dts;
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+index 60b51415..fe695c0e 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -11,6 +11,7 @@
+ #include "DVDCodecs/Video/DVStreamTelemetry.h"
+ #include "DVDCodecs/Video/DVPlaybackInfo.h"
+ #include "DVDCodecs/Video/DVPlaybackNotification.h"
++#include "VideoRenderers/DVPrivateDrain.h"
+ #include "utils/DVBridgeDiagnosticState.h"
+ #include "utils/StringUtils.h"
+ #include "windowing/gbm/WinSystemGbmGLESContext.h"
+@@ -32,6 +33,7 @@
+ #include "windowing/WinSystem.h"
+ 
+ #include <iomanip>
++#include <cstdlib>
+ #include <iterator>
+ #include <memory>
+ #include <mutex>
+@@ -263,6 +265,13 @@ void CVideoPlayerVideo::CloseStream(bool bWaitForBuffers)
+   {
+     SendMessage(std::make_shared<CDVDMsg>(CDVDMsg::VIDEO_DRAIN), 0);
+     m_messageQueue.WaitUntilEmpty();
++#ifdef HAVE_DVBRIDGE
++    if (CDVPrivateDrain::Enabled())
++    {
++      const auto result = CDVPrivateDrain::Get().Wait(m_bAbortOutput, 1000ms);
++      CLog::Log(LOGINFO, "Private EOF presentation drain: result={}", static_cast<int>(result));
++    }
++#endif
+   }
+ 
+   m_messageQueue.Abort();
+@@ -405,6 +414,17 @@ void CVideoPlayerVideo::Process()
+     }
+     else if (ret == MSGQ_TIMEOUT)
+     {
++#ifdef HAVE_DVBRIDGE
++      const char* startupResync = std::getenv("DV_PRIVATE_STARTUP_RESYNC");
++      if (m_syncState == IDVDStreamPlayer::SYNC_WAITSYNC && startupResync &&
++          std::strcmp(startupResync, "1") == 0 && CDVPrivateDrain::Enabled() &&
++          CDVPrivateDrain::Get().Wait(m_bAbortOutput, 0ms) == CDVPrivateDrain::Result::Complete)
++      {
++        // A committed first frame is ready for sync. Filling the remaining
++        // renderer slots here can block delivery of GENERAL_RESYNC.
++        continue;
++      }
++#endif
+       if (m_outputSate == OUTPUT_AGAIN &&
+           m_picture.videoBuffer)
+       {
+@@ -671,6 +691,16 @@ void CVideoPlayerVideo::UpdatePlayerInfo()
+ bool CVideoPlayerVideo::ProcessDecoderOutput(double &frametime, double &pts)
+ {
+   CDVDVideoCodec::VCReturn decoderState = m_pVideoCodec->GetPicture(&m_picture);
++#ifdef HAVE_DVBRIDGE
++  const char* endpointTrace = std::getenv("DV_PRIVATE_ENDPOINT_TRACE");
++  if (endpointTrace && endpointTrace[0] == '1' && endpointTrace[1] == '\0')
++  {
++    if (decoderState == CDVDVideoCodec::VC_PICTURE)
++      CLog::Log(LOGINFO, "Private endpoint decoded: pts={}", m_picture.pts);
++    else if (decoderState == CDVDVideoCodec::VC_EOF)
++      CLog::Log(LOGINFO, "Private endpoint decoder EOF");
++  }
++#endif
+ 
+   if (decoderState == CDVDVideoCodec::VC_BUFFER)
+   {
+@@ -843,6 +873,26 @@ bool CVideoPlayerVideo::ProcessDecoderOutput(double &frametime, double &pts)
+       msg.cachetime = DVD_MSEC_TO_TIME(50); //! @todo implement
+       msg.cachetotal = DVD_MSEC_TO_TIME(100); //! @todo implement
+       msg.timestamp = hasTimestamp ? (pts + m_renderManager.GetDelay() * 1000) : DVD_NOPTS_VALUE;
++#ifdef HAVE_DVBRIDGE
++      const char* startupLatency = std::getenv("DV_PRIVATE_STARTUP_LATENCY");
++      if (startupLatency && std::strcmp(startupLatency, "1") == 0 &&
++          CDVPrivateDrain::Enabled() && msg.timestamp != DVD_NOPTS_VALUE && frametime > 0 &&
++          CDVPrivateDrain::Get().Wait(m_bAbortOutput, 0ms) == CDVPrivateDrain::Result::Complete)
++      {
++        int lateframes, queued, discarded;
++        double presented;
++        if (m_renderManager.GetStats(lateframes, presented, queued, discarded) &&
++            presented != DVD_NOPTS_VALUE)
++        {
++          // Allow one scheduling interval after the first committed frame's
++          // latency-adjusted presentation time before releasing the clock.
++          msg.cachetotal = std::max(msg.cachetotal, msg.timestamp - presented + frametime);
++          CLog::Log(LOGINFO,
++              "Private source startup latency: timestamp={} presented={} frame_us={} cachetotal={}",
++              msg.timestamp, presented, frametime, msg.cachetotal);
++        }
++      }
++#endif
+       m_messageParent.Put(std::make_shared<CDVDMsgType<SStartMsg>>(CDVDMsg::PLAYER_STARTED, msg));
+     }
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
+index a7b5d621..32787077 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
+@@ -74,6 +74,7 @@ public:
+   virtual void SetBufferSize(int numBuffers) { }
+   virtual void ReleaseBuffer(int idx) { }
+   virtual bool NeedBuffer(int idx) { return false; }
++  virtual void PrefetchVideoPicture(int idx) {}
+   virtual bool IsGuiLayer() { return true; }
+   //! True when video never reaches the framebuffer: a DRM plane, an Android
+   //! SurfaceView, the Amlogic video layer. Such a renderer must produce its
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+index ba0fb42c..066a0738 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+@@ -59,8 +59,8 @@ if(ENABLE_DVBRIDGE)
+   file(READ "${DVBRIDGE_SOURCE_DIR}/pack_gles300.vert" DVBRIDGE_VERTEX_SOURCE)
+   file(READ "${DVBRIDGE_SOURCE_DIR}/pack_gles300.frag" DVBRIDGE_FRAGMENT_SOURCE)
+   configure_file(DVBridgeShaders.h.in DVBridgeShaders.h @ONLY)
+-  list(APPEND SOURCES DVBridgeGLES.cpp)
+-  list(APPEND HEADERS DVBridgeGLES.h)
++  list(APPEND SOURCES DVBridgeGLES.cpp DVPrivateSource.cpp DVPrivateScanout.cpp)
++  list(APPEND HEADERS DVBridgeGLES.h DVPrivateSource.h DVPrivateScanout.h dv_scanout_slots.h)
+   if(CB1_ENABLE_HDR10_AI)
+     list(APPEND SOURCES HDR10AISource.cpp)
+     list(APPEND HEADERS HDR10AISource.h)
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 7669034e..a1320c07 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -1,5 +1,7 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ #include "DVBridgeGLES.h"
++#include "DVPrivateSource.h"
++#include "DVPrivateOverlay.h"
+ #include "DVBridgeShaders.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackInfo.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVStreamTelemetry.h"
+@@ -20,9 +22,24 @@ extern "C"
+ #include <string_view>
+ #include <thread>
+ #include <vector>
++#include <cstdlib>
++#include <cstring>
++#include <cmath>
+ 
+ namespace
+ {
++bool SourceSitingEnabled()
++{
++  const char* enabled = std::getenv("DV_PRIVATE_SITED");
++  return enabled && std::strcmp(enabled, "1") == 0;
++}
++
++unsigned SourcePlaneSiting(bool enhancement, int location)
++{
++  return SourceSitingEnabled() && !enhancement && location == AVCHROMA_LOC_TOPLEFT
++      ? DV_SOURCE_CHROMA_TOP_LEFT : DV_SOURCE_CHROMA_CENTER_LEFT;
++}
++
+ void BackendLog(void*, pl_log_level level, const char* message)
+ {
+   // Error-only callback: no debug shader dumps or GPU timing/readback queries.
+@@ -467,6 +484,8 @@ void CDVBridgeGLES::Summary(const char* event)
+ 
+ CDVBridgeGLES::~CDVBridgeGLES()
+ {
++  if (m_source && m_source->Close())
++    delete m_source;
+   Summary("closed");
+   if (!m_live) DVBRIDGE::StreamTelemetry::ClearOutput();
+   glDeleteFramebuffers(1, &m_framebuffer);
+@@ -548,6 +567,8 @@ bool CDVBridgeGLES::SetHDR10Session(const dvbridge_hdr10_session& session, uint6
+ 
+ void CDVBridgeGLES::Reset()
+ {
++  if (m_source) m_source->Reset();
++  m_sourceFrame = m_wasSource = false;
+   Summary("reset");
+   m_firstFrame = true;
+   DVBRIDGE::StreamTelemetry::ClearOutput();
+@@ -673,7 +694,8 @@ DVBRIDGE::SourceBinding CDVBridgeGLES::SelectionIdentity(DVBRIDGE::SourceBinding
+ 
+ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareFrame(const Layer& base, const Layer* enhancement,
+     const CDVMetadataBuffer& metadata, dvbridge_geometry geometry,
+-    const DVBRIDGE::OutputPreferences& preferences, bool allowPacked, const dvbridge_policy* selected)
++    const DVBRIDGE::OutputPreferences& preferences, bool allowPacked, const dvbridge_policy* selected,
++    bool nativeHardware, const AVFrame* hardwareEnhancement, const DVPrivateOverlay* overlay)
+ {
+   if (!base.binding.Valid() || base.binding != metadata.Binding() ||
+       !std::isfinite(base.pts) ||
+@@ -701,9 +723,10 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareFrame(const Layer& base, const
+     m_geometryRevision = DVBRIDGE::NextRevisionAfter(std::max(preferences.revision,base.binding.revision));
+   m_sourceGeometry = geometry;
+   m_geometryKnown = true;
++  const bool reusePacked = allowPacked && !overlay;
+   uint64_t revision = std::max({preferences.revision,base.binding.revision,m_geometryRevision});
+   if (!m_pending && m_hasCommitted && base.binding == m_committedBinding &&
+-      revision == m_committedRevision && (!allowPacked || !m_committedPacked))
++      revision == m_committedRevision && (!reusePacked || !m_committedPacked))
+   {
+     // Explicit refresh of an equal-PTS source is a new processing transaction.
+     revision = m_geometryRevision = DVBRIDGE::NextRevisionAfter(revision);
+@@ -730,7 +753,7 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareFrame(const Layer& base, const
+   const auto retired = m_context->Poll();
+   if (retired != DVBRIDGE_DV_IDLE)
+     return retired == DVBRIDGE_DV_FAILED ? FrameStatus::Failed : FrameStatus::Busy;
+-  if (m_hasCommitted && allowPacked && m_committedPacked &&
++  if (m_hasCommitted && reusePacked && m_committedPacked &&
+       base.binding == m_committedBinding && revision == m_committedRevision &&
+       policy.mode == m_committedMode && policy.mode == m_effectiveMode)
+     return FrameStatus::Reused;
+@@ -781,12 +804,21 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareFrame(const Layer& base, const
+   }
+   m_advanced = policy.mode >= DVBRIDGE_MODE_HDR10_EXPERT;
+   m_context->Retain(base.lease, enhancement ? enhancement->lease : nullptr);
++  if (!nativeHardware && m_wasSource)
++  {
++    m_source->Reset();
++    m_sourceFrame = m_wasSource = false;
++    dvbridge_renderer_reset(m_renderer);
++  }
+   if (!m_advanced)
+   {
+-    const bool prepared = Prepare(base,enhancement,metadata,geometry,allowPacked);
++    const bool prepared = nativeHardware ?
++        PrepareHardware(base,hardwareEnhancement,metadata,geometry,allowPacked,overlay) :
++        Prepare(base,enhancement,metadata,geometry,allowPacked);
+     const bool fenced = m_context->FenceLastUse();
+     m_pending = prepared && fenced;
+     if (m_pending) PreparedAudit();
++    else Cancel();
+     return m_pending ? FrameStatus::Ready : FrameStatus::Failed;
+   }
+   if (!base.lease || (enhancement && !enhancement->lease))
+@@ -843,6 +875,8 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareFrame(const Layer& base, const
+ 
+ void CDVBridgeGLES::Cancel()
+ {
++  if (m_sourceFrame && m_source) m_source->Presented(false);
++  m_sourceFrame = false;
+   if (m_dvPolicyActive) dvbridge_render_dv_policy_cancel(m_renderer);
+   else dvbridge_render_policy_cancel(m_renderer);
+   m_prepared = m_packed = m_pending = false;
+@@ -897,9 +931,110 @@ unsigned int CDVBridgeGLES::GetPQTexture() const
+   return texture ? pl_opengl_unwrap(m_gl->gpu, texture, nullptr, nullptr, nullptr) : 0;
+ }
+ 
++bool CDVBridgeGLES::SourceEligible(const Layer& base, const AVFrame* enhancement,
++                                 dvbridge_geometry geometry) const
++{
++  const char* enabled = std::getenv("DV_PRIVATE_SOURCE");
++  const char* resize = std::getenv("DV_PRIVATE_RESIZE");
++  const bool allowResize = resize && std::strcmp(resize, "1") == 0;
++  const char* nv12 = std::getenv("DV_SINGLE_NV12");
++  const char* piecewise = std::getenv("DV_SINGLE_PIECEWISE");
++  const bool allowNV12 = nv12 && std::strcmp(nv12,"1") == 0 && piecewise &&
++      std::strcmp(piecewise,"1") == 0 && !enhancement && SourceSitingEnabled() &&
++      base.chromaPosition == AVCHROMA_LOC_LEFT;
++  const bool eligible = enabled && std::strcmp(enabled, "1") == 0 && !m_hdr10 &&
++      base.width > 0 && base.width <= 3840 && base.height > 0 && base.height <= 2160 &&
++      base.width % 4 == 0 && base.height % 4 == 0 &&
++      (base.layout == DVBRIDGE_P010 || (allowNV12 && base.layout == DVBRIDGE_NV12)) &&
++      geometry.x >= 0 && geometry.y >= 0 && geometry.x % 2 == 0 && geometry.y % 2 == 0 &&
++      geometry.width > 0 && geometry.width <= 3840 && geometry.height > 0 && geometry.height <= 2160 &&
++      geometry.width % 4 == 0 && geometry.height % 4 == 0 &&
++      geometry.x <= 3840 - geometry.width && geometry.y <= 2160 - geometry.height &&
++      (allowResize || (geometry.width == base.width && geometry.height == base.height)) &&
++      (enhancement || base.chromaPosition == AVCHROMA_LOC_TOPLEFT ||
++       (SourceSitingEnabled() && base.chromaPosition == AVCHROMA_LOC_LEFT)) &&
++      base.vaOwner && base.vaDisplay && std::isfinite(base.pts) &&
++      base.pts >= -9223372036854775808.0 && base.pts < 9223372036854775808.0;
++  if (!eligible && SourceSitingEnabled())
++  {
++    static unsigned reported = 0;
++    if (reported++ < 8)
++      CLog::Log(LOGINFO, "Private source selection rejected: size={}x{} layout={} chroma={} placement={},{},{}x{} owner={} display={} enhancement={} hdr10={}",
++          base.width, base.height, base.layout, base.chromaPosition, geometry.x, geometry.y,
++          geometry.width, geometry.height, base.vaOwner != nullptr, base.vaDisplay != nullptr,
++          enhancement != nullptr, m_hdr10);
++  }
++  return eligible;
++}
++
++void CDVBridgeGLES::PrefetchHardware(const Layer& base, const AVFrame* enhancement,
++                                    const CDVMetadataBuffer& metadata, dvbridge_geometry geometry)
++{
++  if (!m_source || !m_wasSource || !SourceEligible(base, enhancement, geometry))
++    return;
++  const dv_source_geometry placement{static_cast<unsigned>(base.width), static_cast<unsigned>(base.height),
++                                     3840, 2160, static_cast<unsigned>(geometry.x), static_cast<unsigned>(geometry.y),
++                                     SourcePlaneSiting(enhancement != nullptr, base.chromaPosition),
++                                     static_cast<unsigned>(geometry.width), static_cast<unsigned>(geometry.height)};
++  const dv_source_input input{sizeof(dv_source_input),
++      base.layout == DVBRIDGE_NV12 ? DV_SOURCE_INPUT_NV12 : DV_SOURCE_INPUT_P010,
++      base.layout == DVBRIDGE_NV12 ? 8u : 10u};
++  m_source->Prefetch(base.vaDisplay, base.vaSurface, base.vaOwner, enhancement,
++                     metadata.Data(), metadata.Size(), static_cast<int64_t>(base.pts), placement, input);
++}
++
+ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancement,
+-                                  const CDVMetadataBuffer& metadata, dvbridge_geometry geometry, bool allowPacked)
++                                  const CDVMetadataBuffer& metadata, dvbridge_geometry geometry, bool allowPacked,
++                                  const DVPrivateOverlay* overlay)
+ {
++  m_sourceFrame = false;
++  m_prepared = m_packed = false;
++  const char* sourceBypass = allowPacked ? "source-eligibility" : "overlay-gate";
++  if (allowPacked && SourceEligible(base, enhancement, geometry))
++  {
++    if (!m_source) m_source = new CDVPrivateSource;
++    if (!m_wasSource) m_source->Reset();
++    const dv_source_geometry placement{static_cast<unsigned>(base.width), static_cast<unsigned>(base.height),
++                                       3840, 2160, static_cast<unsigned>(geometry.x), static_cast<unsigned>(geometry.y),
++                                       SourcePlaneSiting(enhancement != nullptr, base.chromaPosition),
++                                       static_cast<unsigned>(geometry.width), static_cast<unsigned>(geometry.height)};
++    const dv_source_input input{sizeof(dv_source_input),
++        base.layout == DVBRIDGE_NV12 ? DV_SOURCE_INPUT_NV12 : DV_SOURCE_INPUT_P010,
++        base.layout == DVBRIDGE_NV12 ? 8u : 10u};
++    int result = m_source->Prepare(base.vaDisplay, base.vaSurface, base.vaOwner, enhancement,
++                                    metadata.Data(), metadata.Size(), static_cast<int64_t>(base.pts), placement, input,
++                                    overlay && overlay->texture ? overlay : nullptr);
++    sourceBypass = "source-unsupported";
++    if (result < 0) return Failure("private-source");
++    if (result > 0)
++    {
++      const bool entering = !m_wasSource;
++      m_sourceFrame = m_wasSource = m_prepared = true;
++      m_packed = m_direct = false;
++      dvbridge_color color{};
++      const bool fel = enhancement && dvbridge_map_color(&color, metadata.Data(), metadata.Size(), true) &&
++                       color.dovi.nlq_active;
++      CaptureMetadata(metadata, fel);
++      const char* trace = std::getenv("DV_PRIVATE_ROUTE_TRACE");
++      if (entering && trace && std::strcmp(trace, "1") == 0)
++        CLog::Log(LOGINFO, "Private source composition: pts={} enhancement={} fel={} prepared=true",
++                  base.pts, enhancement != nullptr, fel);
++      return true;
++    }
++  }
++  // A coverage-alpha GUI cannot be handed to the older squared-alpha composer.
++  if (overlay) return Failure("private-overlay-source-required");
++  if (m_wasSource)
++  {
++    const char* trace = std::getenv("DV_PRIVATE_ROUTE_TRACE");
++    static unsigned routeReports = 0;
++    if (trace && std::strcmp(trace, "1") == 0 && routeReports++ < 64)
++      CLog::Log(LOGINFO, "Private source route exit: pts={} reason={} size={}x{} chroma={}",
++          base.pts, sourceBypass, base.width, base.height, base.chromaPosition);
++    m_source->Reset();
++    dvbridge_renderer_reset(m_renderer);
++    m_wasSource = false;
++  }
+   m_prepared = m_packed = false;
+   if (!enhancement)
+     return Prepare(base, nullptr, metadata, geometry, allowPacked);
+@@ -921,12 +1056,30 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base,
+     std::shared_ptr<AVFrame> enhancement, DVBRIDGE::SourceBinding enhancementBinding,
+     const CDVMetadataBuffer& metadata, dvbridge_geometry geometry,
+-    const DVBRIDGE::OutputPreferences& preferences, bool allowPacked, const dvbridge_policy* selected)
++    const DVBRIDGE::OutputPreferences& preferences, bool allowPacked, const dvbridge_policy* selected,
++    const DVPrivateOverlay* overlay)
+ {
+-  if (!enhancement) return PrepareFrame(base,nullptr,metadata,geometry,preferences,allowPacked,selected);
+-  if (!enhancementBinding.Valid() || enhancementBinding != base.binding ||
+-      !std::isfinite(base.pts) || static_cast<double>(enhancement->pts) != base.pts)
++  if (enhancement && (!enhancementBinding.Valid() || enhancementBinding != base.binding ||
++      !std::isfinite(base.pts) || static_cast<double>(enhancement->pts) != base.pts))
+     return FrameStatus::Failed;
++  auto policy = selected ? *selected : preferences.Policy();
++  if (!selected && policy.mode >= DVBRIDGE_MODE_HDR10_EXPERT && !preferences.ProfileValid())
++    policy.mode = preferences.output == DVBRIDGE::OutputMode::HDR10 ?
++        DVBRIDGE_MODE_HDR10_BASIC : DVBRIDGE_MODE_STANDARD;
++  if (policy.mode == DVBRIDGE_MODE_STANDARD)
++  {
++    Layer layer{};
++    if (enhancement)
++    {
++      layer.binding = enhancementBinding;
++      layer.pts = static_cast<double>(enhancement->pts);
++      layer.lease = enhancement;
++    }
++    return PrepareFrame(base,enhancement ? &layer : nullptr,metadata,geometry,preferences,
++        allowPacked,selected,true,enhancement.get(),overlay);
++  }
++  if (overlay) return FrameStatus::Unsupported;
++  if (!enhancement) return PrepareFrame(base,nullptr,metadata,geometry,preferences,allowPacked,selected);
+   struct Import
+   {
+     dvbridge_dmabuf image{};
+@@ -959,6 +1112,13 @@ bool CDVBridgeGLES::Pack(unsigned int framebuffer, int width, int height, bool f
+   m_packed = false;
+   if (!m_prepared)
+     return Failure("pack-without-prepared-frame");
++  if (m_sourceFrame)
++  {
++    m_packed = m_source->Pack(framebuffer, width, height, flipY);
++    if (m_packed && m_live)
++      m_submission = {m_pendingIdentity,m_scanout,0,++m_submissionSequence};
++    return m_packed;
++  }
+   if (m_advanced && m_dvPolicyActive)
+   {
+     if (framebuffer != m_scanoutFramebuffer || width != 3840 || height != 2160 || !m_scanout)
+@@ -1007,6 +1167,7 @@ bool CDVBridgeGLES::ResolveHDR10(bool limited)
+ 
+ unsigned int CDVBridgeGLES::GetPQFramebuffer()
+ {
++  if (m_sourceFrame) return 0;
+   const auto texture = GetPQTexture();
+   if (!texture)
+     return 0;
+@@ -1022,9 +1183,35 @@ unsigned int CDVBridgeGLES::GetPQFramebuffer()
+   return valid ? m_framebuffer : 0;
+ }
+ 
++gbm_bo* CDVBridgeGLES::GetPrivateScanout()
++{
++  if (!m_sourceFrame || !m_prepared || !m_source) return nullptr;
++  auto* bo = m_source->ScanoutBuffer();
++  if (bo)
++  {
++    m_packed = true;
++    if (m_live && (!m_submission.sequence || m_submission.nativeTarget != bo))
++      m_submission = {m_pendingIdentity,nullptr,0,++m_submissionSequence,bo};
++  }
++  return bo;
++}
++
++bool CDVBridgeGLES::DisplayReplaced()
++{ return !m_source || m_source->DisplayReplaced(); }
++
+ bool CDVBridgeGLES::Presented(bool success)
+ {
+   if (m_live) return Presented(success,m_submission);
++  if (m_sourceFrame)
++  {
++    const bool committed = success && m_prepared && m_packed;
++    m_source->Presented(committed);
++    CDVPlaybackInfo::presented.store(committed ? m_pendingInfo : 0);
++    m_prepared = m_packed = m_sourceFrame = false;
++    return committed;
++  }
++  if (success && m_source && !m_source->DisplayReplaced())
++    return Failure("private-scanout-retirement");
+   const bool committed = success && m_prepared && m_packed && dvbridge_render_commit(m_renderer);
+   // A held frame during paced recovery is not a new presentation attempt.
+   if (DVBRIDGE::DiagnosticsEnabled() && m_prepared)
+@@ -1081,6 +1268,7 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+   // A delayed callback must not consume or cancel a newer resolve.
+   if (!submission.sequence || submission.sequence != m_submission.sequence ||
+       submission.target != m_submission.target ||
++      submission.nativeTarget != m_submission.nativeTarget ||
+       submission.resolveSerial != m_submission.resolveSerial ||
+       submission.identity.stream != m_pendingIdentity.stream ||
+       submission.identity.picture != m_pendingIdentity.picture ||
+@@ -1090,12 +1278,13 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+   const float peak = hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
+       m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
+       m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
+-  const bool committed = success && m_prepared && m_packed &&
+-      (m_advanced ? (m_dvPolicyActive ?
++  const bool retired = m_sourceFrame || !success || !m_source || m_source->DisplayReplaced();
++  const bool committed = success && m_prepared && m_packed && retired &&
++      (m_sourceFrame || (m_advanced ? (m_dvPolicyActive ?
+           dvbridge_render_dv_policy_commit(m_renderer,&submission.identity,
+               submission.target,submission.resolveSerial) :
+           dvbridge_render_policy_commit(m_renderer,&submission.identity,submission.target)) :
+-          dvbridge_render_commit(m_renderer));
++          dvbridge_render_commit(m_renderer)));
+   if (!committed)
+   {
+ #ifdef CB1_HAS_HDR10_AI
+@@ -1108,6 +1297,8 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+     Cancel();
+     return false;
+   }
++  if (m_sourceFrame) m_source->Presented(true);
++  m_sourceFrame = false;
+   m_hasCommitted = true;
+ #ifdef CB1_HAS_HDR10_AI
+   if (m_aiFrame && !m_context->HDR10AI().Presented(m_pendingBinding,true)) return false;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 612a43ad..8368bbb5 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -21,6 +21,10 @@ extern "C"
+ #error "DV bridge requires DV policy API 5 and HDR10 policy API 4"
+ #endif
+ 
++class CVideoBuffer;
++class CDVPrivateSource;
++struct DVPrivateOverlay;
++struct gbm_bo;
+ class CDVBridgeGLES
+ {
+ public:
+@@ -69,6 +73,10 @@ public:
+     int height;
+     dvbridge_gl_plane planes[3];
+     double pts;
++    void* vaDisplay{nullptr};
++    unsigned vaSurface{UINT32_MAX};
++    CVideoBuffer* vaOwner{nullptr};
++    int chromaPosition{0};
+     DVBRIDGE::SourceBinding binding{};
+     std::shared_ptr<void> lease;
+     DVBRIDGE::SourceInfo sourceInfo{};
+@@ -93,16 +101,19 @@ public:
+   FrameStatus PrepareFrame(const Layer& base, const Layer* enhancement,
+                            const CDVMetadataBuffer& metadata, dvbridge_geometry geometry,
+                            const DVBRIDGE::OutputPreferences& preferences, bool allowPacked,
+-                           const dvbridge_policy* selected = nullptr);
++                           const dvbridge_policy* selected = nullptr,
++                           bool nativeHardware = false, const AVFrame* hardwareEnhancement = nullptr,
++                           const DVPrivateOverlay* overlay = nullptr);
+   FrameStatus PrepareHardwareFrame(const Layer& base, std::shared_ptr<AVFrame> enhancement,
+       DVBRIDGE::SourceBinding enhancementBinding, const CDVMetadataBuffer& metadata,
+       dvbridge_geometry geometry, const DVBRIDGE::OutputPreferences& preferences, bool allowPacked,
+-      const dvbridge_policy* selected = nullptr);
++      const dvbridge_policy* selected = nullptr, const DVPrivateOverlay* overlay = nullptr);
+   struct Submission
+   {
+     dvbridge_identity identity{};
+     pl_tex target{};
+     uint64_t resolveSerial{}, sequence{};
++    gbm_bo* nativeTarget{};
+   };
+   Submission CaptureSubmission() const { return m_submission; }
+   bool Presented(bool success, const Submission& submission);
+@@ -132,12 +143,17 @@ public:
+   bool Prepare(const Layer& base, const Layer* enhancement,
+                const CDVMetadataBuffer& metadata, dvbridge_geometry geometry, bool allowPacked = false);
+   bool PrepareHardware(const Layer& base, const AVFrame* enhancement,
+-                       const CDVMetadataBuffer& metadata, dvbridge_geometry geometry, bool allowPacked = false);
++                       const CDVMetadataBuffer& metadata, dvbridge_geometry geometry, bool allowPacked = false,
++                       const DVPrivateOverlay* overlay = nullptr);
+   unsigned int GetPQTexture() const;
++  void PrefetchHardware(const Layer& base, const AVFrame* enhancement,
++                        const CDVMetadataBuffer& metadata, dvbridge_geometry geometry);
+   unsigned int GetPQFramebuffer();
+   bool Pack(unsigned int framebuffer, int width, int height, bool flipY);
+   bool ResolveHDR10(bool limited);
+   bool Presented(bool success);
++  gbm_bo* GetPrivateScanout();
++  bool DisplayReplaced();
+ 
+ private:
+   void CaptureMetadata(const CDVMetadataBuffer& metadata, bool fel);
+@@ -166,6 +182,8 @@ private:
+   dvbridge_geometry m_sourceGeometry{};
+   uint64_t m_geometryRevision{1};
+   bool m_geometryKnown{};
++  bool SourceEligible(const Layer& base, const AVFrame* enhancement,
++                      dvbridge_geometry geometry) const;
+   bool Failure(const char* stage);
+   void PreparedAudit();
+   void Summary(const char* event);
+@@ -196,4 +214,6 @@ private:
+   bool m_packed = false;
+   unsigned m_pendingInfo = 0;
+   unsigned int m_framebuffer = 0;
++  CDVPrivateSource* m_source{nullptr};
++  bool m_sourceFrame{false}, m_wasSource{false};
+ };
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateDrain.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateDrain.h
+new file mode 100644
+index 00000000..219ed539
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateDrain.h
+@@ -0,0 +1,80 @@
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
++class CDVPrivateDrain
++{
++public:
++  enum class Result { Idle, Complete, Cancelled, TimedOut };
++  static bool Enabled()
++  {
++    const char* value = std::getenv("DV_PRIVATE_DRAIN_EOF");
++    return value && std::strcmp(value, "1") == 0;
++  }
++  static CDVPrivateDrain& Get()
++  {
++    static CDVPrivateDrain state;
++    return state;
++  }
++  void Queue(const void* owner, int64_t pts)
++  {
++    std::lock_guard lock(m_mutex);
++    ++m_serial;
++    m_owner = owner;
++    m_pts = pts;
++    m_changed.notify_all();
++  }
++  uint64_t Ticket(const void* owner, int64_t pts)
++  {
++    std::lock_guard lock(m_mutex);
++    return owner && owner == m_owner && pts == m_pts ? m_serial : 0;
++  }
++  void Commit(uint64_t ticket)
++  {
++    std::lock_guard lock(m_mutex);
++    if (ticket && ticket == m_serial && m_owner)
++    {
++      m_committed = ticket;
++      m_changed.notify_all();
++    }
++  }
++  void Cancel()
++  {
++    std::lock_guard lock(m_mutex);
++    ++m_serial;
++    m_owner = nullptr;
++    m_changed.notify_all();
++  }
++  Result Wait(const volatile std::atomic_bool& abort, std::chrono::milliseconds timeout)
++  {
++    std::unique_lock lock(m_mutex);
++    if (!m_owner)
++      return Result::Idle;
++    const auto serial = m_serial;
++    const auto deadline = std::chrono::steady_clock::now() + timeout;
++    for (;;)
++    {
++      if (abort || serial != m_serial)
++        return Result::Cancelled;
++      if (m_committed == serial)
++        return Result::Complete;
++      const auto now = std::chrono::steady_clock::now();
++      if (now >= deadline)
++        return Result::TimedOut;
++      m_changed.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(20)));
++    }
++  }
++private:
++  std::mutex m_mutex;
++  std::condition_variable m_changed;
++  uint64_t m_serial{0}, m_committed{0};
++  const void* m_owner{nullptr}; // Identity only; frame leases remain with Kodi.
++  int64_t m_pts{0};
++};
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateLayerGeometry.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateLayerGeometry.h
+new file mode 100644
+index 00000000..d286f872
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateLayerGeometry.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <cstddef>
++#include <cstring>
++extern "C"
++{
++#include <libavutil/dovi_meta.h>
++}
++
++inline bool DVPrivateLayerGeometryMatches(const void* data, size_t size,
++                                         unsigned width, unsigned height,
++                                         int enhancementWidth, int enhancementHeight)
++{
++  if (!data || size < sizeof(AVDOVIMetadata) || !width || !height)
++    return false;
++  AVDOVIMetadata metadata;
++  std::memcpy(&metadata, data, sizeof(metadata));
++  if (metadata.header_offset < sizeof(metadata) || metadata.header_offset > size ||
++      sizeof(AVDOVIRpuDataHeader) > size - metadata.header_offset)
++    return false;
++  AVDOVIRpuDataHeader header;
++  std::memcpy(&header, static_cast<const unsigned char*>(data) + metadata.header_offset,
++              sizeof(header));
++  if (header.el_spatial_resampling_filter_flag > 1 ||
++      enhancementWidth <= 0 || enhancementHeight <= 0)
++    return false;
++  const unsigned scale = header.el_spatial_resampling_filter_flag ? 2 : 1;
++  return width % scale == 0 && height % scale == 0 &&
++         static_cast<unsigned>(enhancementWidth) == width / scale &&
++         static_cast<unsigned>(enhancementHeight) == height / scale;
++}
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateOverlay.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateOverlay.h
+new file mode 100644
+index 00000000..12e34a52
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateOverlay.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++
++struct DVPrivateOverlay
++{
++  unsigned texture{0};
++  unsigned flipY{0};
++  double rgbToLms[9]{};
++  double whiteNits{203.0};
++};
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateScanout.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateScanout.cpp
+new file mode 100644
+index 00000000..f2881ddb
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateScanout.cpp
+@@ -0,0 +1,94 @@
++#include "DVPrivateScanout.h"
++#include <GLES3/gl3.h>
++#include <drm_fourcc.h>
++#include <dlfcn.h>
++#include <unistd.h>
++#include <cstring>
++
++bool CDVPrivateScanout::Initialize(gbm_device* device, void* library)
++{
++  if (!device || !library || m_initialized) return false;
++#define LOAD(member, symbol) member = reinterpret_cast<decltype(member)>(dlsym(library, #symbol)); if (!member) return false
++  LOAD(m_init, dv_scanout_slots_init);
++  LOAD(m_acquire, dv_scanout_slots_acquire);
++  LOAD(m_written, dv_scanout_slots_written);
++  LOAD(m_committed, dv_scanout_slots_committed);
++  LOAD(m_reset, dv_scanout_slots_reset_stream);
++  LOAD(m_restored, dv_scanout_slots_restored);
++  LOAD(m_canDestroy, dv_scanout_slots_can_destroy);
++#undef LOAD
++  m_init(&m_slots);
++  m_initialized = true;
++  m_display = eglGetCurrentDisplay();
++  auto create = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
++  m_destroyImage = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
++  using Target = void (*)(GLenum, void*);
++  auto target = reinterpret_cast<Target>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
++  if (!create || !m_destroyImage || !target || m_display == EGL_NO_DISPLAY) return false;
++  GLint previous;
++  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
++  bool success = true;
++  for (unsigned slot = 0; slot < 2 && success; ++slot)
++  {
++    m_bo[slot] = gbm_bo_create(device, 3840, 2160, GBM_FORMAT_ARGB8888,
++        GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
++    if (!m_bo[slot]) { success = false; break; }
++    int fd = gbm_bo_get_fd(m_bo[slot]);
++    if (fd < 0) { success = false; break; }
++    const EGLint attrs[] = {EGL_WIDTH,3840,EGL_HEIGHT,2160,EGL_LINUX_DRM_FOURCC_EXT,DRM_FORMAT_ARGB8888,
++        EGL_DMA_BUF_PLANE0_FD_EXT,fd,EGL_DMA_BUF_PLANE0_OFFSET_EXT,0,
++        EGL_DMA_BUF_PLANE0_PITCH_EXT,static_cast<EGLint>(gbm_bo_get_stride(m_bo[slot])),EGL_NONE};
++    m_image[slot] = create(m_display,EGL_NO_CONTEXT,EGL_LINUX_DMA_BUF_EXT,nullptr,attrs);
++    close(fd);
++    if (m_image[slot] == EGL_NO_IMAGE_KHR) { success = false; break; }
++    glGenTextures(1,&m_texture[slot]);
++    glBindTexture(GL_TEXTURE_2D,m_texture[slot]);
++    target(GL_TEXTURE_2D,m_image[slot]);
++    glFinish();
++    success = glGetError() == GL_NO_ERROR;
++  }
++  glBindTexture(GL_TEXTURE_2D,previous);
++  return success;
++}
++bool CDVPrivateScanout::Begin(uint64_t frame, int64_t pts)
++{ return m_initialized && m_acquire(&m_slots,{frame,pts},&m_lease) == 0; }
++bool CDVPrivateScanout::Written(dv_scanout_outcome outcome)
++{ return m_initialized && m_written(&m_slots,&m_lease,outcome) == 0; }
++bool CDVPrivateScanout::Presented(bool success)
++{ return m_initialized && m_committed(&m_slots,&m_lease,success ? DV_SCANOUT_ACCEPTED : DV_SCANOUT_REJECTED) == 0; }
++bool CDVPrivateScanout::ResetStream()
++{ return !m_initialized || m_reset(&m_slots) == 0; }
++bool CDVPrivateScanout::Replaced()
++{
++  if (!m_initialized) return true;
++  if (m_slots.writing || m_slots.quarantined) return false;
++  m_restored(&m_slots);
++  return true;
++}
++bool CDVPrivateScanout::CanClose() const
++{ return !m_initialized || m_canDestroy(&m_slots); }
++bool CDVPrivateScanout::Close()
++{
++  if (!CanClose()) return false;
++  glDeleteTextures(2,m_texture);
++  for (unsigned slot=0;slot<2;++slot)
++  {
++    if (m_image[slot] != EGL_NO_IMAGE_KHR) m_destroyImage(m_display,m_image[slot]);
++    if (m_bo[slot]) gbm_bo_destroy(m_bo[slot]);
++    m_image[slot]=EGL_NO_IMAGE_KHR;m_bo[slot]=nullptr;m_texture[slot]=0;
++  }
++  m_initialized=false;
++  return true;
++}
++bool CDVPrivateScanout::Read(unsigned char* output, size_t bytes)
++{
++  if (!m_slots.ready || !output || bytes != 3840u*2160u*4u) return false;
++  uint32_t pitch=0;void* cookie=nullptr;
++  auto* data=static_cast<unsigned char*>(gbm_bo_map(m_bo[m_lease.slot],0,0,3840,2160,GBM_BO_TRANSFER_READ,&pitch,&cookie));
++  if (!data) return false;
++  const bool valid=pitch>=3840*4;
++  if (valid) for (size_t row=0;row<2160;++row)
++    std::memcpy(output+row*3840*4,data+row*pitch,3840*4);
++  gbm_bo_unmap(m_bo[m_lease.slot],cookie);
++  return valid;
++}
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateScanout.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateScanout.h
+new file mode 100644
+index 00000000..40e3f3ee
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateScanout.h
+@@ -0,0 +1,41 @@
++#pragma once
++#include "dv_scanout_slots.h"
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <gbm.h>
++#include <cstddef>
++
++class CDVPrivateScanout
++{
++public:
++  bool Initialize(gbm_device* device, void* library);
++  bool Begin(uint64_t frame, int64_t pts);
++  bool Written(dv_scanout_outcome outcome);
++  bool Presented(bool success);
++  bool ResetStream();
++  bool Replaced();
++  bool CanClose() const;
++  bool Close();
++  bool Read(unsigned char* output, size_t bytes);
++  unsigned Texture(unsigned slot) const { return m_texture[slot]; }
++  unsigned Slot() const { return m_lease.slot; }
++  unsigned Packet() const { return m_lease.packet_id; }
++  bool Refresh() const { return m_lease.refresh != 0; }
++  gbm_bo* ReadyBuffer() const { return m_slots.ready ? m_bo[m_lease.slot] : nullptr; }
++private:
++  dv_scanout_slots m_slots{};
++  dv_scanout_lease m_lease{};
++  bool m_initialized{false};
++  gbm_bo* m_bo[2]{};
++  unsigned m_texture[2]{};
++  EGLImageKHR m_image[2]{EGL_NO_IMAGE_KHR,EGL_NO_IMAGE_KHR};
++  EGLDisplay m_display{EGL_NO_DISPLAY};
++  PFNEGLDESTROYIMAGEKHRPROC m_destroyImage{nullptr};
++  decltype(&dv_scanout_slots_init) m_init{nullptr};
++  decltype(&dv_scanout_slots_acquire) m_acquire{nullptr};
++  decltype(&dv_scanout_slots_written) m_written{nullptr};
++  decltype(&dv_scanout_slots_committed) m_committed{nullptr};
++  decltype(&dv_scanout_slots_reset_stream) m_reset{nullptr};
++  decltype(&dv_scanout_slots_restored) m_restored{nullptr};
++  decltype(&dv_scanout_slots_can_destroy) m_canDestroy{nullptr};
++};
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.cpp
+new file mode 100644
+index 00000000..0c8da3ce
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.cpp
+@@ -0,0 +1,493 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "DVPrivateSource.h"
++#include "DVPrivateOverlay.h"
++#include "DVPrivateDrain.h"
++#include "DVPrivateScanout.h"
++#include "DVPrivateLayerGeometry.h"
++#include "ServiceBroker.h"
++#include "windowing/gbm/WinSystemGbm.h"
++#include "cores/VideoPlayer/Buffers/VideoBuffer.h"
++#include "utils/log.h"
++#include <EGL/egl.h>
++#include <GLES3/gl3.h>
++#include <cstdlib>
++#include <dlfcn.h>
++#include <vector>
++#include <cstring>
++#include <chrono>
++extern "C"
++{
++#include <libavutil/frame.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_vaapi.h>
++}
++
++bool CDVPrivateSource::Initialize(void* display)
++{
++  const char* library = std::getenv("DV_PRIVATE_SOURCE_LIBRARY");
++  const char* resources = std::getenv("DV_PRIVATE_SOURCE_RESOURCES");
++  if (!library || !resources || eglGetCurrentContext() == EGL_NO_CONTEXT)
++    return false;
++  m_library = dlopen(library, RTLD_NOW | RTLD_LOCAL);
++  if (!m_library)
++  {
++    CLog::Log(LOGERROR, "Private source renderer load failed: {}", dlerror());
++    return false;
++  }
++  auto abi = reinterpret_cast<unsigned (*)()>(dlsym(m_library, "dv_source_renderer_abi"));
++  m_create = reinterpret_cast<decltype(m_create)>(dlsym(m_library, "dv_source_renderer_create"));
++  m_render = reinterpret_cast<decltype(m_render)>(dlsym(m_library, "dv_source_renderer_render"));
++  m_drain = reinterpret_cast<decltype(m_drain)>(dlsym(m_library, "dv_source_renderer_drain"));
++  m_destroy = reinterpret_cast<decltype(m_destroy)>(dlsym(m_library, "dv_source_renderer_destroy"));
++  m_check = reinterpret_cast<decltype(m_check)>(dlsym(m_library, "dv_source_renderer_check"));
++  m_submit = reinterpret_cast<decltype(m_submit)>(dlsym(m_library, "dv_source_renderer_submit"));
++  m_submitInput = reinterpret_cast<decltype(m_submitInput)>(dlsym(m_library, "dv_source_renderer_submit_input"));
++  m_present = reinterpret_cast<decltype(m_present)>(dlsym(m_library, "dv_source_renderer_present"));
++  m_prepareOverlays = reinterpret_cast<decltype(m_prepareOverlays)>(dlsym(m_library, "dv_source_renderer_prepare_overlays"));
++  m_presentOverlay = reinterpret_cast<decltype(m_presentOverlay)>(dlsym(m_library, "dv_source_renderer_present_overlay"));
++  m_cancel = reinterpret_cast<decltype(m_cancel)>(dlsym(m_library, "dv_source_renderer_cancel"));
++  if (!abi || abi() != 4 || !m_create || !m_render || !m_drain || !m_destroy)
++    return false;
++  const char* direct = std::getenv("DV_PRIVATE_SCANOUT");
++  if (direct && std::strcmp(direct,"1") == 0)
++  {
++    if (InitializeScanout(display, resources))
++    {
++      m_display = display;
++      CLog::Log(LOGINFO,"Private source direct scanout initialized: two cached buffers, one engine");
++      return InitializeOverlays();
++    }
++    // No frame has been submitted; destroy CL imports before their GL/GBM storage.
++    glFinish();
++    if (m_engine && m_destroy(m_engine) != 0) return false;
++    m_engine = nullptr;
++    if (m_scanout)
++    {
++      if (!m_scanout->Close()) return false;
++      delete m_scanout;
++      m_scanout = nullptr;
++    }
++    m_texture = 0;
++    CLog::Log(LOGWARNING,"Private source direct scanout setup unavailable; using native copy output");
++  }
++  GLint texture;
++  glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++  glGenTextures(1, &m_texture);
++  glBindTexture(GL_TEXTURE_2D, m_texture);
++  glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 3840, 2160);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++  glBindTexture(GL_TEXTURE_2D, texture);
++  glFinish();
++  m_engine = m_create(reinterpret_cast<uintptr_t>(display),
++                      reinterpret_cast<uintptr_t>(eglGetCurrentDisplay()),
++                      reinterpret_cast<uintptr_t>(eglGetCurrentContext()), m_texture, resources);
++  if (!m_engine)
++    return false;
++  m_display = display;
++  glGenFramebuffers(1, &m_framebuffer);
++  GLint previous;
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_framebuffer);
++  glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texture, 0);
++  bool valid = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous);
++  return valid && InitializeOverlays();
++}
++
++bool CDVPrivateSource::InitializeOverlays()
++{
++  const char* enabled = std::getenv("DV_PRIVATE_OVERLAY");
++  if (!enabled || std::strcmp(enabled, "1") != 0)
++    return true;
++  if (!m_submit || !m_present || !m_prepareOverlays || !m_presentOverlay ||
++      m_prepareOverlays(m_engine) != 0)
++  {
++    CLog::Log(LOGERROR, "Private source overlay initialization failed");
++    return false;
++  }
++  CLog::Log(LOGINFO, "Private source overlay programs prepared");
++  return true;
++}
++
++bool CDVPrivateSource::InitializeScanout(void* display, const char* resources)
++{
++  const char* failure = std::getenv("DV_PRIVATE_SCANOUT_TEST_FAIL");
++  const auto fail = [failure](const char* stage)
++  {
++    if (!failure || std::strcmp(failure, stage) != 0) return false;
++    CLog::Log(LOGWARNING,"Private source scanout injected setup failure: {}", stage);
++    return true;
++  };
++  m_createStorage = reinterpret_cast<decltype(m_createStorage)>(dlsym(m_library,"dv_source_renderer_create_storage"));
++  m_attachOutput = reinterpret_cast<decltype(m_attachOutput)>(dlsym(m_library,"dv_source_renderer_attach_output"));
++  m_selectOutput = reinterpret_cast<decltype(m_selectOutput)>(dlsym(m_library,"dv_source_renderer_select_output"));
++  auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  if (!m_createStorage || !m_attachOutput || !m_selectOutput || !window) return false;
++  m_scanout = new CDVPrivateScanout;
++  if (!m_scanout->Initialize(window->GetGBMDevice().Get(),m_library)) return false;
++  m_texture = m_scanout->Texture(0);
++  if (fail("buffers")) return false;
++  m_engine = m_createStorage(reinterpret_cast<uintptr_t>(display),
++      reinterpret_cast<uintptr_t>(eglGetCurrentDisplay()),reinterpret_cast<uintptr_t>(eglGetCurrentContext()),
++      m_texture,resources,1);
++  if (!m_engine || fail("engine")) return false;
++  if (m_attachOutput(m_engine,m_scanout->Texture(1)) != 0 || fail("attached")) return false;
++  return true;
++}
++
++void CDVPrivateSource::ReleaseInputs()
++{
++  m_enhancement.reset();
++  if (m_owner)
++    m_owner->Release();
++  m_owner = nullptr;
++}
++
++int CDVPrivateSource::AcquireFrame(void* display, CVideoBuffer* owner,
++                                  const AVFrame* enhancement, int64_t pts,
++                                  const dv_source_geometry& geometry,
++                                  const void* metadata, size_t size)
++{
++  if (m_unsafe)
++    return -1;
++  if (!display || !owner)
++    return 0;
++  if (enhancement)
++  {
++    if (enhancement->format != AV_PIX_FMT_VAAPI ||
++        !DVPrivateLayerGeometryMatches(metadata, size, geometry.width, geometry.height,
++                                       enhancement->width, enhancement->height) ||
++        !enhancement->hw_frames_ctx || enhancement->pts != pts)
++      return 0;
++    auto* frames = reinterpret_cast<AVHWFramesContext*>(enhancement->hw_frames_ctx->data);
++    auto* va = reinterpret_cast<AVVAAPIDeviceContext*>(frames->device_ctx->hwctx);
++    if (frames->sw_format != AV_PIX_FMT_P010 || va->display != display)
++      return 0;
++  }
++  if (!m_engine && !Initialize(display))
++  {
++    Close();
++    return -1;
++  }
++  if (m_display != display)
++    return -1;
++  if (enhancement)
++  {
++    auto* copy = av_frame_clone(enhancement);
++    if (!copy)
++      return -1;
++    m_enhancement = {copy, [](AVFrame* frame) { av_frame_free(&frame); }};
++  }
++  owner->Acquire();
++  m_owner = owner;
++  return 1;
++}
++
++bool CDVPrivateSource::Matches(void* display, CVideoBuffer* owner, int64_t pts,
++                              const dv_source_geometry& geometry, const dv_source_input& input) const
++{
++  return !m_unsafe && m_pending && m_display == display && m_owner == owner &&
++         m_pendingPts == pts && std::memcmp(&m_pendingGeometry, &geometry, sizeof(geometry)) == 0 &&
++         std::memcmp(&m_pendingInput, &input, sizeof(input)) == 0;
++}
++
++bool CDVPrivateSource::CancelPending()
++{
++  if (m_unsafe)
++    return false;
++  if (m_pending && (!m_cancel || m_cancel(m_engine) != 0))
++  {
++    m_unsafe = true;
++    return false;
++  }
++  m_pending = false;
++  ReleaseInputs();
++  return true;
++}
++
++void CDVPrivateSource::Prefetch(void* display, unsigned surface, CVideoBuffer* owner,
++                               const AVFrame* enhancement, const void* metadata,
++                               size_t size, int64_t pts, const dv_source_geometry& geometry, const dv_source_input& input)
++{
++  const char* enabled = std::getenv("DV_PRIVATE_ASYNC");
++  if (!enabled || std::strcmp(enabled, "1") != 0 || m_unsafe || !m_engine ||
++      !m_submit || !m_present || !m_cancel || eglGetCurrentContext() == EGL_NO_CONTEXT)
++    return;
++  if (input.format == DV_SOURCE_INPUT_NV12 && !m_submitInput) return;
++  if (Matches(display, owner, pts, geometry, input)) return;
++  if (!CancelPending()) return;
++  if (AcquireFrame(display, owner, enhancement, pts, geometry, metadata, size) != 1) return;
++  const auto started = std::chrono::steady_clock::now();
++  const unsigned el = enhancement ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(enhancement->data[3])) : UINT32_MAX;
++  m_pendingId = ++m_serial;
++  // Reconstruction does not acquire/write the packed GL image Kodi still needs.
++  const int result = input.format == DV_SOURCE_INPUT_NV12 ?
++      m_submitInput(m_engine, surface, el, geometry.width, geometry.height,
++                    metadata, size, m_pendingId, pts, &geometry, &input) :
++      m_submit(m_engine, surface, el, geometry.width, geometry.height,
++                              metadata, size, m_pendingId, pts, &geometry);
++  if (m_serial <= 12)
++    CLog::Log(LOGINFO, "Private source prefetch: id={} pts={} surface={} status={}", m_pendingId, pts, surface, result);
++  if (result != 0)
++  {
++    if (m_drain(m_engine) != 0) m_unsafe = true;
++    else ReleaseInputs();
++    return;
++  }
++  m_pending = true;
++  m_pendingPts = pts;
++  m_pendingGeometry = geometry;
++  m_pendingInput = input;
++  m_submitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
++}
++
++int CDVPrivateSource::Prepare(void* display, unsigned surface, CVideoBuffer* owner,
++                              const AVFrame* enhancement, const void* metadata,
++                              size_t size, int64_t pts, const dv_source_geometry& geometry, const dv_source_input& input,
++                              const DVPrivateOverlay* overlay)
++{
++  m_ready = false;
++  if (m_unsafe) return -1;
++  const char* timing = m_transitionFrames ? std::getenv("DV_PRIVATE_TRANSITION_TIMING") : nullptr;
++  const char* frameTiming = m_processed < 480 ? std::getenv("DV_PRIVATE_FRAME_TIMING") : nullptr;
++  const bool trace = (timing && std::strcmp(timing, "1") == 0) ||
++                    (frameTiming && std::strcmp(frameTiming, "1") == 0);
++  const auto entered = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++  const bool prefetched = Matches(display, owner, pts, geometry, input);
++  if (!prefetched)
++  {
++    if (trace && m_pending)
++      CLog::Log(LOGINFO, "Private source prefetch miss: pending_pts={} selected_pts={}",
++                m_pendingPts, pts);
++    if (!CancelPending()) return -1;
++    const int acquired = AcquireFrame(display, owner, enhancement, pts, geometry, metadata, size);
++    if (acquired != 1) return acquired;
++  }
++  if (input.format == DV_SOURCE_INPUT_NV12 && (!m_submitInput || !m_present))
++  {
++    ReleaseInputs();
++    return 0;
++  }
++  if (overlay && (!overlay->texture || !m_submit || !m_presentOverlay))
++  {
++    if (!CancelPending()) return -1;
++    ReleaseInputs();
++    return -1;
++  }
++  const auto started = std::chrono::steady_clock::now();
++  const char* directNoFinish = m_scanout ? std::getenv("DV_PRIVATE_DIRECT_NO_GL_FINISH") : nullptr;
++  // Private scanout textures have no GL readers after initialization. CL
++  // release and the scanout slot contract still gate every buffer reuse.
++  if (overlay || !directNoFinish || std::strcmp(directNoFinish, "1") != 0)
++    glFinish();
++  const auto glDone = trace ? std::chrono::steady_clock::now() : started;
++  if (m_scanout)
++  {
++    if (!m_scanout->Begin(prefetched ? m_pendingId : m_serial+1,pts)) return -1;
++    if (m_selectOutput(m_engine,m_scanout->Slot()) != 0)
++    {
++      m_scanout->Written(DV_SCANOUT_REJECTED);
++      return -1;
++    }
++  }
++  const unsigned packet = m_scanout ? m_scanout->Packet() : m_packetId;
++  const bool refresh = m_scanout ? m_scanout->Refresh() : m_refresh;
++  const unsigned elSurface = enhancement ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(enhancement->data[3])) : UINT32_MAX;
++  const auto present = [&](uint64_t id)
++  {
++    return overlay ? m_presentOverlay(m_engine, id, pts, packet, refresh, overlay->texture,
++                                      overlay->flipY, overlay->rgbToLms, overlay->whiteNits)
++                   : m_present(m_engine, id, pts, packet, refresh);
++  };
++  int result;
++  if (prefetched)
++    result = present(m_pendingId);
++  else if (input.format == DV_SOURCE_INPUT_NV12 || overlay)
++  {
++    const uint64_t id = ++m_serial;
++    result = input.format == DV_SOURCE_INPUT_NV12 ?
++        m_submitInput(m_engine, surface, elSurface, geometry.width, geometry.height,
++                      metadata, size, id, pts, &geometry, &input) :
++        m_submit(m_engine, surface, elSurface, geometry.width, geometry.height,
++                 metadata, size, id, pts, &geometry);
++    if (result == 0) result = present(id);
++  }
++  else
++    result = m_render(m_engine, surface, elSurface, geometry.width, geometry.height,
++                      metadata, size, ++m_serial, pts, packet, refresh, &geometry);
++  const auto renderDone = trace ? std::chrono::steady_clock::now() : started;
++  if (m_serial <= 12)
++    CLog::Log(LOGINFO, "Private source consume: pts={} prefetch={} status={}", pts, prefetched, result);
++  if (m_drain(m_engine) != 0)
++  {
++    if (m_scanout) m_scanout->Written(DV_SCANOUT_UNCERTAIN);
++    m_unsafe = true;
++    CLog::Log(LOGFATAL, "Private source renderer ownership could not drain; retaining frame leases; restart Kodi");
++    return -1;
++  }
++  const auto drained = trace ? std::chrono::steady_clock::now() : started;
++  m_pending = false;
++  ReleaseInputs();
++  if (m_scanout && !m_scanout->Written(result == 0 ? DV_SCANOUT_ACCEPTED : DV_SCANOUT_REJECTED))
++  {
++    m_unsafe = true;
++    return -1;
++  }
++  if (result == -2 && !overlay)
++    return 0;
++  if (result != 0)
++  {
++    CLog::Log(LOGERROR, "Private source renderer rejected frame pts={} status={}", pts, result);
++    return -1;
++  }
++  const double elapsed = std::chrono::duration<double, std::milli>(
++      std::chrono::steady_clock::now() - started).count();
++  const double processing = elapsed + (prefetched ? m_submitMs : 0.0);
++  m_processingMs += processing;
++  m_prefetchHits += prefetched;
++  ++m_processed;
++  m_preparedPts = pts;
++  m_drainTicket = CDVPrivateDrain::Enabled() ? CDVPrivateDrain::Get().Ticket(owner, pts) : 0;
++  m_ready = true;
++  if (trace)
++  {
++    const auto ms = [](auto end, auto begin) { return std::chrono::duration<double, std::milli>(end - begin).count(); };
++    CLog::Log(LOGINFO, "Private source transition: pts={} direct={} prefetch={} overlay={} setup_ms={} prior_gl_ms={} render_call_ms={} drain_ms={} processing_ms={} remaining={} entered_ns={}",
++        pts, m_scanout != nullptr, prefetched, overlay != nullptr, ms(started,entered), ms(glDone,started),
++        ms(renderDone,glDone), ms(drained,renderDone), processing, m_transitionFrames,
++        std::chrono::duration_cast<std::chrono::nanoseconds>(entered.time_since_epoch()).count());
++  }
++  if (m_transitionFrames) --m_transitionFrames;
++  const char* verify = std::getenv("DV_PRIVATE_VERIFY");
++  // The movie-only oracle cannot validate pixels intentionally covered by GUI.
++  if (!overlay && verify && std::strcmp(verify, "1") == 0 &&
++      (m_verifiedFrames < 6 || m_resetChecks))
++  {
++    std::vector<unsigned char> rgba(3840u * 2160u * 4u);
++    bool readValid = true;
++    if (m_scanout) readValid = m_scanout->Read(rgba.data(),rgba.size());
++    else
++    {
++    GLint previous, packBuffer, alignment, rowLength, skipRows, skipPixels;
++    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous);
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
++    glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
++    glGetIntegerv(GL_PACK_ROW_LENGTH, &rowLength);
++    glGetIntegerv(GL_PACK_SKIP_ROWS, &skipRows);
++    glGetIntegerv(GL_PACK_SKIP_PIXELS, &skipPixels);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
++    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_framebuffer);
++    glReadPixels(0, 0, 3840, 2160, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, previous);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, packBuffer);
++    glPixelStorei(GL_PACK_ALIGNMENT, alignment);
++    glPixelStorei(GL_PACK_ROW_LENGTH, rowLength);
++    glPixelStorei(GL_PACK_SKIP_ROWS, skipRows);
++    glPixelStorei(GL_PACK_SKIP_PIXELS, skipPixels);
++    }
++    if (!readValid || glGetError() != GL_NO_ERROR || !m_check || m_check(m_engine, rgba.data(), rgba.size()) != 0)
++    {
++      m_ready = false;
++      CLog::Log(LOGERROR, "Private source GL output verification failed at pts={}", pts);
++      return -1;
++    }
++    const bool resized = geometry.destination_width &&
++        (geometry.destination_width != geometry.width || geometry.destination_height != geometry.height);
++    CLog::Log(LOGINFO, "Private source GL output verified: pts={} bytes={} check={} prefetch={} after_reset={}",
++        pts, rgba.size(), resized ? "sample-tolerance-and-payload" : "byte-exact", prefetched, m_resetChecks != 0);
++    if (m_resetChecks) --m_resetChecks;
++    if (m_verifiedFrames < 6) ++m_verifiedFrames;
++  }
++  if (m_processed == 1 || m_processed % 120 == 0)
++    CLog::Log(LOGINFO, "Private source frame: serial={} pts={} prepared=true processing_ms={} mean_ms={} diagnostic_readback={} colour_conversion=false prefetch_hit={} prefetch_hits={} present_wait_ms={} submit_ms={}", m_serial, pts, processing, m_processingMs / m_processed, verify && std::strcmp(verify, "1") == 0, prefetched, m_prefetchHits, elapsed, prefetched ? m_submitMs : 0.0);
++  return 1;
++}
++
++bool CDVPrivateSource::Pack(unsigned framebuffer, int width, int height, bool flipY)
++{
++  if (m_scanout) return false;
++  if (!m_ready || width != 3840 || height != 2160 || !flipY)
++    return false;
++  GLint read, draw;
++  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++  const bool scissor = glIsEnabled(GL_SCISSOR_TEST), dither = glIsEnabled(GL_DITHER);
++  glDisable(GL_SCISSOR_TEST);
++  glDisable(GL_DITHER);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, m_framebuffer);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
++  glBlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++  const bool valid = glGetError() == GL_NO_ERROR;
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, read);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw);
++  if (scissor) glEnable(GL_SCISSOR_TEST);
++  if (dither) glEnable(GL_DITHER);
++  return valid;
++}
++
++void CDVPrivateSource::Presented(bool success)
++{
++  const char* endpointTrace = std::getenv("DV_PRIVATE_ENDPOINT_TRACE");
++  if (m_ready && endpointTrace && std::strcmp(endpointTrace, "1") == 0)
++    CLog::Log(LOGINFO, "Private endpoint display commit: pts={} success={} direct={}",
++              m_preparedPts, success, m_scanout != nullptr);
++  if (m_scanout && m_ready && !m_scanout->Presented(success)) m_unsafe = true;
++  if (m_ready && success)
++  {
++    if (!m_unsafe)
++      CDVPrivateDrain::Get().Commit(m_drainTicket);
++    m_packetId = (m_packetId + 1) & 15;
++    m_refresh = false;
++    ++m_presented;
++  }
++  else m_refresh = true;
++  m_ready = false;
++}
++void CDVPrivateSource::Reset()
++{
++  if (!CancelPending()) m_unsafe = true;
++  if (m_scanout && !m_scanout->ResetStream()) m_unsafe = true;
++  m_ready = false;
++  m_refresh = true;
++  m_packetId = 0;
++  m_transitionFrames = 3;
++  const char* verifyReset = std::getenv("DV_PRIVATE_VERIFY_RESET");
++  m_resetChecks = m_processed && verifyReset && std::strcmp(verifyReset, "1") == 0 ? 3 : 0;
++}
++bool CDVPrivateSource::Close()
++{
++  if (m_scanout && !m_scanout->CanClose()) return false;
++  glFinish();
++  if (m_engine && m_destroy(m_engine) != 0)
++    return false;
++  m_engine = nullptr;
++  ReleaseInputs();
++  glDeleteFramebuffers(1, &m_framebuffer);
++  if (m_scanout)
++  {
++    if (!m_scanout->Close()) return false;
++    delete m_scanout;
++    m_scanout = nullptr;
++  }
++  else glDeleteTextures(1, &m_texture);
++  m_framebuffer = m_texture = 0;
++  if (m_library) dlclose(m_library);
++  m_library = nullptr;
++  CLog::Log(LOGINFO, "Private source renderer closed: processed={} submissions={} presented={}", m_processed, m_serial, m_presented);
++  return true;
++}
++
++gbm_bo* CDVPrivateSource::ScanoutBuffer() const
++{ return m_ready && m_scanout ? m_scanout->ReadyBuffer() : nullptr; }
++bool CDVPrivateSource::DisplayReplaced()
++{
++  if (!m_scanout) return true;
++  if (!CancelPending() || !m_scanout->Replaced()) return false;
++  m_ready = false;
++  return true;
++}
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.h
+new file mode 100644
+index 00000000..ffca2d5f
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.h
+@@ -0,0 +1,79 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include "source_geometry.h"
++#include "source_input.h"
++
++class CVideoBuffer;
++class CDVPrivateScanout;
++struct gbm_bo;
++struct AVFrame;
++struct DVPrivateOverlay;
++class CDVPrivateSource
++{
++public:
++  int Prepare(void* display, unsigned surface, CVideoBuffer* owner,
++              const AVFrame* enhancement, const void* metadata, size_t size, int64_t pts,
++              const dv_source_geometry& geometry, const dv_source_input& input,
++              const DVPrivateOverlay* overlay = nullptr);
++  void Prefetch(void* display, unsigned surface, CVideoBuffer* owner,
++                const AVFrame* enhancement, const void* metadata, size_t size, int64_t pts,
++                const dv_source_geometry& geometry, const dv_source_input& input);
++  bool Pack(unsigned framebuffer, int width, int height, bool flipY);
++  bool Close();
++  void Reset();
++  void Presented(bool success);
++  gbm_bo* ScanoutBuffer() const;
++  bool DisplayReplaced();
++private:
++  bool Initialize(void* display);
++  bool InitializeScanout(void* display, const char* resources);
++  bool InitializeOverlays();
++  void ReleaseInputs();
++  int AcquireFrame(void* display, CVideoBuffer* owner, const AVFrame* enhancement,
++                   int64_t pts, const dv_source_geometry& geometry,
++                   const void* metadata, size_t size);
++  bool Matches(void* display, CVideoBuffer* owner, int64_t pts,
++               const dv_source_geometry& geometry, const dv_source_input& input) const;
++  bool CancelPending();
++  void* m_library{nullptr};
++  void* m_engine{nullptr};
++  void* m_display{nullptr};
++  void* (*m_create)(uintptr_t, uintptr_t, uintptr_t, unsigned, const char*){nullptr};
++  void* (*m_createStorage)(uintptr_t, uintptr_t, uintptr_t, unsigned, const char*, unsigned){nullptr};
++  int (*m_attachOutput)(void*, unsigned){nullptr};
++  int (*m_selectOutput)(void*, unsigned){nullptr};
++  CDVPrivateScanout* m_scanout{nullptr};
++  int (*m_render)(void*, unsigned, unsigned, unsigned, unsigned, const void*, size_t,
++                  uint64_t, int64_t, unsigned, int, const dv_source_geometry*){nullptr};
++  int (*m_drain)(void*){nullptr};
++  int (*m_destroy)(void*){nullptr};
++  int (*m_check)(void*, const unsigned char*, size_t){nullptr};
++  int (*m_submit)(void*, unsigned, unsigned, unsigned, unsigned, const void*, size_t,
++                  uint64_t, int64_t, const dv_source_geometry*){nullptr};
++  int (*m_submitInput)(void*, unsigned, unsigned, unsigned, unsigned, const void*, size_t,
++                  uint64_t, int64_t, const dv_source_geometry*, const dv_source_input*){nullptr};
++  int (*m_present)(void*, uint64_t, int64_t, unsigned, int){nullptr};
++  int (*m_prepareOverlays)(void*){nullptr};
++  int (*m_presentOverlay)(void*, uint64_t, int64_t, unsigned, int, unsigned,
++                          unsigned, const double*, double){nullptr};
++  int (*m_cancel)(void*){nullptr};
++  CVideoBuffer* m_owner{nullptr};
++  std::shared_ptr<AVFrame> m_enhancement;
++  unsigned m_texture{0}, m_framebuffer{0}, m_packetId{0};
++  uint64_t m_serial{0}, m_presented{0};
++  uint64_t m_processed{0};
++  double m_processingMs{0};
++  bool m_pending{false};
++  uint64_t m_pendingId{0}, m_prefetchHits{0};
++  int64_t m_pendingPts{0};
++  int64_t m_preparedPts{0};
++  uint64_t m_drainTicket{0};
++  dv_source_geometry m_pendingGeometry{};
++  dv_source_input m_pendingInput{};
++  double m_submitMs{0};
++  unsigned m_transitionFrames{3}, m_resetChecks{0}, m_verifiedFrames{0};
++  bool m_refresh{true}, m_ready{false}, m_unsafe{false};
++};
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+index 70a03b18..8ac8b351 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+@@ -212,7 +212,8 @@ bool CRendererVAAPIGLES::RenderHook(int idx)
+ }
+ 
+ #ifdef HAVE_DVBRIDGE
+-bool CRendererVAAPIGLES::BuildDVBridgeLayer(int idx, CDVBridgeGLES::Layer& layer)
++bool CRendererVAAPIGLES::BuildDVBridgeLayer(int idx, CDVBridgeGLES::Layer& layer,
++                                         bool requireTexture)
+ {
+   // Native decoder textures only. Postprocessed/cropped/rotated images need
+   // their own explicit metadata/geometry mapping and must not fall back here.
+@@ -243,8 +244,8 @@ bool CRendererVAAPIGLES::BuildDVBridgeLayer(int idx, CDVBridgeGLES::Layer& layer
+   layer.binding = hdr10 ? source.doviSourceBinding : buffer.doviMetadata.Binding();
+   if (!std::isfinite(layer.pts) || (hdr10 && source.doviSourcePts == AV_NOPTS_VALUE))
+     return false;
+-  const auto texture = m_texturePool.Retain(m_vaapiTextures[idx]);
+-  if (!texture || !buffer.doviSourcePicture) return false;
++  const auto texture = requireTexture ? m_texturePool.Retain(m_vaapiTextures[idx]) : nullptr;
++  if (requireTexture && !texture) return false;
+   layer.sourceInfo = buffer.doviSourcePicture->doviSourceInfo;
+   if (hdr10)
+   {
+@@ -266,6 +267,13 @@ bool CRendererVAAPIGLES::BuildDVBridgeLayer(int idx, CDVBridgeGLES::Layer& layer
+     std::shared_ptr<VideoPicture> decoded;
+   };
+   layer.lease = std::make_shared<ForeignLease>(texture,buffer.doviSourcePicture);
++  if (auto* picture = dynamic_cast<CVaapiRenderPicture*>(buffer.videoBuffer))
++  {
++    layer.vaDisplay = picture->vadsp;
++    layer.vaSurface = picture->procPic.videoSurface;
++    layer.vaOwner = picture;
++    layer.chromaPosition = picture->DVDPic.chroma_position;
++  }
+   for (int p = 0; p < 2; ++p)
+   {
+     const auto& plane = buffer.fields[FIELD_FULL][p];
+@@ -313,16 +321,32 @@ bool CRendererVAAPIGLES::HDR10AIFrameCommitted() const
+ #endif
+ 
+ bool CRendererVAAPIGLES::RenderDVBridge(int idx)
++{
++  return ProcessDVBridge(idx, false);
++}
++
++void CRendererVAAPIGLES::PrefetchVideoPicture(int idx)
++{
++  ProcessDVBridge(idx, true);
++}
++
++bool CRendererVAAPIGLES::ProcessDVBridge(int idx, bool prefetch)
+ {
+   auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
+       CServiceBroker::GetWinSystem());
+   CDVBridgeGLES::Layer layer{};
+-  if (!window || !BuildDVBridgeLayer(idx,layer)) return false;
++  if (!window || !BuildDVBridgeLayer(idx,layer,!prefetch)) return false;
+   auto& buffer = m_buffers[idx];
+   dvbridge_geometry geometry{layer.width, layer.height,
+       static_cast<int>(std::lround(m_destRect.x1)), static_cast<int>(std::lround(m_destRect.y1)),
+       static_cast<int>(std::lround(m_destRect.Width())),
+       static_cast<int>(std::lround(m_destRect.Height()))};
++  if (prefetch)
++  {
++    window->PrefetchDVBridge(layer, buffer.doviEnhancement,
++        buffer.doviEnhancementBinding, buffer.doviMetadata, geometry);
++    return true;
++  }
+   return window->RenderDVBridge(layer, buffer.doviEnhancement,
+       buffer.doviEnhancementBinding, buffer.doviMetadata, geometry);
+ }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
+index 4a8aa5bd..814871a7 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
+@@ -64,7 +64,9 @@ protected:
+   bool RenderHook(int idx) override;
+ #ifdef HAVE_DVBRIDGE
+   bool RenderDVBridge(int idx) override;
+-  bool BuildDVBridgeLayer(int idx, CDVBridgeGLES::Layer& layer);
++  bool BuildDVBridgeLayer(int idx, CDVBridgeGLES::Layer& layer, bool requireTexture = true);
++  void PrefetchVideoPicture(int idx) override;
++  bool ProcessDVBridge(int idx, bool prefetch);
+ #endif
+   void AfterRenderHook(int idx) override;
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index 5589003c..3b7eace5 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -1263,6 +1263,8 @@ bool CLinuxRendererGLES::Render(unsigned int flags, int index)
+     if (!window || !window->PrepareDVOutputFrame(*m_buffers[index].doviSourcePicture))
+       return false;
+     m_dvRequested = window->DVBridgeRequested(m_buffers[index].doviSourcePicture.get());
++    // Output admission can enable compositing after Configure's initial probe.
++    m_hdrFboActive = window->IsHdrComposite();
+   }
+   if (m_dvRequested)
+   {
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+index b470af76..65775f27 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+@@ -299,6 +299,18 @@ void CRenderer::Render(COverlay* o)
+   o->Render(state);
+ }
+ 
++bool CRenderer::HasHDROverlay(int idx) const
++{
++  std::unique_lock lock(m_section);
++  if (idx < 0 || idx >= NUM_BUFFERS)
++    return false;
++  for (const auto& e : m_buffers[idx])
++    if (e.overlay_dvd && e.overlay_dvd->IsOverlayType(DVDOVERLAY_TYPE_IMAGE) &&
++        static_cast<const CDVDOverlayImage&>(*e.overlay_dvd).m_isHDROverlay)
++      return true;
++  return false;
++}
++
+ bool CRenderer::HasVisibleOverlay(int idx) const
+ {
+   std::unique_lock lock(m_section);
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+index cd61e110..060d0899 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+@@ -115,6 +115,7 @@ namespace OVERLAY {
+ 
+     // render overlays already in HDR (not sRGB)
+     void RenderHDROverlays(int idx);
++    bool HasHDROverlay(int idx) const;
+ 
+     /*!
+      * \brief Pre-walk hook: render libass output for the present slot.
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 5b527272..c9c78cf7 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -7,6 +7,9 @@
+  */
+ 
+ #include "RenderManager.h"
++#ifdef HAVE_DVBRIDGE
++#include "DVPrivateDrain.h"
++#endif
+ 
+ /* to use the same as player */
+ #include "../VideoPlayer/DVDClock.h"
+@@ -36,8 +39,12 @@
+ #include "guilib/WindowIDs.h"
+ #endif
+ #ifdef HAVE_DVBRIDGE
++#include "guilib/GUIComponent.h"
++#include "guilib/GUIWindowManager.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h"
+ #include "windowing/gbm/WinSystemGbmGLESContext.h"
++#include <cstdlib>
++#include <cstring>
+ #endif
+ 
+ using namespace std::chrono_literals;
+@@ -151,9 +158,18 @@ bool CRenderManager::Configure(const VideoPicture& picture, float fps, unsigned
+   {
+     std::unique_lock lock(m_statelock);
+     m_picture.SetParams(picture);
+-    m_nativeDVRate = false;
+ #ifdef HAVE_DVBRIDGE
+-    m_nativeDVRate = DVBRIDGE::WantsNativeOutput(&picture);
++    bool nativeDV = DVBRIDGE::WantsNativeOutput(&picture);
++    if (!nativeDV && m_nativeDVRate && picture.doviMetadata.Binding().Valid())
++    {
++      auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++          CServiceBroker::GetWinSystem());
++      // Preserve stream timing intent until this picture has import evidence.
++      nativeDV = window && !window->GetDVOutputCapabilities(&picture).processingKnown;
++    }
++    m_nativeDVRate = nativeDV;
++#else
++    m_nativeDVRate = false;
+ #endif
+     m_fps = fps;
+     m_orientation = orientation;
+@@ -283,6 +299,10 @@ bool CRenderManager::IsConfigured() const
+ 
+ void CRenderManager::ShowVideo(bool enable)
+ {
++#ifdef HAVE_DVBRIDGE
++  if (!enable && CDVPrivateDrain::Enabled())
++    CDVPrivateDrain::Get().Cancel();
++#endif
+   m_showVideo = enable;
+   if (!enable)
+     DiscardBuffer();
+@@ -492,6 +512,24 @@ void CRenderManager::FrameMove()
+   // to use during the render pass. PrepareOverlays MarkDirty's on libass
+   // changes and on PGS/DVB/SPU arrival/disappearance.
+   m_overlays.PrepareOverlays(m_presentsource);
++#ifdef HAVE_DVBRIDGE
++  const char* earlyProbe = std::getenv("DV_PRIVATE_EARLY_PROBE");
++  if (earlyProbe && std::strcmp(earlyProbe, "1") == 0)
++  {
++    const bool controls = CServiceBroker::GetGUI()->GetWindowManager().HasVisibleControls();
++    if (m_probeControls && !controls) m_probeFrames = 3;
++    m_probeControls = controls;
++    if (!controls && m_probeFrames)
++    {
++      std::unique_lock lock(m_presentlock);
++      const auto now = std::chrono::steady_clock::now().time_since_epoch();
++      CLog::Log(LOGINFO, "Private source early probe: pts={} steady_ns={} subtitles={} remaining={}",
++          m_Queue[m_presentsource].pts, std::chrono::duration_cast<std::chrono::nanoseconds>(now).count(),
++          m_overlays.HasVisibleOverlay(m_presentsource), m_probeFrames);
++      --m_probeFrames;
++    }
++  }
++#endif
+ }
+ 
+ void CRenderManager::PreInit()
+@@ -531,6 +569,10 @@ void CRenderManager::PreInit()
+ 
+ void CRenderManager::UnInit()
+ {
++#ifdef HAVE_DVBRIDGE
++  if (CDVPrivateDrain::Enabled())
++    CDVPrivateDrain::Get().Cancel();
++#endif
+   if (!CServiceBroker::GetAppMessenger()->IsProcessThread())
+   {
+     m_initEvent.Reset();
+@@ -559,6 +601,10 @@ void CRenderManager::UnInit()
+ 
+ bool CRenderManager::Flush(bool wait, bool saveBuffers)
+ {
++#ifdef HAVE_DVBRIDGE
++  if (CDVPrivateDrain::Enabled())
++    CDVPrivateDrain::Get().Cancel();
++#endif
+   if (!m_pRenderer)
+     return true;
+ 
+@@ -764,7 +810,8 @@ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
+   {
+ #ifdef HAVE_DVBRIDGE
+     if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem()))
+-      window->SetDVBridgeOverlays(m_renderDebug || m_overlays.HasVisibleOverlay(m_presentsource));
++      window->SetDVBridgeOverlays(m_renderDebug || m_overlays.HasVisibleOverlay(m_presentsource),
++                                  m_overlays.HasHDROverlay(m_presentsource), m_renderDebug);
+ #endif
+     SPresent& m = m_Queue[m_presentsource];
+ 
+@@ -776,6 +823,11 @@ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
+       PresentSingle(clear, flags, alpha);
+ 
+     presented = true;
++    {
++      std::unique_lock lock(m_presentlock);
++      if (!m_queued.empty())
++        m_pRenderer->PrefetchVideoPicture(m_queued.front());
++    }
+   }
+ 
+   // the just-presented region is video-only: OSD, GUI and subtitles come later
+@@ -1005,6 +1057,8 @@ void CRenderManager::ToggleDebug()
+   m_renderDebug = isEnabled;
+   m_debugTimer.SetExpired();
+   m_renderDebugVideo = false;
++  if (CServiceBroker::GetWinSystem()->UsesNativeGuiCoverage())
++    CServiceBroker::GetGUI()->GetWindowManager().MarkDirty();
+ }
+ 
+ void CRenderManager::ToggleDebugVideo()
+@@ -1018,6 +1072,8 @@ void CRenderManager::ToggleDebugVideo()
+   m_renderDebug = isEnabled;
+   m_debugTimer.SetExpired();
+   m_renderDebugVideo = true;
++  if (CServiceBroker::GetWinSystem()->UsesNativeGuiCoverage())
++    CServiceBroker::GetGUI()->GetWindowManager().MarkDirty();
+ }
+ 
+ void CRenderManager::SetSubtitleVerticalPosition(int value, bool save)
+@@ -1090,6 +1146,15 @@ bool CRenderManager::AddVideoPicture(const VideoPicture& picture, volatile std::
+ #ifdef CB1_HAS_HDR10_AI
+   m.duration = picture.iDuration;
+   if (m_pRenderer->HDR10AILookahead()) wait = false;
++#endif
++#ifdef HAVE_DVBRIDGE
++  if (CDVPrivateDrain::Enabled())
++  {
++    if (m_nativeDVRate && picture.videoBuffer && picture.pts != DVD_NOPTS_VALUE)
++      CDVPrivateDrain::Get().Queue(picture.videoBuffer, static_cast<int64_t>(picture.pts));
++    else
++      CDVPrivateDrain::Get().Cancel();
++  }
+ #endif
+   m_queued.push_back(m_free.front());
+   m_free.pop_front();
+@@ -1119,6 +1184,22 @@ bool CRenderManager::AddVideoPicture(const VideoPicture& picture, volatile std::
+       }
+     }
+     m_forceNext = false;
++#ifdef HAVE_DVBRIDGE
++    const char* firstCommit = std::getenv("DV_PRIVATE_STARTUP_COMMIT");
++    if (m_nativeDVRate && CDVPrivateDrain::Enabled() && firstCommit &&
++        std::strcmp(firstCommit, "1") == 0)
++    {
++      // Frame selection does not mean the native renderer has finished setup.
++      // Release the presentation lock so rendering and cancellation can proceed.
++      lock.unlock();
++      const auto started = std::chrono::steady_clock::now();
++      const auto result = CDVPrivateDrain::Get().Wait(bStop, 10s);
++      CLog::Log(LOGINFO, "Private source startup commit: pts={} result={} wait_ms={}",
++          picture.pts, static_cast<int>(result),
++          std::chrono::duration<double, std::milli>(
++              std::chrono::steady_clock::now() - started).count());
++    }
++#endif
+   }
+ 
+   return true;
+@@ -1305,6 +1386,15 @@ void CRenderManager::PrepareNextRender()
+       ++iter;
+     }
+ 
++#ifdef HAVE_DVBRIDGE
++    const char* startupTrace = std::getenv("DV_PRIVATE_FRAME_TIMING");
++    if (m_nativeDVRate && startupTrace && std::strcmp(startupTrace, "1") == 0 &&
++        m_Queue[idx].pts >= 0 && m_Queue[idx].pts < DVD_TIME_BASE)
++      CLog::Log(LOGINFO,
++          "Private source startup selection: front_pts={} selected_pts={} clock={} render_pts={} latency={} paused={} forced={} queued={}",
++          m_Queue[m_queued.front()].pts, m_Queue[idx].pts, frameOnScreen, renderPts,
++          m_displayLatency, isPaused, m_forceNext, m_queued.size());
++#endif
+     // skip late frames
+     while (m_queued.front() != idx)
+     {
+@@ -1312,6 +1402,14 @@ void CRenderManager::PrepareNextRender()
+       {
+         m_discard.push_back(m_presentsourcePast);
+         m_QueueSkip++;
++#ifdef HAVE_DVBRIDGE
++        const char* trace = std::getenv("DV_PRIVATE_TRANSITION_TIMING");
++        if (trace && std::strcmp(trace, "1") == 0 && m_QueueSkip <= 32)
++          CLog::Log(LOGINFO,
++              "Private source queue skip: total={} discarded_pts={} selected_pts={} render_pts={} lateframes={} queued={}",
++              m_QueueSkip, m_Queue[m_presentsourcePast].pts, m_Queue[idx].pts,
++              renderPts, m_lateframes, m_queued.size());
++#endif
+       }
+       m_presentsourcePast = m_queued.front();
+       m_queued.pop_front();
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+index aa4663eb..62ff844c 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+@@ -253,6 +253,10 @@ protected:
+   int m_lateframes = -1;
+   double m_presentpts = 0.0;
+   EPRESENTSTEP m_presentstep = PRESENT_IDLE;
++#ifdef HAVE_DVBRIDGE
++  bool m_probeControls{true};
++  unsigned m_probeFrames{0};
++#endif
+   XbmcThreads::EndTime<> m_presentTimer;
+   bool m_forceNext = false;
+   int m_presentsource = 0;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/dv_scanout_slots.h b/xbmc/cores/VideoPlayer/VideoRenderers/dv_scanout_slots.h
+new file mode 100644
+index 00000000..a73d822b
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/dv_scanout_slots.h
+@@ -0,0 +1,41 @@
++#ifndef DV_SCANOUT_SLOTS_H
++#define DV_SCANOUT_SLOTS_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++enum {DV_SCANOUT_BUSY=1};
++typedef enum {DV_SCANOUT_REJECTED=0,DV_SCANOUT_ACCEPTED=1,DV_SCANOUT_UNCERTAIN=2} dv_scanout_outcome;
++typedef struct {uint64_t frame_id;int64_t pts;} dv_scanout_identity;
++typedef struct {
++    uint64_t serial;
++    dv_scanout_identity identity;
++    unsigned slot,packet_id,refresh;
++} dv_scanout_lease;
++typedef struct {
++    uint64_t serial;
++    dv_scanout_lease pending;
++    int current,writing,ready,quarantined;
++    unsigned packet_id,refresh;
++} dv_scanout_slots;
++/* Single render-thread bookkeeping, no allocation or implicit GPU/KMS waits.
++ * Exactly two externally owned BOs. Initialize once before either is used. */
++void dv_scanout_slots_init(dv_scanout_slots *);
++int dv_scanout_slots_acquire(dv_scanout_slots *,dv_scanout_identity,dv_scanout_lease *);
++/* ACCEPTED certifies GPU completion AND release of producer ownership.
++ * REJECTED certifies all attempted writes have drained. Otherwise UNCERTAIN. */
++int dv_scanout_slots_written(dv_scanout_slots *,const dv_scanout_lease *,dv_scanout_outcome);
++/* ACCEPTED means a successful BLOCKING replacement commit, not a queued flip.
++ * REJECTED means old scanout is unchanged. Unknown outcomes quarantine both BOs. */
++int dv_scanout_slots_committed(dv_scanout_slots *,const dv_scanout_lease *,dv_scanout_outcome);
++/* Stream reset retains current display ownership. Pending writes must first
++ * finish/drain; ready but uncommitted output may be discarded. */
++int dv_scanout_slots_reset_stream(dv_scanout_slots *);
++/* Caller certifies external scanout was restored and all GPU work drained.
++ * Preserves serial so pre-reset leases cannot authorize a later frame. */
++void dv_scanout_slots_restored(dv_scanout_slots *);
++int dv_scanout_slots_can_destroy(const dv_scanout_slots *);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/source_geometry.h b/xbmc/cores/VideoPlayer/VideoRenderers/source_geometry.h
+new file mode 100644
+index 00000000..c700c8a1
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/source_geometry.h
+@@ -0,0 +1,24 @@
++#ifndef DV_SOURCE_GEOMETRY_H
++#define DV_SOURCE_GEOMETRY_H
++#include <stddef.h>
++#include <stdint.h>
++enum {DV_SOURCE_CHROMA_CENTER_LEFT=0,DV_SOURCE_CHROMA_TOP_LEFT=1};
++typedef struct {
++    unsigned width,height,canvas_width,canvas_height,x,y;
++    unsigned chroma_siting; /* Reconstructed planes,not the decoded EL. */
++    unsigned destination_width,destination_height; /* Both zero means no resize. */
++} dv_source_geometry;
++/* Even placement retains alternating Cb/Cr sample identity.
++ * Metadata and length are unchanged on failure. */
++int dv_source_geometry_valid(const dv_source_geometry *);
++unsigned dv_source_destination_width(const dv_source_geometry *);
++unsigned dv_source_destination_height(const dv_source_geometry *);
++int dv_source_place_metadata(const dv_source_geometry *,unsigned char [512],size_t *);
++/* Resize in source space before packing. Active rectangles use half-open
++ * coordinates; round outward so scaling cannot discard active source pixels.
++ * These helpers do not enable scaling in the renderer. */
++int dv_source_map_active(const dv_source_geometry *,unsigned,unsigned,
++                         const uint32_t [4],uint32_t [4]);
++int dv_source_place_scaled_metadata(const dv_source_geometry *,unsigned,unsigned,
++                                    unsigned char [512],size_t *);
++#endif
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/source_input.h b/xbmc/cores/VideoPlayer/VideoRenderers/source_input.h
+new file mode 100644
+index 00000000..d1bcf55d
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/source_input.h
+@@ -0,0 +1,6 @@
++#ifndef DV_SOURCE_INPUT_H
++#define DV_SOURCE_INPUT_H
++#include <stdint.h>
++enum {DV_SOURCE_INPUT_P010=1,DV_SOURCE_INPUT_NV12=2};
++typedef struct {uint32_t size,format,bit_depth;} dv_source_input;
++#endif
+diff --git a/xbmc/guilib/GUIFontTTFGLES.cpp b/xbmc/guilib/GUIFontTTFGLES.cpp
+index 6554740f..9cd729d3 100644
+--- a/xbmc/guilib/GUIFontTTFGLES.cpp
++++ b/xbmc/guilib/GUIFontTTFGLES.cpp
+@@ -135,7 +135,8 @@ bool CGUIFontTTFGLES::FirstBegin()
+   // alpha blend that approximately matches SDR perceived translucency. It
+   // is a "close enough" compromise; a mathematically correct fix would
+   // require linear-light compositing (too expensive on typical ARM GPUs).
+-  if (CServiceBroker::GetWinSystem()->IsHdrComposite())
++  if (CServiceBroker::GetWinSystem()->IsHdrComposite() &&
++      !CServiceBroker::GetWinSystem()->UsesNativeGuiCoverage())
+     glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+   else
+     glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE_MINUS_DST_ALPHA, GL_ONE);
+diff --git a/xbmc/guilib/GUITextureGLES.cpp b/xbmc/guilib/GUITextureGLES.cpp
+index a55365e4..34ef705b 100644
+--- a/xbmc/guilib/GUITextureGLES.cpp
++++ b/xbmc/guilib/GUITextureGLES.cpp
+@@ -123,7 +123,8 @@ void CGUITextureGLES::Begin(KODI::UTILS::COLOR::Color color)
+     // coverage alpha; HDR FBO composite uses a compensated squared-alpha
+     // blend because the FBO is color-transformed to PQ/HLG before composite,
+     // and alpha blending in non-linear space is mathematically wrong.
+-    if (CServiceBroker::GetWinSystem()->IsHdrComposite())
++    if (CServiceBroker::GetWinSystem()->IsHdrComposite() &&
++        !CServiceBroker::GetWinSystem()->UsesNativeGuiCoverage())
+       glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA,
+                           GL_ONE_MINUS_SRC_ALPHA);
+     else
+@@ -295,7 +296,10 @@ void CGUITextureGLES::DrawQuad(const CRect& rect,
+ 
+   if (blending)
+   {
+-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++    if (CServiceBroker::GetWinSystem()->UsesNativeGuiCoverage())
++      glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++    else
++      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+     glEnable(GL_BLEND);
+   }
+   else
+diff --git a/xbmc/guilib/GUIVideoControl.cpp b/xbmc/guilib/GUIVideoControl.cpp
+index 88bc1195..b919fec4 100644
+--- a/xbmc/guilib/GUIVideoControl.cpp
++++ b/xbmc/guilib/GUIVideoControl.cpp
+@@ -38,7 +38,8 @@ void CGUIVideoControl::Process(unsigned int currentTime, CDirtyRegionList &dirty
+   const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+   // Only fire for single-plane renderers where video draws via the GUI walk.
+   // See CGUIWindowFullScreen::Process for full rationale.
+-  if (!appPlayer->IsRenderingVideoLayer())
++  if (!appPlayer->IsRenderingVideoLayer() &&
++      !CServiceBroker::GetWinSystem()->CanReuseGuiComposite())
+     MarkDirtyRegion();
+ 
+   CGUIControl::Process(currentTime, dirtyregions);
+diff --git a/xbmc/guilib/GUIWindowManager.cpp b/xbmc/guilib/GUIWindowManager.cpp
+index 0ca0a397..59e9101d 100644
+--- a/xbmc/guilib/GUIWindowManager.cpp
++++ b/xbmc/guilib/GUIWindowManager.cpp
+@@ -1323,6 +1323,7 @@ void CGUIWindowManager::MarkDirty()
+ 
+ void CGUIWindowManager::MarkDirty(const CRect& rect)
+ {
++  ++m_dirtyGeneration;
+   m_tracker.MarkDirtyRegion(CDirtyRegion(rect));
+ 
+   CGUIWindow* pWindow = GetWindow(GetActiveWindow());
+diff --git a/xbmc/guilib/GUIWindowManager.h b/xbmc/guilib/GUIWindowManager.h
+index 59de35c8..012a1b6c 100644
+--- a/xbmc/guilib/GUIWindowManager.h
++++ b/xbmc/guilib/GUIWindowManager.h
+@@ -16,6 +16,8 @@
+ #include "messaging/IMessageTarget.h"
+ 
+ #include <list>
++#include <atomic>
++#include <cstdint>
+ #include <memory>
+ #include <unordered_map>
+ #include <utility>
+@@ -106,6 +108,7 @@ public:
+    *   (currently gated to D2P plane and HDR GUI compositing FBO contexts).
+    */
+   bool HasDirtyRegions() const { return !m_dirtyregions.empty(); }
++  uint64_t GetDirtyGeneration() const { return m_dirtyGeneration.load(); }
+ 
+   /*! \brief Rendering of the current window and any dialogs
+    Render is called every frame to draw the current window and any dialogs.
+@@ -305,5 +308,6 @@ private:
+   mutable bool m_inhibitTouchGestureEvents{false};
+ 
+   CDirtyRegionList m_dirtyregions;
++  std::atomic<uint64_t> m_dirtyGeneration{0};
+   CDirtyRegionTracker m_tracker;
+ };
+diff --git a/xbmc/video/windows/GUIWindowFullScreen.cpp b/xbmc/video/windows/GUIWindowFullScreen.cpp
+index 5f5a555c..d972fd63 100644
+--- a/xbmc/video/windows/GUIWindowFullScreen.cpp
++++ b/xbmc/video/windows/GUIWindowFullScreen.cpp
+@@ -382,7 +382,8 @@ void CGUIWindowFullScreen::Process(unsigned int currentTime, CDirtyRegionList &d
+   // Single-plane: MarkDirtyRegion every frame so the render pass keeps
+   // running and draws the next video frame. D2P video plane updates
+   // independently.
+-  if (!appPlayer->IsRenderingVideoLayer())
++  if (!appPlayer->IsRenderingVideoLayer() &&
++      !CServiceBroker::GetWinSystem()->CanReuseGuiComposite())
+     MarkDirtyRegion();
+ 
+   m_controlStats->Reset();
+diff --git a/xbmc/windowing/WinSystem.h b/xbmc/windowing/WinSystem.h
+index 477632da..46fcf756 100644
+--- a/xbmc/windowing/WinSystem.h
++++ b/xbmc/windowing/WinSystem.h
+@@ -280,6 +280,8 @@ public:
+   // yields wrong transparency. When true, GUI draws select a compensated
+   // alpha blend (see CGUIFontTTFGLES::FirstBegin).
+   virtual bool IsHdrComposite() const { return false; }
++  virtual bool UsesNativeGuiCoverage() const { return false; }
++  virtual bool CanReuseGuiComposite() const { return false; }
+ 
+   /*!
+    * \brief Gets debug info from video renderer for use in "Debug Info OSD" (Alt + O)
+diff --git a/xbmc/windowing/gbm/GBMUtils.cpp b/xbmc/windowing/gbm/GBMUtils.cpp
+index 949d36bc..7c7325f7 100644
+--- a/xbmc/windowing/gbm/GBMUtils.cpp
++++ b/xbmc/windowing/gbm/GBMUtils.cpp
+@@ -152,6 +152,13 @@ void CGBMUtils::CGBMDevice::CGBMSurface::EndTransactionalMode()
+     m_buffers.push(std::move(m_scanoutBuffer));
+ }
+ 
++void CGBMUtils::CGBMDevice::CGBMSurface::RetireTransactionalScanout()
++{
++  while (!m_buffers.empty())
++    m_buffers.pop();
++  m_scanoutBuffer.reset();
++}
++
+ CGBMUtils::CGBMDevice::CGBMSurface::CGBMSurfaceBuffer::~CGBMSurfaceBuffer()
+ {
+   if (m_surface && m_buffer)
+diff --git a/xbmc/windowing/gbm/GBMUtils.h b/xbmc/windowing/gbm/GBMUtils.h
+index bff3f220..6a0b1d72 100644
+--- a/xbmc/windowing/gbm/GBMUtils.h
++++ b/xbmc/windowing/gbm/GBMUtils.h
+@@ -146,6 +146,9 @@ public:
+       gbm_bo* LockTransactionalBuffer();
+       void CompleteTransactionalBuffer(bool presented);
+       void EndTransactionalMode();
++      bool HasPendingTransactionalBuffer() const { return m_pendingBuffer != nullptr; }
++      // Only after a successful blocking commit to caller-owned external storage.
++      void RetireTransactionalScanout();
+ 
+     private:
+       gbm_surface* m_surface{nullptr};
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 32f5f797..7b102ce1 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -320,13 +320,16 @@ bool CWinSystemGbm::SupportsNativeDVOutput() const
+          !(mode->flags & DRM_MODE_FLAG_INTERLACE);
+ }
+ 
+-bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore)
++bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore, gbm_bo* external)
+ {
+   auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+   if (!drm || !m_GBM || !state.Captured())
+     return false;
+   auto& surface = m_GBM->GetDevice().GetSurface();
+-  auto* bo = surface.LockTransactionalBuffer();
++  if (external && (restore || surface.HasPendingTransactionalBuffer() ||
++                   gbm_bo_get_device(external) != m_GBM->GetDevice().Get()))
++    return false;
++  auto* bo = external ? external : surface.LockTransactionalBuffer();
+   bool valid = bo != nullptr;
+   if (valid && !restore)
+   {
+@@ -349,7 +352,13 @@ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore)
+   if (valid)
+     valid = state.Stage(*drm, restore);
+   const bool accepted = drm->FlipPageTransactional(valid ? bo : nullptr, restore);
+-  surface.CompleteTransactionalBuffer(accepted);
++  if (external)
++  {
++    if (accepted)
++      surface.RetireTransactionalScanout();
++  }
++  else
++    surface.CompleteTransactionalBuffer(accepted);
+   if (accepted && restore)
+   {
+     surface.EndTransactionalMode();
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 208b1b2d..530f8aa9 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -52,7 +52,9 @@ public:
+ 
+   void FlipPage(bool rendered, bool videoLayer, bool async);
+ #ifdef HAVE_DVBRIDGE
+-  bool FlipDVBridgePage(CDVBridgeState& state, bool restore);
++  // external remains caller-owned until a successful replacement/restoration.
++  // It must be GPU-complete and belong to this DRM device; never use for restore.
++  bool FlipDVBridgePage(CDVBridgeState& state, bool restore, gbm_bo* external = nullptr);
+   bool SupportsNativeDVOutput() const;
+ #endif
+ 
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 081b6b30..54246e8f 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -10,6 +10,7 @@
+ #ifdef HAVE_DVBRIDGE
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackNotification.h"
+ #endif
++#include "cores/VideoPlayer/VideoRenderers/DVPrivateOverlay.h"
+ 
+ #include "OptionalsReg.h"
+ #include "cores/RetroPlayer/process/gbm/RPProcessInfoGbm.h"
+@@ -45,8 +46,10 @@ extern "C"
+ #include <mutex>
+ #include <chrono>
+ #include <thread>
++#include <cmath>
+ #include <cstdlib>
+ #include <cstring>
++#include <vector>
+ #ifdef HAVE_DVBRIDGE
+ #include "ServiceBroker.h"
+ #include "DVBridgeCapture.h"
+@@ -265,7 +268,13 @@ void CWinSystemGbmGLESContext::PresentFrame(bool rendered, bool videoLayer)
+     CDVBridgeGLES::Submission submitted;
+     // EGL's window framebuffer has a bottom-left GL origin, while transport
+     // metadata is indexed from the top-left of the HDMI raster.
+-    if (m_dvFrame && m_dvBridge && m_dvBridge->Pack(0, m_nWidth, m_nHeight, true))
++    auto* nativeScanout = m_dvBridge ? m_dvBridge->GetPrivateScanout() : nullptr;
++    if (nativeScanout)
++    {
++      submitted = m_dvBridge->CaptureSubmission();
++      presented = FlipDVBridgePage(m_dvState, false, nativeScanout);
++    }
++    else if (m_dvFrame && m_dvBridge && m_dvBridge->Pack(0, m_nWidth, m_nHeight, true))
+     {
+       submitted = m_dvBridge->CaptureSubmission();
+       if (!m_dvBridge->Advanced()) glFinish();
+@@ -385,6 +394,11 @@ bool CWinSystemGbmGLESContext::SetGuiCompositing(int colorTransfer)
+   else
+   {
+     m_guiFbo.Cleanup();
++    m_guiHalfFbo.Cleanup();
++    m_guiHalf = false;
++    m_guiHalfBound = false;
++    m_guiRasterReady = true;
++    m_nativeGuiCoverage = false;
+     m_guiFboWidth = 0;
+     m_guiFboHeight = 0;
+     m_compositeShader.reset();
+@@ -393,15 +407,81 @@ bool CWinSystemGbmGLESContext::SetGuiCompositing(int colorTransfer)
+   return m_guiCompositing;
+ }
+ 
++void CWinSystemGbmGLESContext::ScaleGuiRaster(bool viewport)
++{
++  GLint box[4];
++  glGetIntegerv(viewport ? GL_VIEWPORT : GL_SCISSOR_BOX, box);
++  const GLint left = static_cast<GLint>(std::floor(box[0] / 2.0));
++  const GLint bottom = static_cast<GLint>(std::floor(box[1] / 2.0));
++  const GLint right = static_cast<GLint>(std::ceil((box[0] + box[2]) / 2.0));
++  const GLint top = static_cast<GLint>(std::ceil((box[1] + box[3]) / 2.0));
++  if (viewport)
++    glViewport(left, bottom, right - left, top - bottom);
++  else
++    glScissor(left, bottom, right - left, top - bottom);
++}
++
++void CWinSystemGbmGLESContext::SetViewPort(const CRect& viewPort)
++{
++  CRenderSystemGLES::SetViewPort(viewPort);
++  if (m_guiHalfBound)
++  {
++    ScaleGuiRaster(true);
++    ScaleGuiRaster(false);
++  }
++}
++
++void CWinSystemGbmGLESContext::SetScissors(const CRect& rect)
++{
++  CRenderSystemGLES::SetScissors(rect);
++  if (m_guiHalfBound)
++    ScaleGuiRaster(false);
++}
++
++bool CWinSystemGbmGLESContext::CanReuseGuiComposite() const
++{
++#ifdef HAVE_DVBRIDGE
++  const char* enabled = std::getenv("DV_PRIVATE_GUI_CACHE");
++  return enabled && std::strcmp(enabled, "1") == 0 && m_nativeGuiCoverage &&
++         m_dvState.Captured() && !m_hdrConversion && !m_dvDebugOverlay && m_guiRasterReady &&
++         m_guiFbo.IsValid() && m_guiFboWidth == m_nWidth && m_guiFboHeight == m_nHeight;
++#else
++  return false;
++#endif
++}
++
+ bool CWinSystemGbmGLESContext::BeginGuiComposite(bool guiWillRender)
+ {
+   if (!m_guiCompositing)
+     return false;
+ 
++  bool nativeCoverage = false;
++#ifdef HAVE_DVBRIDGE
++  const char* overlay = std::getenv("DV_PRIVATE_OVERLAY");
++  const char* nativeSource = std::getenv("DV_PRIVATE_SOURCE");
++  nativeCoverage = m_dvState.Captured() && !m_hdrConversion && overlay &&
++                   std::strcmp(overlay, "1") == 0 && nativeSource &&
++                   std::strcmp(nativeSource, "1") == 0 &&
++                   m_dvSelection.policy.mode == DVBRIDGE_MODE_STANDARD;
++#endif
++  if (nativeCoverage != m_nativeGuiCoverage)
++    m_guiFboClean = false;
++  m_nativeGuiCoverage = nativeCoverage;
+   m_guiWillRender = guiWillRender;
+ 
+   int width = m_nWidth;
+   int height = m_nHeight;
++  const char* half = std::getenv("DV_PRIVATE_GUI_HALF");
++  const bool guiHalf = nativeCoverage && width == 3840 && height == 2160 && half &&
++                       std::strcmp(half, "1") == 0;
++  if (guiHalf != m_guiHalf)
++  {
++    m_guiFboClean = false;
++    m_guiRasterReady = false;
++    CLog::Log(LOGINFO, "Private native GUI raster: {}x{}; movie and output {}x{}",
++              guiHalf ? width / 2 : width, guiHalf ? height / 2 : height, width, height);
++  }
++  m_guiHalf = guiHalf;
+ 
+   // create or recreate FBO if size changed
+   if (!m_guiFbo.IsValid() || m_guiFboWidth != width || m_guiFboHeight != height)
+@@ -447,16 +527,47 @@ bool CWinSystemGbmGLESContext::BeginGuiComposite(bool guiWillRender)
+   //! lets the GUI walk skip while CompositeGui still runs each video frame,
+   //! re-using this cached sRGB FBO as the composite source.
+   if (!guiWillRender)
++  {
++    if (CanReuseGuiComposite() && (++m_guiReusedFrames <= 3 || m_guiReusedFrames % 120 == 0))
++      CLog::Log(LOGINFO, "Private native GUI cache: reused_frames={} empty={}",
++                m_guiReusedFrames, m_guiFboClean);
+     return true;
++  }
+ 
+-  if (!m_guiFbo.BeginRender())
++  m_guiRasterReady = false;
++  if (m_guiHalf && !m_guiHalfFbo.IsValid())
++  {
++    if (!m_guiHalfFbo.Initialize() ||
++        !m_guiHalfFbo.CreateAndBindToTexture(GL_TEXTURE_2D, width / 2, height / 2, GL_RGBA) ||
++        (GetEnabledFrontToBackRendering() &&
++         !m_guiHalfFbo.AttachDepthBuffer(width / 2, height / 2)))
++    {
++      m_guiHalfFbo.Cleanup();
++      CLog::Log(LOGERROR, "Private native GUI: failed to create half-resolution framebuffer");
++      return false;
++    }
++  }
++  if (!(m_guiHalf ? m_guiHalfFbo : m_guiFbo).BeginRender())
+     return false;
++  if (m_guiHalf)
++  {
++    glGetIntegerv(GL_VIEWPORT, m_guiSavedViewport);
++    glGetIntegerv(GL_SCISSOR_BOX, m_guiSavedScissor);
++    m_guiHalfBound = true;
++    ScaleGuiRaster(true);
++    ScaleGuiRaster(false);
++  }
+ 
+   // Clear only when the FBO holds stale content; idle frames are already clean.
+   if (!m_guiFboClean)
+   {
++    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++    if (m_guiHalf)
++      glDisable(GL_SCISSOR_TEST);
+     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+     glClear(GL_COLOR_BUFFER_BIT);
++    if (m_guiHalf && scissor)
++      glEnable(GL_SCISSOR_TEST);
+     m_guiFboClean = true;
+   }
+ 
+@@ -465,6 +576,84 @@ bool CWinSystemGbmGLESContext::BeginGuiComposite(bool guiWillRender)
+ 
+ void CWinSystemGbmGLESContext::EndGuiComposite()
+ {
++  if (m_guiHalfBound)
++  {
++    GLint source = 0;
++    m_guiHalfFbo.BeginRender();
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &source);
++    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++    glDisable(GL_SCISSOR_TEST);
++    if (m_guiFbo.BeginRender())
++    {
++      glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
++      glBlitFramebuffer(0, 0, m_guiFboWidth / 2, m_guiFboHeight / 2,
++                        0, 0, m_guiFboWidth, m_guiFboHeight, GL_COLOR_BUFFER_BIT, GL_LINEAR);
++      m_guiRasterReady = glGetError() == GL_NO_ERROR;
++      if (!m_guiRasterReady)
++        CLog::Log(LOGERROR, "Private native GUI: half-resolution upscale failed");
++    }
++    m_guiHalfBound = false;
++    glViewport(m_guiSavedViewport[0], m_guiSavedViewport[1],
++               m_guiSavedViewport[2], m_guiSavedViewport[3]);
++    glScissor(m_guiSavedScissor[0], m_guiSavedScissor[1],
++              m_guiSavedScissor[2], m_guiSavedScissor[3]);
++    if (scissor)
++      glEnable(GL_SCISSOR_TEST);
++  }
++  else if (m_guiWillRender)
++    m_guiRasterReady = true;
++  const char* coverage = std::getenv("DV_PRIVATE_GUI_COVERAGE");
++  if (coverage && std::strcmp(coverage, "1") == 0 && m_nativeGuiCoverage &&
++      m_guiWillRender && m_guiRasterReady && m_guiFboWidth > 0 && m_guiFboHeight > 0)
++  {
++    // Intrusive, bounded readback: never enable during performance measurements.
++    static unsigned samples = 0;
++    static unsigned rendered = 0;
++    if (samples < 3 && ++rendered % 30 == 0)
++    {
++      ++samples;
++      GLint buffer, alignment, rowLength, skipRows, skipPixels;
++      glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &buffer);
++      glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
++      glGetIntegerv(GL_PACK_ROW_LENGTH, &rowLength);
++      glGetIntegerv(GL_PACK_SKIP_ROWS, &skipRows);
++      glGetIntegerv(GL_PACK_SKIP_PIXELS, &skipPixels);
++      glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++      glPixelStorei(GL_PACK_ALIGNMENT, 1);
++      glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++      glPixelStorei(GL_PACK_SKIP_ROWS, 0);
++      glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
++      const int width = m_guiFboWidth, height = m_guiFboHeight;
++      std::vector<unsigned char> pixels(static_cast<size_t>(width) * height * 4);
++      glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
++      const GLenum error = glGetError();
++      glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer);
++      glPixelStorei(GL_PACK_ALIGNMENT, alignment);
++      glPixelStorei(GL_PACK_ROW_LENGTH, rowLength);
++      glPixelStorei(GL_PACK_SKIP_ROWS, skipRows);
++      glPixelStorei(GL_PACK_SKIP_PIXELS, skipPixels);
++      const int columns = (width + 15) / 16, rows = (height + 15) / 16;
++      std::vector<unsigned char> tiles(static_cast<size_t>(columns) * rows);
++      unsigned occupied = 0, touched = 0;
++      int left = width, right = -1, bottom = height, top = -1;
++      for (int y = 0; y < height; ++y)
++        for (int x = 0; x < width; ++x)
++          if (pixels[(static_cast<size_t>(y) * width + x) * 4 + 3])
++          {
++            ++occupied;
++            left = std::min(left, x); right = std::max(right, x);
++            bottom = std::min(bottom, y); top = std::max(top, y);
++            for (int dx = -1; dx <= 1; ++dx)
++              tiles[(y / 16) * columns + std::clamp(x + dx, 0, width - 1) / 16] = 1;
++          }
++      for (const auto tile : tiles)
++        touched += tile;
++      CLog::Log(LOGINFO, "Private GUI coverage: sample={} size={}x{} alpha_pixels={} "
++                "bounds_gl={},{},{},{} halo_tiles={}/{} gl_error={}", samples,
++                width, height, occupied, left, bottom, right, top, touched,
++                columns * rows, error);
++    }
++  }
+   if (m_guiWillRender)
+     m_guiFbo.EndRender();
+ 
+@@ -501,7 +690,11 @@ void CWinSystemGbmGLESContext::CompositeGui()
+   //   D2P:          "FBO is empty/clean AND back buffer cache is invalid"
+   if (m_guiWillRender)
+   {
+-    const bool guiEmpty = (GetGUIElementCount() == 0);
++    const bool guiEmpty = (GetGUIElementCount() == 0)
++#ifdef HAVE_DVBRIDGE
++                         && !(m_nativeGuiCoverage && m_dvOverlays)
++#endif
++                         ;
+     m_guiFboClean = guiEmpty;
+     if (guiEmpty)
+       return;
+@@ -521,6 +714,8 @@ void CWinSystemGbmGLESContext::CompositeGui()
+     return;
+ 
+ #ifdef HAVE_DVBRIDGE
++  if (m_nativeGuiCoverage)
++    return; // The native packer consumed the completed GUI texture.
+   GLint previousFramebuffer = 0;
+   GLint previousViewport[4]{};
+   const bool dvComposite = m_dvState.Captured() || m_hdrConversion;
+@@ -1437,10 +1632,30 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   const auto capture = CServiceBroker::GetCaptureService();
+   const bool capturing = capture && !capture->TakeActive(
+       KODI::RENDERING::CAPTURE::CaptureContent::COMPOSITE).empty();
+-  const bool overlayFree = !capturing &&
+-      (!m_guiWillRender || GetGUIElementCount() == 0) && !m_dvOverlays;
++  const bool overlayFree = !capturing && !m_dvOverlays &&
++      (m_nativeGuiCoverage ?
++          (m_guiWillRender ? GetGUIElementCount() == 0 : CanReuseGuiComposite() && m_guiFboClean) :
++          (!m_guiWillRender || GetGUIElementCount() == 0));
+   const auto preferences = DVBRIDGE::FrameOutputSettings();
+   const auto policy = m_dvSelection.policy;
++  const bool nativeOverlay = m_nativeGuiCoverage && policy.mode == DVBRIDGE_MODE_STANDARD;
++  DVPrivateOverlay gui;
++  if (nativeOverlay)
++  {
++    if (capturing || m_dvHDROverlays || !m_guiRasterReady || !m_guiFbo.IsValid() ||
++        m_guiFboWidth != 3840 || m_guiFboHeight != 2160)
++      return false;
++    if (!overlayFree)
++      gui.texture = m_guiFbo.Texture();
++    gui.flipY = 1;
++    // GUI709 -> BT2020 -> common LMS; the engine inverts the current movie matrices.
++    const double rgb[9]{.6274,.3293,.0433,.0691,.9195,.0114,.0164,.0880,.8956};
++    const double lms[9]{7222,8771,390,2654,12430,1300,0,422,15962};
++    for (unsigned i = 0; i < 3; ++i)
++      for (unsigned j = 0; j < 3; ++j)
++        for (unsigned k = 0; k < 3; ++k)
++          gui.rgbToLms[3*i+j] += lms[3*i+k] * rgb[3*k+j] / 16384.0;
++  }
+ #ifdef CB1_HAS_HDR10_AI
+   const bool aiFrame = !metadata.Data();
+   cb1_ai_result prediction{};
+@@ -1455,7 +1670,8 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+           prediction, policy);
+ #endif
+     return m_dvBridge->PrepareHardwareFrame(layer, enhancement, enhancementBinding,
+-        metadata, geometry, preferences, overlayFree, &policy);
++        metadata, geometry, preferences, overlayFree || nativeOverlay, &policy,
++        nativeOverlay ? &gui : nullptr);
+   };
+ #ifdef CB1_HAS_HDR10_AI
+   const double refresh = m_DRM->GetCurrentMode().fRefreshRate;
+@@ -1529,10 +1745,28 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+       m_dvFrame = SetHDR(&output);
+     }
+   }
++  if (m_dvFrame)
++    m_dvExitPending = false;
+   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   return m_dvFrame || reused;
+ }
+ 
++void CWinSystemGbmGLESContext::PrefetchDVBridge(const CDVBridgeGLES::Layer& layer,
++                                              std::shared_ptr<AVFrame> enhancement,
++                                              DVBRIDGE::SourceBinding enhancementBinding,
++                                              const CDVMetadataBuffer& metadata,
++                                              dvbridge_geometry geometry)
++{
++  if (!layer.binding.Valid() || layer.binding != metadata.Binding() ||
++      !std::isfinite(layer.pts) || m_dvSelection.policy.mode != DVBRIDGE_MODE_STANDARD ||
++      (enhancement && (enhancementBinding != layer.binding ||
++          static_cast<double>(enhancement->pts) != layer.pts)))
++    return;
++  if (m_dvFrame && m_dvBridge &&
++      (m_nativeGuiCoverage || (m_guiWillRender && GetGUIElementCount() == 0 && !m_dvOverlays)))
++    m_dvBridge->PrefetchHardware(layer, enhancement.get(), metadata, geometry);
++}
++
+ bool CWinSystemGbmGLESContext::EndDVBridge()
+ {
+   if (m_failedHDR10SetupRestore && !RestoreFailedHDR10Setup())
+@@ -1589,6 +1823,7 @@ bool CWinSystemGbmGLESContext::EndDVBridge()
+       return false;
+     }
+   }
++  if (m_dvBridge && !m_dvBridge->DisplayReplaced()) return false;
+   if (m_hdrConversion)
+     m_dvBridge.reset();
+   else if (m_dvBridge)
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 9ba2c043..061c83b8 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -55,6 +55,10 @@ public:
+   void EndGuiComposite() override;
+   void CompositeGui() override;
+   bool IsHdrComposite() const override { return m_guiCompositing; }
++  bool UsesNativeGuiCoverage() const override { return m_nativeGuiCoverage; }
++  bool CanReuseGuiComposite() const override;
++  void SetViewPort(const CRect& viewPort) override;
++  void SetScissors(const CRect& rect) override;
+ #ifdef HAVE_DVBRIDGE
+   static bool DVBridgeRequested(const VideoPicture* picture);
+   bool CreateNewWindow(const std::string& name, bool fullScreen, RESOLUTION_INFO& res) override;
+@@ -82,7 +86,12 @@ public:
+   bool RestoreFailedHDR10Setup();
+   bool ConfigureHDR10Conversion(const VideoPicture& picture);
+   bool SupportsHDR10Conversion();
+-  void SetDVBridgeOverlays(bool visible) { m_dvOverlays = visible; }
++  void SetDVBridgeOverlays(bool visible, bool hdr = false, bool debug = false)
++  {
++    m_dvOverlays = visible;
++    m_dvHDROverlays = hdr;
++    m_dvDebugOverlay = debug;
++  }
+   bool HasDVBridgeScreenshot() const { return m_dvState.Captured() || m_hdrConversion; }
+   unsigned int GetDVBridgeScreenshotFramebuffer()
+   {
+@@ -93,6 +102,12 @@ public:
+                        const CDVMetadataBuffer& metadata,
+                        dvbridge_geometry geometry);
+   bool EndDVBridge();
++  void PrefetchDVBridge(const CDVBridgeGLES::Layer& layer, std::shared_ptr<AVFrame> enhancement,
++                        DVBRIDGE::SourceBinding enhancementBinding,
++                        const CDVMetadataBuffer& metadata, dvbridge_geometry geometry);
++  // Renderer teardown: when a refresh-rate restore is about to follow, the DV signal is
++  // restored in that mode change instead of in a separate one.
++  bool EndDVBridgeAtStop();
+   bool SetVideoOutput(const VideoPicture* picture) override;
+   bool DestroyWindowSystem() override;
+   bool DestroyWindow() override;
+@@ -109,14 +124,23 @@ protected:
+ 
+ private:
+   void PresentFrame(bool rendered, bool videoLayer);
++  void ScaleGuiRaster(bool viewport);
+   bool m_guiCompositing{false};
+   CFrameBufferObject m_guiFbo;
++  CFrameBufferObject m_guiHalfFbo;
++  bool m_guiHalf{false};
++  bool m_guiHalfBound{false};
++  bool m_guiRasterReady{true};
++  unsigned m_guiReusedFrames{0};
++  GLint m_guiSavedViewport[4]{};
++  GLint m_guiSavedScissor[4]{};
+   int m_guiFboWidth{0};
+   int m_guiFboHeight{0};
+   // True when the GUI FBO is empty (no draws this frame); CompositeGui skips composite when true.
+   bool m_guiFboClean{false};
+   // Whether the GUI render pass will run this frame; set by BeginGuiComposite.
+   bool m_guiWillRender{true};
++  bool m_nativeGuiCoverage{false};
+ 
+   std::unique_ptr<CGuiCompositeShaderGLES> m_compositeShader;
+ #ifdef HAVE_DVBRIDGE
+@@ -169,6 +193,17 @@ private:
+   std::optional<uint64_t> m_hdrDeepColorPrevious;
+   bool m_failedHDR10SetupRestore = false;
+   bool m_dvOverlays = true;
++  bool m_dvHDROverlays = false;
++  bool m_dvDebugOverlay = false;
++  // One HDMI change per transition: a refresh switch for native output leaves its mode set
++  // pending for the bridge's first commit (m_dvModesetDeferred), and a DV stop that a refresh
++  // restore will follow keeps the signal until that mode change (m_dvExitPending). Both give
++  // up at their deadline and fall back to separate commits.
++  bool m_dvModesetDeferred = false;
++  XbmcThreads::EndTime<> m_dvModesetDeadline;
++  bool m_dvExitPending = false;
++  bool m_dvRestoreWithModeset = false;
++  XbmcThreads::EndTime<> m_dvExitDeadline;
+ #endif
+ };
+ 

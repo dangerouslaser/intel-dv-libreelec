@@ -1,0 +1,58 @@
+Native renderer OpenCL dependencies
+
+The native C/OpenCL renderer requires a loader, Intel's GPU runtime and its
+compiler, in addition to the existing Mesa, VAAPI and Intel media-driver stack.
+The media driver alone cannot execute reconstruction kernels.
+
+Pinned packages
+opencl-headers             2025.07.22       Khronos source archive
+opencl-icd-loader          2025.07.22       Khronos source archive
+intel-opencl-runtime      26.05.37020.3     Intel upstream binary package
+intel-igc-core-runtime    2.28.4/build20760 Intel upstream binary package
+intel-igc-opencl-runtime  2.28.4/build20760 Intel upstream binary package
+
+Each recipe pins and verifies its input SHA256. The loader is cross-compiled
+with the LibreELEC toolchain. The Intel runtime/compiler recipes install the
+upstream x86_64 binaries; they do not claim to build those binaries locally.
+They retain the supplied copyright/combined compiler notices. System libc,
+libstdc++, Mesa, libva and gmmlib are not replaced with distribution copies.
+
+Upstream sources and build information
+https://github.com/KhronosGroup/OpenCL-Headers/tree/v2025.07.22
+https://github.com/KhronosGroup/OpenCL-ICD-Loader/tree/v2025.07.22
+https://github.com/intel/compute-runtime/releases/tag/26.05.37020.3
+https://github.com/intel/compute-runtime/tree/26.05.37020.3
+https://github.com/intel/intel-graphics-compiler/releases/tag/v2.28.4
+https://github.com/intel/intel-graphics-compiler/tree/v2.28.4
+
+The IGC release identifies its LLVM16, OpenCL-Clang, SPIR-V translator/tools
+and vc-intrinsics revisions. Use those pins when rebuilding upstream IGC;
+substituting the LibreELEC tree's newer LLVM is not an equivalent rebuild.
+
+Packaging checks completed
+- All three Intel binary archives match the upstream release checksums.
+- The actual unpack/install recipe functions were exercised in staging.
+- The Khronos loader cross-build and install succeed with the LibreELEC SDK.
+- On an Intel N150, both general and specialized VAAPI-imported surface suites
+  pass with the packaged loader and Intel runtime/compiler: 12 cases and
+  208896 exact component comparisons per suite, zero differences. Pending
+  frame identity, metadata rejection and sample-error recovery checks pass.
+- These checks exclude the older development compiler library directory from
+  library lookup and disable the persistent compiler cache.
+
+These are dependency/package and GPU-compute checks, not qualification of a
+complete LibreELEC image, every Intel GPU, HDMI output or playback performance.
+The recipes are not automatically enabled for Kodi by this dependency change.
+
+Short playback follow-up
+The staged runtime was selected explicitly in the existing qualified N150
+Kodi/engine build. Process mappings confirm the packaged loader,NEO,IGC,
+IGDFCL and OpenCL-Clang are loaded,excluding the prior development runtime.
+P8.4 and P7 FEL both pass clean-video,controls-open and controls-closed
+windows:101distinct display commits/window,no failed/backward commits,
+maximum source-PTS gaps41667us(P8.4) and42001us(P7). Pause,paused seek and
+resume pass for both. Render busy is50.1/59.5/50.0percent for P8.4 and
+61.9/73.3/63.5percent for P7,consistent with the prior runtime's short-scene
+measurements. These are dependency playback checks using the unchanged
+engine binary,not qualification of the separately CMake-built renderer or
+a complete image. No new image-quality/conformance claim follows from them.

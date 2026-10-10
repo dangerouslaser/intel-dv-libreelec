@@ -1,4 +1,7 @@
 {
+  "src/dvbridge_fel.c": "7c6991db2cfff877e21e9110227e912def5d066d98a8166c33a179d9701d18f0",
+  "src/dvbridge_fel_seek.h": "a913805e13f5939225c7dec7d250fe1fa862efd4e7a801ed1fb971a1a6d7531f",
+  "src/dvbridge_fel_key_match.h": "d8277b5fa1b9e3da16f39e504a0217ee6c3cf31720ba28c1e79bedfae2e0d5a8",
   "src/dvbridge_gl_pack.c": "8e85dbad36c392a64bf1443f876e74c343ecf129fd88d651d9241fc6a307fecd",
   "src/cb1_circuit.c": "b2bc4dca430039ca7e1f126abff58ba36b3cf2a6c7d18f8fc6f80983d913a365",
   "src/cb1_circuit.h": "fc11317ac8ccb92e1d330c199f941396ec93185eadbfc693587fdaadc7e15df9",

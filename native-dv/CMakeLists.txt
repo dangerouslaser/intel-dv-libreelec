@@ -1,0 +1,78 @@
+cmake_minimum_required(VERSION 3.22)
+project(NativeDV VERSION 0.1 LANGUAGES C)
+include(GNUInstallDirs)
+include(CTest)
+option(NATIVE_DV_BUILD_RENDERER "Build Linux VAAPI/OpenCL renderer" ON)
+option(NATIVE_DV_GPU_TESTS "Build opt-in Intel GPU reconstruction tests" OFF)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+add_compile_options(-Wall -Wextra -Wconversion -ffp-contract=off)
+
+if(NATIVE_DV_BUILD_RENDERER)
+  find_package(PkgConfig REQUIRED)
+  find_package(OpenCL REQUIRED)
+  find_package(Threads REQUIRED)
+  pkg_check_modules(VA REQUIRED IMPORTED_TARGET libva)
+  pkg_check_modules(AVUTIL REQUIRED libavutil>=59.12.100)
+  set(NATIVE_DV_FFMPEG_INCLUDE_DIR "" CACHE PATH
+      "Optional matched FFmpeg include root, ahead of pkg-config headers")
+  set(ffmpeg_include_dirs ${AVUTIL_INCLUDE_DIRS})
+  if(NATIVE_DV_FFMPEG_INCLUDE_DIR)
+    list(PREPEND ffmpeg_include_dirs "${NATIVE_DV_FFMPEG_INCLUDE_DIR}")
+  endif()
+  include(CheckCSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${ffmpeg_include_dirs})
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/tests/ffmpeg_metadata_fields.c" metadata_probe)
+  # A changed include root must not reuse an earlier successful ABI probe.
+  unset(NATIVE_DV_METADATA_LAYOUT_V1 CACHE)
+  check_c_source_compiles("${metadata_probe}" NATIVE_DV_METADATA_LAYOUT_V1)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(NOT NATIVE_DV_METADATA_LAYOUT_V1)
+    message(FATAL_ERROR "Matched modified FFmpeg raw metadata headers required")
+  endif()
+  add_library(dv_source_private SHARED
+    src/dv_source_renderer.c src/source_overlay.c src/dv_scanout_slots.c
+    src/source_geometry.c src/dv_ffmpeg_metadata.c src/dv_cm4.c
+    src/opencl_backend.c src/mmr_prepare.c src/single_reshape.c
+    src/single_reshape_ffmpeg.c src/colour_lut.c src/dv_engine.c
+    src/pixel_colour.c src/pixel_luma.c src/pixel_chroma_final.c src/pixel_spatial.c)
+  set_target_properties(dv_source_private PROPERTIES SOVERSION 1)
+  # Keep the qualified renderer optimization level, even in Release builds.
+  target_compile_options(dv_source_private PRIVATE -O2)
+  target_compile_definitions(dv_source_private PRIVATE DV_FFMPEG_RAW_EXTENSIONS
+    DV_PREPARED_CHROMA DV_ENCODE_STEPS=256 DV_COLOUR_LUT)
+  target_include_directories(dv_source_private SYSTEM PRIVATE ${ffmpeg_include_dirs})
+  target_link_libraries(dv_source_private PRIVATE OpenCL::OpenCL PkgConfig::VA Threads::Threads m)
+  target_link_options(dv_source_private PRIVATE -Wl,--no-undefined -Wl,-Bsymbolic)
+  install(TARGETS dv_source_private LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  install(FILES src/colour_dd.cl src/opencl_kernels.cl src/single_reshape.cl
+    src/source_overlay.cl src/source_tunnel.cl DESTINATION ${CMAKE_INSTALL_DATADIR}/native-dv)
+  install(FILES src/dv_source_renderer.h src/source_geometry.h src/source_input.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/native-dv)
+  install(FILES LICENSE SOURCES.md DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/native-dv)
+  install(DIRECTORY LICENSES/ DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/native-dv)
+endif()
+
+if(BUILD_TESTING)
+  if(NATIVE_DV_BUILD_RENDERER AND NATIVE_DV_GPU_TESTS)
+    add_executable(polynomial_fel_gpu_tests tests/polynomial_fel_gpu_tests.c)
+    target_include_directories(polynomial_fel_gpu_tests PRIVATE src)
+    target_compile_options(polynomial_fel_gpu_tests PRIVATE -UNDEBUG)
+    target_link_libraries(polynomial_fel_gpu_tests PRIVATE dv_source_private OpenCL::OpenCL)
+    add_test(NAME polynomial_fel_gpu COMMAND polynomial_fel_gpu_tests "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  endif()
+  add_executable(polynomial_fel_tests tests/polynomial_fel_tests.c
+    src/pixel_luma.c src/pixel_chroma_final.c src/mmr_prepare.c)
+  target_include_directories(polynomial_fel_tests PRIVATE src)
+  target_compile_options(polynomial_fel_tests PRIVATE -UNDEBUG)
+  add_test(NAME polynomial_fel COMMAND polynomial_fel_tests)
+  foreach(pair "order2_gate;single_reshape" "source_geometry;source_geometry" "scanout_slots;dv_scanout_slots")
+    list(GET pair 0 test_name)
+    list(GET pair 1 implementation)
+    add_executable(${test_name}_tests tests/${test_name}_tests.c src/${implementation}.c)
+    target_include_directories(${test_name}_tests PRIVATE src)
+    target_compile_options(${test_name}_tests PRIVATE -UNDEBUG)
+    add_test(NAME ${test_name} COMMAND ${test_name}_tests)
+  endforeach()
+endif()
