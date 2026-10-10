@@ -110,3 +110,27 @@ may affect timing, so this does not establish that the problem is resolved.
 Raw traces, Kodi logs and display snapshots are retained on the VM under
 native-kodi-fixes-test/qms-cadence-run{1,2,3}*. Normal YBLOD was restored,
 qms=Y retained, and the dedicated tracing instance was disabled.
+
+Different-rate predecessor tests
+On the same pre-fix candidate/QMS-on setup, France 2 UHD negotiated 50fps
+VAAPI and fixed 50Hz output, but the user saw a black picture. The subsequent
+FEL clip looked correct. That predecessor is not a successful visual playback
+qualification. Its transition trace includes a 959ms delivered-event gap
+after the five-second exclusion, plus startup skips; steady vblank interval
+remains 41.707ms. Do not label that transition stall-free.
+
+Gemini Man from 03:00 negotiated 59.94fps/QMS; the user reported a glitchy
+picture. A trace captured during that state shows mean vblank 16.683112ms,
+maximum 16.889ms, and no sequence jumps in 519 sampled events (after 5s).
+However the renderer repeatedly consumes source PTS 184067000 while health
+reports stalled=true and an empty video queue. Regular display interrupts
+therefore do not establish progressing movie frames; investigate frame supply
+separately from QMS signalling. This does not identify the stall's cause or
+prove it explains every visual artifact.
+
+Switching directly from Gemini Man to the FEL test produced a visually
+correct picture. Its trace has 342 sampled vblanks, mean 41.707554ms, max
+41.987ms and no sequence jumps after startup. Neither different-rate test
+reproduced the FEL artifact. Traces and display snapshots are retained with
+ratechange, gemini and gemini-to-fel labels. Normal YBLOD is restored and the
+private tracing instance disabled; QMS remains enabled.
