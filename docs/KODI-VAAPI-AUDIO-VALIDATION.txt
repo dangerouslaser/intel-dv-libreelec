@@ -1,0 +1,63 @@
+Kodi VAAPI/audio port qualification — 2026-10-10
+
+Scope
+Two existing YBLOD fixes are ported to the integrated Kodi base:
+- Determine VAAPI allocation bit depth/chroma from the decoded software format.
+- Acknowledge DISPLAYLOST in audio states without a configured sink; defer
+  error-state sink retries until DISPLAYRESET or the bounded retry timeout.
+The audio header hunk is adapted to this base's member layout. The historical
+alternative DV announcement and single-modeset patches are not imported.
+
+Build
+Both patches apply and reverse-check against the cached prepared Kodi
+28ea2eac1eb7af8fdcbd2672d933ce87f594be79 tree with the native adapter.
+Incremental cross-build/link passes with six workers, eight-CPU container cap
+and 7 GiB memory cap. Source verification, 78 staging checks and eight staging
+unit tests pass. This is not a new complete LibreELEC image build.
+Candidate kodi.bin SHA256:
+b69a3ba063d1271988a0df1d3d2349083f697390d21210d32ea799c9fada244c
+Pre-fix cached binary SHA256:
+ca6c1542b111037dbd01b065bd666e4f19254000f7d0847337500daa9159d03a
+
+VM runtime
+An isolated profile and matching Kodi resources/libplacebo were used, with
+the pinned build's libnfs/libplist and installed VM drivers/FFmpeg. The shared
+native engine was the tested YBLOD pre4 polynomial-FEL candidate. This is a
+mixed test runtime, not qualification of a booted image from this repository.
+
+Live TV: France 2 UHD played using ff-hevc-vaapi at 3840x2160/50fps.
+Renderer logs confirm BT2020_YCC, 10bit, limited range and 10-bit output.
+Initial missing-extradata messages were followed by successful codec opening.
+Transient audio sink-open failures occurred around transitions, followed by
+successful ALSA initialization. This establishes a playback smoke test, not
+a controlled reproduction of the original pre-fix late-join defect.
+
+FEL clip: DT/DL P7 CMV4.0 4000nits v3.
+The first candidate run with debug overlay enabled looked wrong to the user
+(refresh/stuttering concern), despite no logged drops. It is not a pass.
+Pre-fix and candidate replays with the overlay OFF were both visually
+confirmed correct by the user. Both committed 23.976 Hz DV output. The first
+candidate replay stopped with processed=307/presented=307 and restored 60 Hz
+non-DV menu output. No DISPLAYLOST timeout was observed.
+
+IMPORTANT: the subsequent candidate stop/restart replay was reported glitchy
+by the user with the debug overlay still OFF. Therefore candidate DV visual
+qualification FAILS intermittently. The initial good replay is insufficient,
+and the debug overlay cannot explain all observed failures. The test was
+stopped and normal YBLOD restored; the port must remain unmerged pending a
+controlled transition investigation. No causal attribution to either patch
+versus the mixed runtime or existing adapter is established.
+
+At frame 241 (same clip position), cumulative engine service means:
+  pre-fix: 5.774 ms/frame
+  patched: 6.002 ms/frame
+Both ten-second health windows report zero drops/skips. These short samples
+are not a demonstrated speed change and do not measure HDMI/audio latency.
+The initial visual problem is associated with different test conditions;
+the failed repeat rules out treating overlay removal as a sufficient fix.
+
+Limitations
+No independent HDMI capture, audio-listening confirmation, exhaustive error-
+state injection or broad live-channel qualification. The transition changes
+do not combine the separate refresh-rate and DV-signalling mode changes.
+YBLOD already includes these fixes; this port does not require a YBLOD release.
