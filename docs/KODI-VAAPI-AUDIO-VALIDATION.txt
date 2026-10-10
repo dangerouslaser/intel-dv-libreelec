@@ -89,3 +89,24 @@ snapshots can accompany both good and bad output. QMS/display-transition
 state or pacing remains the investigation target; exact cause is unproven.
 Normal YBLOD was restored with qms=Y. No merge or additional runtime change
 was made. Logs and both display snapshots are retained on the test VM.
+
+Kernel cadence capture follow-up
+Three additional pre-fix/qms=Y/overlay-OFF playbacks were traced in a dedicated
+tracefs instance (global tracing configuration left alone). Captured events:
+DRM vblank, delivered vblank, Intel flip completion and pipe enable/disable.
+All three runs were visually confirmed correct; the intermittent failure did
+not recur during this capture series. First trace reports 1202/1202 retained
+records. Five seconds from trace start were excluded from cadence statistics.
+
+Run   vblank events   mean interval ms   maximum ms   gaps >60ms / seq jumps
+1     501             41.707858          42.044       0 / 0
+2     490             41.707865          42.046       0 / 0
+3     466             41.707978          42.009       0 / 0
+Delivered-vblank intervals agree within timestamp rounding. These are kernel
+event-delivery intervals, not an independent measurement of HDMI pixel output
+or proof every displayed frame has the correct contents. They establish a
+good-run reference only; no bad-run kernel trace exists yet. Tracing itself
+may affect timing, so this does not establish that the problem is resolved.
+Raw traces, Kodi logs and display snapshots are retained on the VM under
+native-kodi-fixes-test/qms-cadence-run{1,2,3}*. Normal YBLOD was restored,
+qms=Y retained, and the dedicated tracing instance was disabled.
