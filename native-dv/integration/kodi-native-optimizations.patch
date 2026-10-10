@@ -1,0 +1,488 @@
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -321,6 +321,12 @@ void CRenderManager::FrameMove()
+       lock.unlock();
+       if (!Configure())
+         return;
++#ifdef HAVE_DVBRIDGE
++      // Carry the renderer's queued HDR state in the refresh commit, before
++      // presenting a frame at the previous refresh rate. Native DV owns its handoff.
++      if (!m_nativeDVRate)
++        UpdateResolution();
++#endif
+       UpdateLatencyTweak();
+       firstFrame = true;
+       FrameWait(50ms);
+diff --git a/xbmc/guilib/GUIWindowManager.cpp b/xbmc/guilib/GUIWindowManager.cpp
+--- a/xbmc/guilib/GUIWindowManager.cpp
++++ b/xbmc/guilib/GUIWindowManager.cpp
+@@ -1423,6 +1423,10 @@ bool CGUIWindowManager::Render()
+   CSingleExit lock(CServiceBroker::GetWinSystem()->GetGfxContext());
+ 
+   int bufferAge = CServiceBroker::GetWinSystem()->GetBufferAge();
++  // Native DV clears its GUI FBO before this pass; swapchain age cannot
++  // preserve unchanged controls in that separate target.
++  if (CServiceBroker::GetWinSystem()->UsesNativeGuiCoverage())
++    bufferAge = 0;
+   bool visualizeDirtyRegions =
+       CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_guiVisualizeDirtyRegions;
+   if (visualizeDirtyRegions)
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -1632,7 +1632,9 @@ void CApplication::FrameMove(bool processEvents, bool processGUI)
+         !CServiceBroker::GetGUI()->GetWindowManager().HasDirtyRegions())
+       m_skipGuiRender = true;
++    const char* homeCache = std::getenv("DV_PRIVATE_GUI_CACHE_HOME");
+     if (!m_skipGuiRender &&
+-        CServiceBroker::GetWinSystem()->GetGfxContext().IsFullScreenVideo() &&
++        (CServiceBroker::GetWinSystem()->GetGfxContext().IsFullScreenVideo() ||
++         (homeCache && std::strcmp(homeCache, "1") == 0)) &&
+         CServiceBroker::GetWinSystem()->CanReuseGuiComposite() &&
+         !CServiceBroker::GetGUI()->GetWindowManager().HasDirtyRegions())
+     {
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.cpp
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.cpp
+@@ -46,6 +46,8 @@
+   m_prepareOverlays = reinterpret_cast<decltype(m_prepareOverlays)>(dlsym(m_library, "dv_source_renderer_prepare_overlays"));
+   m_presentOverlay = reinterpret_cast<decltype(m_presentOverlay)>(dlsym(m_library, "dv_source_renderer_present_overlay"));
+   m_cancel = reinterpret_cast<decltype(m_cancel)>(dlsym(m_library, "dv_source_renderer_cancel"));
++  m_packBegin = reinterpret_cast<decltype(m_packBegin)>(dlsym(m_library, "dv_source_renderer_pack_begin"));
++  m_packComplete = reinterpret_cast<decltype(m_packComplete)>(dlsym(m_library, "dv_source_renderer_pack_complete"));
+   if (!abi || abi() != 4 || !m_create || !m_render || !m_drain || !m_destroy)
+     return false;
+   const char* direct = std::getenv("DV_PRIVATE_SCANOUT");
+@@ -197,10 +199,18 @@
+   if (m_unsafe)
+     return false;
+   if (m_pending && (!m_cancel || m_cancel(m_engine) != 0))
++  {
++    if (m_packPending) m_scanout->Written(DV_SCANOUT_UNCERTAIN);
++    m_unsafe = true;
++    return false;
++  }
++  if (m_packPending && !m_scanout->Written(DV_SCANOUT_REJECTED))
+   {
+     m_unsafe = true;
+     return false;
+   }
++  m_packPending = false;
++  m_packSubmitMs = 0;
+   m_pending = false;
+   ReleaseInputs();
+   return true;
+@@ -254,6 +264,7 @@
+   const bool trace = (timing && std::strcmp(timing, "1") == 0) ||
+                     (frameTiming && std::strcmp(frameTiming, "1") == 0);
+   const auto entered = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++  if (m_packPending && overlay && !CancelPending()) return -1;
+   const bool prefetched = Matches(display, owner, pts, geometry, input);
+   if (!prefetched)
+   {
+@@ -282,7 +293,7 @@
+   if (overlay || !directNoFinish || std::strcmp(directNoFinish, "1") != 0)
+     glFinish();
+   const auto glDone = trace ? std::chrono::steady_clock::now() : started;
+-  if (m_scanout)
++  if (m_scanout && !m_packPending)
+   {
+     if (!m_scanout->Begin(prefetched ? m_pendingId : m_serial+1,pts)) return -1;
+     if (m_selectOutput(m_engine,m_scanout->Slot()) != 0)
+@@ -301,7 +312,14 @@
+                    : m_present(m_engine, id, pts, packet, refresh);
+   };
+   int result;
+-  if (prefetched)
++  const bool prepacked = prefetched && m_packPending;
++  if (prepacked)
++  {
++    int ready = 0;
++    result = m_packComplete(m_engine, m_pendingId, pts, 1, &ready);
++    if (result == 0 && !ready) result = -1;
++  }
++  else if (prefetched)
+     result = present(m_pendingId);
+   else if (input.format == DV_SOURCE_INPUT_NV12 || overlay)
+   {
+@@ -327,6 +345,7 @@
+     return -1;
+   }
+   const auto drained = trace ? std::chrono::steady_clock::now() : started;
++  m_packPending = false;
+   m_pending = false;
+   ReleaseInputs();
+   if (m_scanout && !m_scanout->Written(result == 0 ? DV_SCANOUT_ACCEPTED : DV_SCANOUT_REJECTED))
+@@ -343,13 +362,16 @@
+   }
+   const double elapsed = std::chrono::duration<double, std::milli>(
+       std::chrono::steady_clock::now() - started).count();
+-  const double processing = elapsed + (prefetched ? m_submitMs : 0.0);
++  const double processing = elapsed + (prefetched ? m_submitMs : 0.0) +
++                            (prepacked ? m_packSubmitMs : 0.0);
++  m_packSubmitMs = 0;
+   m_processingMs += processing;
+   m_prefetchHits += prefetched;
+   ++m_processed;
+   m_preparedPts = pts;
+   m_drainTicket = CDVPrivateDrain::Enabled() ? CDVPrivateDrain::Get().Ticket(owner, pts) : 0;
+   m_ready = true;
++  m_preparedOverlay = overlay != nullptr;
+   if (trace)
+   {
+     const auto ms = [](auto end, auto begin) { return std::chrono::duration<double, std::milli>(end - begin).count(); };
+@@ -360,8 +382,10 @@
+   }
+   if (m_transitionFrames) --m_transitionFrames;
+   const char* verify = std::getenv("DV_PRIVATE_VERIFY");
++  const char* verifyAsync = std::getenv("DV_PRIVATE_ASYNC_PACK");
+   // The movie-only oracle cannot validate pixels intentionally covered by GUI.
+   if (!overlay && verify && std::strcmp(verify, "1") == 0 &&
++      (!verifyAsync || std::strcmp(verifyAsync, "1") != 0 || prepacked) &&
+       (m_verifiedFrames < 6 || m_resetChecks))
+   {
+     std::vector<unsigned char> rgba(3840u * 2160u * 4u);
+@@ -398,8 +422,8 @@
+     }
+     const bool resized = geometry.destination_width &&
+         (geometry.destination_width != geometry.width || geometry.destination_height != geometry.height);
+-    CLog::Log(LOGINFO, "Private source GL output verified: pts={} bytes={} check={} prefetch={} after_reset={}",
+-        pts, rgba.size(), resized ? "sample-tolerance-and-payload" : "byte-exact", prefetched, m_resetChecks != 0);
++    CLog::Log(LOGINFO, "Private source GL output verified: pts={} bytes={} check={} prefetch={} after_reset={} prepacked={}",
++        pts, rgba.size(), resized ? "sample-tolerance-and-payload" : "byte-exact", prefetched, m_resetChecks != 0, prepacked);
+     if (m_resetChecks) --m_resetChecks;
+     if (m_verifiedFrames < 6) ++m_verifiedFrames;
+   }
+@@ -447,7 +471,30 @@
+   }
+   else m_refresh = true;
+   m_ready = false;
++  if (success && !m_unsafe && !m_preparedOverlay) QueuePendingPack();
+ }
++void CDVPrivateSource::QueuePendingPack()
++{
++  const char* enabled = std::getenv("DV_PRIVATE_ASYNC_PACK");
++  if (!enabled || std::strcmp(enabled, "1") != 0 || !m_pending || m_packPending ||
++      !m_scanout || !m_packBegin || !m_packComplete ||
++      eglGetCurrentContext() == EGL_NO_CONTEXT)
++    return;
++  const auto started = std::chrono::steady_clock::now();
++  glFinish();
++  if (!m_scanout->Begin(m_pendingId, m_pendingPts)) return;
++  m_packPending = true;
++  int result = m_selectOutput(m_engine, m_scanout->Slot());
++  if (result == 0)
++    result = m_packBegin(m_engine, m_pendingId, m_pendingPts, m_scanout->Packet(),
++                        m_scanout->Refresh(), 0, 0, nullptr, 0);
++  m_packSubmitMs = std::chrono::duration<double, std::milli>(
++      std::chrono::steady_clock::now() - started).count();
++  if (m_processed < 480)
++    CLog::Log(LOGINFO, "Private source async pack: pts={} status={} enqueue_ms={}",
++              m_pendingPts, result, m_packSubmitMs);
++  if (result != 0) CancelPending();
++}
+ void CDVPrivateSource::Reset()
+ {
+   if (!CancelPending()) m_unsafe = true;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.h
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.h
+@@ -38,6 +38,7 @@
+   bool Matches(void* display, CVideoBuffer* owner, int64_t pts,
+                const dv_source_geometry& geometry, const dv_source_input& input) const;
+   bool CancelPending();
++  void QueuePendingPack();
+   void* m_library{nullptr};
+   void* m_engine{nullptr};
+   void* m_display{nullptr};
+@@ -60,6 +61,9 @@
+   int (*m_presentOverlay)(void*, uint64_t, int64_t, unsigned, int, unsigned,
+                           unsigned, const double*, double){nullptr};
+   int (*m_cancel)(void*){nullptr};
++  int (*m_packBegin)(void*, uint64_t, int64_t, unsigned, int, unsigned,
++                    unsigned, const double*, double){nullptr};
++  int (*m_packComplete)(void*, uint64_t, int64_t, int, int*){nullptr};
+   CVideoBuffer* m_owner{nullptr};
+   std::shared_ptr<AVFrame> m_enhancement;
+   unsigned m_texture{0}, m_framebuffer{0}, m_packetId{0};
+@@ -67,6 +71,8 @@
+   uint64_t m_processed{0};
+   double m_processingMs{0};
+   bool m_pending{false};
++  bool m_packPending{false}, m_preparedOverlay{false};
++  double m_packSubmitMs{0};
+   uint64_t m_pendingId{0}, m_prefetchHits{0};
+   int64_t m_pendingPts{0};
+   int64_t m_preparedPts{0};
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateOverlay.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateOverlay.h
+@@ -1,10 +1,19 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ #pragma once
++#include <cstdint>
++#include <cstring>
+
+ struct DVPrivateOverlay
+ {
+   unsigned texture{0};
+   unsigned flipY{0};
++  uint64_t revision{0};
+   double rgbToLms[9]{};
+   double whiteNits{203.0};
++  bool SameContents(const DVPrivateOverlay& other) const
++  {
++    return revision && revision == other.revision && texture == other.texture &&
++           flipY == other.flipY && whiteNits == other.whiteNits &&
++           std::memcmp(rgbToLms, other.rgbToLms, sizeof(rgbToLms)) == 0;
++  }
+ };
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.h
+@@ -5,12 +5,12 @@
+ #include <memory>
+ #include "source_geometry.h"
+ #include "source_input.h"
++#include "DVPrivateOverlay.h"
+
+ class CVideoBuffer;
+ class CDVPrivateScanout;
+ struct gbm_bo;
+ struct AVFrame;
+-struct DVPrivateOverlay;
+ class CDVPrivateSource
+ {
+ public:
+@@ -60,10 +60,14 @@
+   int (*m_prepareOverlays)(void*){nullptr};
+   int (*m_presentOverlay)(void*, uint64_t, int64_t, unsigned, int, unsigned,
+                           unsigned, const double*, double){nullptr};
++  int (*m_presentOverlayRevision)(void*, uint64_t, int64_t, unsigned, int, unsigned,
++                          unsigned, const double*, double, uint64_t){nullptr};
+   int (*m_cancel)(void*){nullptr};
+   int (*m_packBegin)(void*, uint64_t, int64_t, unsigned, int, unsigned,
+                     unsigned, const double*, double){nullptr};
+   int (*m_packComplete)(void*, uint64_t, int64_t, int, int*){nullptr};
++  int (*m_packOverlayCached)(void*, uint64_t, int64_t, unsigned, int, unsigned,
++                            unsigned, const double*, double, uint64_t){nullptr};
+   CVideoBuffer* m_owner{nullptr};
+   std::shared_ptr<AVFrame> m_enhancement;
+   unsigned m_texture{0}, m_framebuffer{0}, m_packetId{0};
+@@ -72,6 +76,11 @@
+   double m_processingMs{0};
+   bool m_pending{false};
+   bool m_packPending{false}, m_preparedOverlay{false};
++  bool m_packOverlay{false};
++  DVPrivateOverlay m_preparedGui{}, m_packGui{};
++  unsigned m_overlayPrefetchHits{0};
++  double m_lastProcessingMs{0};
++  double m_discardedWorkMs{0};
+   double m_packSubmitMs{0};
+   uint64_t m_pendingId{0}, m_prefetchHits{0};
+   int64_t m_pendingPts{0};
+@@ -81,5 +90,6 @@
+   dv_source_input m_pendingInput{};
+   double m_submitMs{0};
+   unsigned m_transitionFrames{3}, m_resetChecks{0}, m_verifiedFrames{0};
++  unsigned m_verifiedOverlayFrames{0};
+   bool m_refresh{true}, m_ready{false}, m_unsafe{false};
+ };
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVPrivateSource.cpp
+@@ -45,9 +45,11 @@
+   m_present = reinterpret_cast<decltype(m_present)>(dlsym(m_library, "dv_source_renderer_present"));
+   m_prepareOverlays = reinterpret_cast<decltype(m_prepareOverlays)>(dlsym(m_library, "dv_source_renderer_prepare_overlays"));
+   m_presentOverlay = reinterpret_cast<decltype(m_presentOverlay)>(dlsym(m_library, "dv_source_renderer_present_overlay"));
++  m_presentOverlayRevision = reinterpret_cast<decltype(m_presentOverlayRevision)>(dlsym(m_library, "dv_source_renderer_present_overlay_revision"));
+   m_cancel = reinterpret_cast<decltype(m_cancel)>(dlsym(m_library, "dv_source_renderer_cancel"));
+   m_packBegin = reinterpret_cast<decltype(m_packBegin)>(dlsym(m_library, "dv_source_renderer_pack_begin"));
+   m_packComplete = reinterpret_cast<decltype(m_packComplete)>(dlsym(m_library, "dv_source_renderer_pack_complete"));
++  m_packOverlayCached = reinterpret_cast<decltype(m_packOverlayCached)>(dlsym(m_library, "dv_source_renderer_pack_overlay_cached"));
+   if (!abi || abi() != 4 || !m_create || !m_render || !m_drain || !m_destroy)
+     return false;
+   const char* direct = std::getenv("DV_PRIVATE_SCANOUT");
+@@ -198,6 +200,8 @@
+ {
+   if (m_unsafe)
+     return false;
++  if (m_pending)
++    m_discardedWorkMs += m_submitMs + (m_packPending ? m_packSubmitMs : 0.0);
+   if (m_pending && (!m_cancel || m_cancel(m_engine) != 0))
+   {
+     if (m_packPending) m_scanout->Written(DV_SCANOUT_UNCERTAIN);
+@@ -263,8 +267,12 @@
+   const char* frameTiming = m_processed < 480 ? std::getenv("DV_PRIVATE_FRAME_TIMING") : nullptr;
+   const bool trace = (timing && std::strcmp(timing, "1") == 0) ||
+                     (frameTiming && std::strcmp(frameTiming, "1") == 0);
+-  const auto entered = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+-  if (m_packPending && overlay && !CancelPending()) return -1;
++  const auto entered = std::chrono::steady_clock::now();
++  if (m_packPending)
++  {
++    const bool sameGui = m_packOverlay ? overlay && m_packGui.SameContents(*overlay) : !overlay;
++    if (!sameGui && !CancelPending()) return -1;
++  }
+   const bool prefetched = Matches(display, owner, pts, geometry, input);
+   if (!prefetched)
+   {
+@@ -307,6 +315,9 @@
+   const unsigned elSurface = enhancement ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(enhancement->data[3])) : UINT32_MAX;
+   const auto present = [&](uint64_t id)
+   {
++    if (overlay && overlay->revision && m_presentOverlayRevision)
++      return m_presentOverlayRevision(m_engine, id, pts, packet, refresh, overlay->texture,
++                                      overlay->flipY, overlay->rgbToLms, overlay->whiteNits, overlay->revision);
+     return overlay ? m_presentOverlay(m_engine, id, pts, packet, refresh, overlay->texture,
+                                       overlay->flipY, overlay->rgbToLms, overlay->whiteNits)
+                    : m_present(m_engine, id, pts, packet, refresh);
+@@ -363,7 +374,9 @@
+   const double elapsed = std::chrono::duration<double, std::milli>(
+       std::chrono::steady_clock::now() - started).count();
+   const double processing = elapsed + (prefetched ? m_submitMs : 0.0) +
+-                            (prepacked ? m_packSubmitMs : 0.0);
++                            (prepacked ? m_packSubmitMs : 0.0) + m_discardedWorkMs +
++                            std::chrono::duration<double, std::milli>(started - entered).count();
++  m_discardedWorkMs = 0;
+   m_packSubmitMs = 0;
+   m_processingMs += processing;
+   m_prefetchHits += prefetched;
+@@ -371,7 +384,11 @@
+   m_preparedPts = pts;
+   m_drainTicket = CDVPrivateDrain::Enabled() ? CDVPrivateDrain::Get().Ticket(owner, pts) : 0;
+   m_ready = true;
++  m_overlayPrefetchHits = overlay && prefetched && m_preparedOverlay &&
++      m_preparedGui.SameContents(*overlay) ? std::min(m_overlayPrefetchHits + 1, 2u) : 0;
++  m_lastProcessingMs = processing;
+   m_preparedOverlay = overlay != nullptr;
++  m_preparedGui = overlay ? *overlay : DVPrivateOverlay{};
+   if (trace)
+   {
+     const auto ms = [](auto end, auto begin) { return std::chrono::duration<double, std::milli>(end - begin).count(); };
+@@ -382,11 +399,13 @@
+   }
+   if (m_transitionFrames) --m_transitionFrames;
+   const char* verify = std::getenv("DV_PRIVATE_VERIFY");
+-  const char* verifyAsync = std::getenv("DV_PRIVATE_ASYNC_PACK");
+-  // The movie-only oracle cannot validate pixels intentionally covered by GUI.
+-  if (!overlay && verify && std::strcmp(verify, "1") == 0 &&
++  const char* verifyAsync = std::getenv(overlay ? "DV_PRIVATE_ASYNC_OVERLAY" : "DV_PRIVATE_ASYNC_PACK");
++  const char* verifyGui = std::getenv("DV_PRIVATE_VERIFY_OVERLAY");
++  unsigned& verifiedFrames = overlay ? m_verifiedOverlayFrames : m_verifiedFrames;
++  if ((!overlay || (verifyGui && std::strcmp(verifyGui, "1") == 0)) &&
++      verify && std::strcmp(verify, "1") == 0 &&
+       (!verifyAsync || std::strcmp(verifyAsync, "1") != 0 || prepacked) &&
+-      (m_verifiedFrames < 6 || m_resetChecks))
++      (verifiedFrames < 6 || m_resetChecks))
+   {
+     std::vector<unsigned char> rgba(3840u * 2160u * 4u);
+     bool readValid = true;
+@@ -423,9 +442,9 @@
+     const bool resized = geometry.destination_width &&
+         (geometry.destination_width != geometry.width || geometry.destination_height != geometry.height);
+     CLog::Log(LOGINFO, "Private source GL output verified: pts={} bytes={} check={} prefetch={} after_reset={} prepacked={}",
+-        pts, rgba.size(), resized ? "sample-tolerance-and-payload" : "byte-exact", prefetched, m_resetChecks != 0, prepacked);
++        pts, rgba.size(), overlay ? "overlay-repack-byte-exact" : resized ? "sample-tolerance-and-payload" : "byte-exact", prefetched, m_resetChecks != 0, prepacked);
+     if (m_resetChecks) --m_resetChecks;
+-    if (m_verifiedFrames < 6) ++m_verifiedFrames;
++    if (verifiedFrames < 6) ++verifiedFrames;
+   }
+   if (m_processed == 1 || m_processed % 120 == 0)
+     CLog::Log(LOGINFO, "Private source frame: serial={} pts={} prepared=true processing_ms={} mean_ms={} diagnostic_readback={} colour_conversion=false prefetch_hit={} prefetch_hits={} present_wait_ms={} submit_ms={}", m_serial, pts, processing, m_processingMs / m_processed, verify && std::strcmp(verify, "1") == 0, prefetched, m_prefetchHits, elapsed, prefetched ? m_submitMs : 0.0);
+@@ -471,7 +490,7 @@
+   }
+   else m_refresh = true;
+   m_ready = false;
+-  if (success && !m_unsafe && !m_preparedOverlay) QueuePendingPack();
++  if (success && !m_unsafe) QueuePendingPack();
+ }
+ void CDVPrivateSource::QueuePendingPack()
+ {
+@@ -480,25 +499,45 @@
+       !m_scanout || !m_packBegin || !m_packComplete ||
+       eglGetCurrentContext() == EGL_NO_CONTEXT)
+     return;
++  if (m_preparedOverlay)
++  {
++    const char* overlays = std::getenv("DV_PRIVATE_ASYNC_OVERLAY");
++    if (!overlays || std::strcmp(overlays, "1") != 0 ||
++        !m_packOverlayCached || !m_preparedGui.revision)
++      return;
++    // Do not speculate while the frame selector is skipping ahead or the
++    // synchronous route already consumes the next frame's time budget.
++    const double budgetMs = (m_pendingPts - m_preparedPts) / 1000.0;
++    if (m_overlayPrefetchHits < 2 || budgetMs <= 0 || m_lastProcessingMs >= budgetMs * 0.85)
++      return;
++  }
+   const auto started = std::chrono::steady_clock::now();
+   glFinish();
+   if (!m_scanout->Begin(m_pendingId, m_pendingPts)) return;
+   m_packPending = true;
++  m_packOverlay = m_preparedOverlay;
++  m_packGui = m_preparedGui;
+   int result = m_selectOutput(m_engine, m_scanout->Slot());
+   if (result == 0)
+-    result = m_packBegin(m_engine, m_pendingId, m_pendingPts, m_scanout->Packet(),
+-                        m_scanout->Refresh(), 0, 0, nullptr, 0);
++    result = m_packOverlay ?
++        m_packOverlayCached(m_engine, m_pendingId, m_pendingPts, m_scanout->Packet(),
++                            m_scanout->Refresh(), m_packGui.texture, m_packGui.flipY,
++                            m_packGui.rgbToLms, m_packGui.whiteNits, m_packGui.revision) :
++        m_packBegin(m_engine, m_pendingId, m_pendingPts, m_scanout->Packet(),
++                    m_scanout->Refresh(), 0, 0, nullptr, 0);
+   m_packSubmitMs = std::chrono::duration<double, std::milli>(
+       std::chrono::steady_clock::now() - started).count();
+   if (m_processed < 480)
+-    CLog::Log(LOGINFO, "Private source async pack: pts={} status={} enqueue_ms={}",
+-              m_pendingPts, result, m_packSubmitMs);
++    CLog::Log(LOGINFO, "Private source async pack: pts={} status={} enqueue_ms={} overlay={} revision={}",
++              m_pendingPts, result, m_packSubmitMs, m_packOverlay, m_packGui.revision);
+   if (result != 0) CancelPending();
+ }
+ void CDVPrivateSource::Reset()
+ {
++  m_overlayPrefetchHits = 0;
+   if (!CancelPending()) m_unsafe = true;
+   if (m_scanout && !m_scanout->ResetStream()) m_unsafe = true;
++  m_discardedWorkMs = 0;
+   m_ready = false;
+   m_refresh = true;
+   m_packetId = 0;
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -98,6 +98,7 @@
+   bool m_guiHalf{false};
+   bool m_guiHalfBound{false};
+   bool m_guiRasterReady{true};
++  uint64_t m_guiRevision{0};
+   unsigned m_guiReusedFrames{0};
+   GLint m_guiSavedViewport[4]{};
+   GLint m_guiSavedScissor[4]{};
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -456,6 +456,8 @@
+     m_guiFboClean = false;
+   m_nativeGuiCoverage = nativeCoverage;
+   m_guiWillRender = guiWillRender;
++  if (guiWillRender || m_dvOverlays)
++    ++m_guiRevision;
+
+   int width = m_nWidth;
+   int height = m_nHeight;
+@@ -474,6 +476,7 @@
+   // create or recreate FBO if size changed
+   if (!m_guiFbo.IsValid() || m_guiFboWidth != width || m_guiFboHeight != height)
+   {
++    ++m_guiRevision;
+     m_guiFbo.Cleanup();
+
+     if (!m_guiFbo.Initialize())
+@@ -1028,6 +1031,9 @@
+     if (!overlayFree)
+       gui.texture = m_guiFbo.Texture();
+     gui.flipY = 1;
++    const char* revisionCache = std::getenv("DV_PRIVATE_GUI_REVISION");
++    if (revisionCache && std::strcmp(revisionCache, "1") == 0)
++      gui.revision = m_guiRevision;
+     // GUI709 -> BT2020 -> common LMS; the engine inverts the current movie matrices.
+     const double rgb[9]{.6274,.3293,.0433,.0691,.9195,.0114,.0164,.0880,.8956};
+     const double lms[9]{7222,8771,390,2654,12430,1300,0,422,15962};

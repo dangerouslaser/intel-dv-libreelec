@@ -28,6 +28,23 @@ int dv_source_map_active(const dv_source_geometry *g,unsigned width,unsigned hei
 }
 static unsigned get16(const unsigned char *p){return (unsigned)p[0]*256u+p[1];}
 static void put16(unsigned char *p,unsigned v){p[0]=(unsigned char)(v>>8);p[1]=(unsigned char)v;}
+int dv_source_overlay_metadata(unsigned char payload[512],size_t bytes,int visible,int previous)
+{
+    if(!payload||bytes<71||bytes>512)return -1;
+    size_t at=71,area=0;
+    for(unsigned i=0;i<payload[70];++i){
+        if(at>bytes||bytes-at<5)return -1;
+        uint32_t n=(uint32_t)payload[at]<<24|(uint32_t)payload[at+1]<<16|
+                   (uint32_t)payload[at+2]<<8|payload[at+3];
+        if(n>bytes-at-5)return -1;
+        if(payload[at+4]==5){if(area||n!=8)return -1;area=at+5;}
+        at+=5+n;
+    }
+    if(at!=bytes)return -1;
+    if(visible&&area)memset(payload+area,0,8);
+    if(!!visible!=!!previous)payload[1]=1;
+    return 0;
+}
 int dv_source_place_scaled_metadata(const dv_source_geometry *g,unsigned width,unsigned height,
                                     unsigned char payload[512],size_t *bytes)
 {

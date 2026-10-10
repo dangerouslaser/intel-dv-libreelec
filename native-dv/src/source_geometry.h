@@ -16,6 +16,9 @@ int dv_source_geometry_valid(const dv_source_geometry *);
 unsigned dv_source_destination_width(const dv_source_geometry *);
 unsigned dv_source_destination_height(const dv_source_geometry *);
 int dv_source_place_metadata(const dv_source_geometry *,unsigned char [512],size_t *);
+/* Presentation copy only: keep controls visible without changing movie masking.
+ * Refresh on both edges, including redraws of a paused frame. */
+int dv_source_overlay_metadata(unsigned char [512],size_t,int,int);
 /* Resize in source space before packing. Active rectangles use half-open
  * coordinates; round outward so scaling cannot discard active source pixels.
  * These helpers do not enable scaling in the renderer. */

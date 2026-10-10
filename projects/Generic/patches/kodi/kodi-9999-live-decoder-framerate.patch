@@ -1,0 +1,45 @@
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -1146,6 +1146,19 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+   if (!m_pFrame)
+     return false;
+ 
++  // Live demuxers may omit FPS even when the decoder has parsed stream timing.
++  if (m_processInfo.IsRealtimeStream() && m_processInfo.GetVideoFps() == 0.0f &&
++      m_pCodecContext->framerate.num > 0 && m_pCodecContext->framerate.den > 0)
++  {
++    const double fps = av_q2d(m_pCodecContext->framerate);
++    if (fps >= 5.0 && fps <= 120.0)
++    {
++      m_processInfo.SetVideoFps(static_cast<float>(fps));
++      CLog::Log(LOGINFO, "Live startup: decoder supplied framerate {}/{}",
++                m_pCodecContext->framerate.num, m_pCodecContext->framerate.den);
++    }
++  }
++
+   pVideoPicture->iWidth = m_pFrame->width;
+   pVideoPicture->iHeight = m_pFrame->height;
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -976,6 +976,18 @@
++  if (m_bFpsInvalid && m_processInfo.IsRealtimeStream())
++  {
++    const float decoderFps = m_processInfo.GetVideoFps();
++    if (decoderFps >= 5.0f && decoderFps <= 120.0f)
++    {
++      m_fFrameRate = DVD_TIME_BASE /
++                     CDVDCodecUtils::NormalizeFrameduration(DVD_TIME_BASE / decoderFps);
++      m_bFpsInvalid = false;
++      CLog::Log(LOGINFO, "Live startup: configuring renderer at {:.3f} fps", m_fFrameRate);
++    }
++  }
++
+   double config_framerate = m_bFpsInvalid ? 0.0 : m_fFrameRate;
+   if (m_processInfo.GetVideoInterlaced())
+   {
+     if (MathUtils::FloatEquals(config_framerate, 25.0, 0.02))
+       config_framerate = 50.0;
+     else if (MathUtils::FloatEquals(config_framerate, 29.97, 0.02))

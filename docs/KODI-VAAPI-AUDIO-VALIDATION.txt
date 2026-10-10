@@ -1,0 +1,184 @@
+Kodi VAAPI/audio port qualification — 2026-10-10
+
+Scope
+Two existing YBLOD fixes are ported to the integrated Kodi base:
+- Determine VAAPI allocation bit depth/chroma from the decoded software format.
+- Acknowledge DISPLAYLOST in audio states without a configured sink; defer
+  error-state sink retries until DISPLAYRESET or the bounded retry timeout.
+The audio header hunk is adapted to this base's member layout. The historical
+alternative DV announcement and single-modeset patches are not imported.
+
+Build
+Both patches apply and reverse-check against the cached prepared Kodi
+28ea2eac1eb7af8fdcbd2672d933ce87f594be79 tree with the native adapter.
+Incremental cross-build/link passes with six workers, eight-CPU container cap
+and 7 GiB memory cap. Source verification, 78 staging checks and eight staging
+unit tests pass. This is not a new complete LibreELEC image build.
+Candidate kodi.bin SHA256:
+b69a3ba063d1271988a0df1d3d2349083f697390d21210d32ea799c9fada244c
+Pre-fix cached binary SHA256:
+ca6c1542b111037dbd01b065bd666e4f19254000f7d0847337500daa9159d03a
+
+VM runtime
+An isolated profile and matching Kodi resources/libplacebo were used, with
+the pinned build's libnfs/libplist and installed VM drivers/FFmpeg. The shared
+native engine was the tested YBLOD pre4 polynomial-FEL candidate. This is a
+mixed test runtime, not qualification of a booted image from this repository.
+
+Live TV: France 2 UHD played using ff-hevc-vaapi at 3840x2160/50fps.
+Renderer logs confirm BT2020_YCC, 10bit, limited range and 10-bit output.
+Initial missing-extradata messages were followed by successful codec opening.
+Transient audio sink-open failures occurred around transitions, followed by
+successful ALSA initialization. This establishes a playback smoke test, not
+a controlled reproduction of the original pre-fix late-join defect.
+
+FEL clip: DT/DL P7 CMV4.0 4000nits v3.
+The first candidate run with debug overlay enabled looked wrong to the user
+(refresh/stuttering concern), despite no logged drops. It is not a pass.
+Pre-fix and candidate replays with the overlay OFF were both visually
+confirmed correct by the user. Both committed 23.976 Hz DV output. The first
+candidate replay stopped with processed=307/presented=307 and restored 60 Hz
+non-DV menu output. No DISPLAYLOST timeout was observed.
+
+IMPORTANT: the subsequent candidate stop/restart replay was reported glitchy
+by the user with the debug overlay still OFF. Therefore candidate DV visual
+qualification FAILS intermittently. The initial good replay is insufficient,
+and the debug overlay cannot explain all observed failures. The test was
+stopped and normal YBLOD restored; the port must remain unmerged pending a
+controlled transition investigation. No causal attribution to either patch
+versus the mixed runtime or existing adapter is established.
+
+At frame 241 (same clip position), cumulative engine service means:
+  pre-fix: 5.774 ms/frame
+  patched: 6.002 ms/frame
+Both ten-second health windows report zero drops/skips. These short samples
+are not a demonstrated speed change and do not measure HDMI/audio latency.
+The initial visual problem is associated with different test conditions;
+the failed repeat rules out treating overlay removal as a sufficient fix.
+
+Limitations
+No independent HDMI capture, audio-listening confirmation, exhaustive error-
+state injection or broad live-channel qualification. The transition changes
+do not combine the separate refresh-rate and DV-signalling mode changes.
+YBLOD already includes these fixes; this port does not require a YBLOD release.
+
+QMS isolation follow-up
+The installed YBLOD kernel's i915 qms parameter was enabled during the earlier
+tests. With the SAME candidate binary, engine, profile and overlay-off setting,
+qms was temporarily disabled before starting the test service. Two playbacks
+separated by stop/start were both visually confirmed correct. The user also
+reported the TV information overlay showing fixed 24 Hz on the second run.
+Kernel display state confirmed requested and adjusted timings both at
+296703 kHz / 5500 / 2250 (23.976 Hz); actual pipe clock was 296702 kHz.
+Both runs' ten-second health windows reported zero drops/skips. Second-run
+cumulative engine processing at about 20 seconds was 5.888 ms/frame.
+This supports a QMS/transition interaction in this mixed runtime, not a
+proven arithmetic regression or an identified root cause. It does not qualify
+QMS-enabled playback. Normal YBLOD and the original qms=Y setting were restored.
+
+Pre-fix QMS-on control
+The cached pre-fix binary (ca6c1542... above) was replayed twice with qms=Y,
+the same engine/profile and debug overlay OFF. The user reported the first
+run glitchy (TV overlay reported "WMS 23.9x") and the second run correct
+after stop/start. Both kernel snapshots show the same requested 23.976 Hz
+timing, but adjusted/pipe timing uses 594000 kHz, htotal=4400, vtotal=5630.
+This confirms QMS-adjusted timing rather than the fixed-clock QMS-off path.
+Both sampled health windows still report zero drops/skips. Thus the visual
+failure is reproducible without either ported fix, and identical static mode
+snapshots can accompany both good and bad output. QMS/display-transition
+state or pacing remains the investigation target; exact cause is unproven.
+Normal YBLOD was restored with qms=Y. No merge or additional runtime change
+was made. Logs and both display snapshots are retained on the test VM.
+
+Kernel cadence capture follow-up
+Three additional pre-fix/qms=Y/overlay-OFF playbacks were traced in a dedicated
+tracefs instance (global tracing configuration left alone). Captured events:
+DRM vblank, delivered vblank, Intel flip completion and pipe enable/disable.
+All three runs were visually confirmed correct; the intermittent failure did
+not recur during this capture series. First trace reports 1202/1202 retained
+records. Five seconds from trace start were excluded from cadence statistics.
+
+Run   vblank events   mean interval ms   maximum ms   gaps >60ms / seq jumps
+1     501             41.707858          42.044       0 / 0
+2     490             41.707865          42.046       0 / 0
+3     466             41.707978          42.009       0 / 0
+Delivered-vblank intervals agree within timestamp rounding. These are kernel
+event-delivery intervals, not an independent measurement of HDMI pixel output
+or proof every displayed frame has the correct contents. They establish a
+good-run reference only; no bad-run kernel trace exists yet. Tracing itself
+may affect timing, so this does not establish that the problem is resolved.
+Raw traces, Kodi logs and display snapshots are retained on the VM under
+native-kodi-fixes-test/qms-cadence-run{1,2,3}*. Normal YBLOD was restored,
+qms=Y retained, and the dedicated tracing instance was disabled.
+
+Different-rate predecessor tests
+On the same pre-fix candidate/QMS-on setup, France 2 UHD negotiated 50fps
+VAAPI and fixed 50Hz output, but the user saw a black picture. The subsequent
+FEL clip looked correct. That predecessor is not a successful visual playback
+qualification. Its transition trace includes a 959ms delivered-event gap
+after the five-second exclusion, plus startup skips; steady vblank interval
+remains 41.707ms. Do not label that transition stall-free.
+
+Gemini Man from 03:00 negotiated 59.94fps/QMS; the user reported a glitchy
+picture. A trace captured during that state shows mean vblank 16.683112ms,
+maximum 16.889ms, and no sequence jumps in 519 sampled events (after 5s).
+However the renderer repeatedly consumes source PTS 184067000 while health
+reports stalled=true and an empty video queue. Regular display interrupts
+therefore do not establish progressing movie frames; investigate frame supply
+separately from QMS signalling. This does not identify the stall's cause or
+prove it explains every visual artifact.
+
+Switching directly from Gemini Man to the FEL test produced a visually
+correct picture. Its trace has 342 sampled vblanks, mean 41.707554ms, max
+41.987ms and no sequence jumps after startup. Neither different-rate test
+reproduced the FEL artifact. Traces and display snapshots are retained with
+ratechange, gemini and gemini-to-fel labels. Normal YBLOD is restored and the
+private tracing instance disabled; QMS remains enabled.
+Shutdown of this test session exceeded its 30s service timeout and systemd
+killed the test process before normal YBLOD started. Clean shutdown is not
+qualified by this run; the normal Kodi service was then verified active.
+
+Frame-supply investigation and live-TV comparison
+The original Gemini stall followed ActiveAE::OnLostDisplay timing out and
+ActiveAE::MakeStream failing, with ProcessDecoderOutput unable to create its
+audio renderer. The initial roughly four seconds of queued video drained,
+then the renderer repeatedly consumed PTS 184067000. This is not evidence
+that reconstruction is too slow. Kodi's VideoPlayer read loop gates further
+demux reads if either audio or video stops accepting data; an audio blockage
+can therefore starve video. An actual blocked-thread capture is still needed
+to establish that mechanism in this incident.
+
+Pre-fix replay checks: fresh Gemini start, FEL-to-Gemini, and the original
+live-channel-to-FEL-to-Gemini sequence all progressed beyond the formerly
+stuck position, with approximately 99% video queue occupancy. The sustained
+stall did not reproduce, so no stalled-thread debugger capture was obtained.
+
+At the user's request, Sky Sports Main Event UHD replaced France 2 as the
+known-live channel. Pre-fix: user confirmed black picture, with repeated
+avcodec_receive_frame and vaSyncSurface failures. Patched binary: user
+confirmed a correct live picture; ff-hevc-vaapi at 50fps, 10-bit output, and
+no corresponding decoder/surface errors in that session. This provides a
+direct visual before/after smoke test for the live-10-bit fix. The binaries
+also differ in the audio fix; it is not a one-patch-only experiment.
+
+Patched Sky-to-FEL-to-Gemini: source PTS continues through 203070000, video
+queue ~99%, no sustained stall or MakeStream/DISPLAYLOST timeout observed.
+The sampled steady ten-second window has zero drop/skip deltas, but totals
+include 4 drops/3 skips accumulated around transitions. Do not claim a
+flawless startup or that the intermittent QMS artifact has been fixed.
+These results narrow the earlier stall toward audio/error-state recovery;
+they do not prove a root cause or complete a regression qualification.
+No additional playback code was changed during this investigation.
+
+Normal YBLOD comparison
+Repeated Sky Sports Main Event UHD -> FEL test -> Gemini Man (03:00) using
+the installed YBLOD pre3 Kodi/kernel and pre4 native-engine override, normal
+profile, QMS enabled. The experimental service remained stopped.
+The user confirmed correct pictures for Sky and FEL. Gemini advanced beyond
+the former 184.067s stall point through at least 208.291s; steady ten-second
+windows show 59.94fps, ~99% video queue, stalled=false and zero drop/skip
+deltas. Totals remain 4 drops/3 skips accumulated during transitions; this
+does not establish flawless startup. Cumulative engine service around the
+20s mark is ~4.0ms/frame, not total playback latency. Gemini visual response
+was still pending when this log note was recorded. Per-stage logs and display
+snapshots are retained as yblod-cycle-*. No new build was installed.
