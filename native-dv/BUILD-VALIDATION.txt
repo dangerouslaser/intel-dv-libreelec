@@ -105,3 +105,8 @@ all 32 valid GPU cases still match with both optimization configurations.
 The final library/resources also pass a live replay: first480frames averaged
 7.626 ms engine processing, no renderer rejection, direct GPU surfaces and
 asynchronous prefetch active. Visual TV confirmation is a separate user check.
+That final replay completed: processed=1458, presented=1458, no renderer
+rejections; cumulative processing mean at frame1440 was7.562 ms. The exhaustive
+CPU regression also passes GCC AddressSanitizer/UndefinedBehaviorSanitizer
+on Ollie. The macOS ASan runtime stalled during initialization before main;
+that process was stopped and is not counted as a test result.
