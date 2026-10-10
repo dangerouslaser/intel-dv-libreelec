@@ -61,3 +61,17 @@ No independent HDMI capture, audio-listening confirmation, exhaustive error-
 state injection or broad live-channel qualification. The transition changes
 do not combine the separate refresh-rate and DV-signalling mode changes.
 YBLOD already includes these fixes; this port does not require a YBLOD release.
+
+QMS isolation follow-up
+The installed YBLOD kernel's i915 qms parameter was enabled during the earlier
+tests. With the SAME candidate binary, engine, profile and overlay-off setting,
+qms was temporarily disabled before starting the test service. Two playbacks
+separated by stop/start were both visually confirmed correct. The user also
+reported the TV information overlay showing fixed 24 Hz on the second run.
+Kernel display state confirmed requested and adjusted timings both at
+296703 kHz / 5500 / 2250 (23.976 Hz); actual pipe clock was 296702 kHz.
+Both runs' ten-second health windows reported zero drops/skips. Second-run
+cumulative engine processing at about 20 seconds was 5.888 ms/frame.
+This supports a QMS/transition interaction in this mixed runtime, not a
+proven arithmetic regression or an identified root cause. It does not qualify
+QMS-enabled playback. Normal YBLOD and the original qms=Y setting were restored.
