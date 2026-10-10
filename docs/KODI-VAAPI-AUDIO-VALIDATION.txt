@@ -134,3 +134,6 @@ correct picture. Its trace has 342 sampled vblanks, mean 41.707554ms, max
 reproduced the FEL artifact. Traces and display snapshots are retained with
 ratechange, gemini and gemini-to-fel labels. Normal YBLOD is restored and the
 private tracing instance disabled; QMS remains enabled.
+Shutdown of this test session exceeded its 30s service timeout and systemd
+killed the test process before normal YBLOD started. Clean shutdown is not
+qualified by this run; the normal Kodi service was then verified active.
