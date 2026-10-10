@@ -75,3 +75,17 @@ cumulative engine processing at about 20 seconds was 5.888 ms/frame.
 This supports a QMS/transition interaction in this mixed runtime, not a
 proven arithmetic regression or an identified root cause. It does not qualify
 QMS-enabled playback. Normal YBLOD and the original qms=Y setting were restored.
+
+Pre-fix QMS-on control
+The cached pre-fix binary (ca6c1542... above) was replayed twice with qms=Y,
+the same engine/profile and debug overlay OFF. The user reported the first
+run glitchy (TV overlay reported "WMS 23.9x") and the second run correct
+after stop/start. Both kernel snapshots show the same requested 23.976 Hz
+timing, but adjusted/pipe timing uses 594000 kHz, htotal=4400, vtotal=5630.
+This confirms QMS-adjusted timing rather than the fixed-clock QMS-off path.
+Both sampled health windows still report zero drops/skips. Thus the visual
+failure is reproducible without either ported fix, and identical static mode
+snapshots can accompany both good and bad output. QMS/display-transition
+state or pacing remains the investigation target; exact cause is unproven.
+Normal YBLOD was restored with qms=Y. No merge or additional runtime change
+was made. Logs and both display snapshots are retained on the test VM.
