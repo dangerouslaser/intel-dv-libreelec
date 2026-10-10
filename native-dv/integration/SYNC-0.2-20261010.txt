@@ -1,0 +1,40 @@
+Native engine synchronization with YBLOD 0.2
+
+Scope
+Shared source port, not a new LibreELEC image or default-engine switch.
+Engine src/ and tests match the released YBLOD 0.2 implementation.
+The fork retains its pinned Kodi/CB1 base and explicit native-adapter selection.
+No YBLOD-specific QMS/menu integration or base resync is imported.
+
+Included
+- Existing pending VAAPI live-10-bit and ActiveAE display-loss recovery fixes.
+- Actual decoded frame rate for live startup, avoiding a duplicate live MPEG-TS
+  open, and audio preroll based on buffered duration plus 100 ms headroom.
+- Level 5 active-area handling while compositing overlays.
+- GUI pixel cache, transparent reads, Home raster reuse and GUI revision reuse.
+- Bounded movie-only asynchronous packing; asynchronous overlays remain OFF.
+- Native adapter display coordination and GUI redraw fixes.
+
+Validation
+Fresh Kodi 28ea2eac1eb7af8fdcbd2672d933ce87f594be79 archive, all current common
+and Generic patches, then kodi-adapter.patch and kodi-native-optimizations.patch:
+applied in order with patch --batch --fuzz=0; all passed.
+Corrected the live-single-open patch hunk counts; no semantic change.
+All four CPU contract tests passed (assertions enabled in Release).
+Renderer and all GPU test helpers cross-compiled successfully.
+On the tested Intel device, the newly built helpers passed:
+- eight asynchronous completion/ownership checks;
+- eight exact GUI-cache steps, including stale-coefficient negative control,
+  changing pixels, flip and transparent clear;
+- 32 polynomial/MMR FEL cases, 98,304 samples, zero reference differences;
+  16,344 chroma samples changed by FEL, confirming a nontrivial residual test.
+These are synthetic consistency tests, not independent Dolby conformance.
+
+Kodi compile/link result: passed, ENABLE_DVBRIDGE=ON, CB1_ENABLE_HDR10_AI=OFF.
+Build source: 944e1cf880197adaaf69f37d3d2012a23cb41ac6.
+Build used cached dependencies, first six and then twelve compiler workers,
+with a 10 GiB container memory limit. No compile/link errors or OOM.
+No replacement playback binary was installed. The released YBLOD image remains
+untouched. This port has not received fresh full-image or integrated playback
+qualification; earlier adapter measurements remain historical evidence only.
+Do not claim YBLOD's measured performance as this fork's measured performance.

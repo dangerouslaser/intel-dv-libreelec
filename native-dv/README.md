@@ -12,9 +12,10 @@ The standalone CMake build and short N150 playback/packing checks pass; see
 [BUILD-VALIDATION.txt](BUILD-VALIDATION.txt) for the exact scope and results.
 The [experimental Kodi adapter](integration/README.md) is now available as an
 explicit source patch, with build notes and a runtime configuration example.
-Normal LibreELEC image wiring is still being integrated.
-Building this branch's image does **not yet enable this new renderer**. No
-YBLOD merge or new pre-release image is included in this work-in-progress push.
+Building this repository's normal image does **not enable this new renderer**.
+The explicit adapter now includes the shared YBLOD 0.2 optimizations; see the
+[synchronization checks](integration/SYNC-0.2-20261010.txt). This source port is
+not a new image release or a change to the default CB1 playback route.
 `packages/graphics/native-dv/package.mk` packages the bundled source and its
 runtime dependencies; it is not yet a dependency of Kodi. Changes under
 `native-dv/` participate in LibreELEC's package rebuild stamp.
@@ -45,6 +46,6 @@ remain necessary.
 The shader bundle pins the accepted tunnel packer, without the rejected GUI
 tile prototype. `DV_OVERLAY_TILES` must remain disabled. No arithmetic changes
 are intended by this export. Source references and distribution terms accompany
-the code. The remaining Kodi/YBLOD integration still requires build, feature
-and publication review before an image release. Do not substitute the earlier
+the code. This fork's full-image integration still requires feature and playback
+qualification before an image release. Do not substitute the earlier
 test binary as proof that a future integrated image was built or qualified.

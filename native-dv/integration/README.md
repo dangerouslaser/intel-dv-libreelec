@@ -16,8 +16,9 @@ This is inspectable/buildable integration work, not a ready-to-install release.
 
 1. Prepare Kodi with the revision and existing patches above, using this
    repository's matching FFmpeg and libplacebo patches and staged CB1 sources.
-2. From that prepared Kodi tree, apply this patch with `git apply --check`
-   followed by `git apply`, or the equivalent `patch -p1` workflow.
+2. From that prepared Kodi tree, apply `kodi-adapter.patch`, followed by
+   `kodi-native-optimizations.patch`. The validated sequence uses
+   `patch --batch --fuzz=0 -p1 < PATCH` for each file in that order.
 3. Build Kodi's GBM/GLES target with `ENABLE_DVBRIDGE=ON`. The qualified
    integration build used `CB1_ENABLE_HDR10_AI=OFF`; the optional AI build
    configuration has not been qualified with this adapter.
@@ -38,11 +39,30 @@ are disabled in this configuration.
 
 ## Qualification scope
 
+### YBLOD 0.2 synchronization
+
+The standalone engine source now matches YBLOD 0.2. The additional adapter patch
+ports movie-only asynchronous packing, GUI revision reuse, unchanged Home raster
+reuse, full redraw of the separate GUI target and native-route display coordination.
+The engine also contains Level 5 overlay handling and transparent-pixel skipping.
+Asynchronous overlays remain disabled. Normal builds retain this repository's
+existing CB1 pipeline; selecting the native adapter remains an explicit step.
+
+Common Kodi patches include live 10-bit surface selection, audio-sink recovery,
+decoder-derived live frame rates, retaining an open live MPEG-TS connection and
+buffered-duration-based audio startup. Native display coordination is in the
+optional adapter patch because it depends on that adapter's rate-selection state.
+
+YBLOD's persistent DV-menu restoration and QMS-specific changes are not copied
+over this repository's different display-session implementation. Neither are
+YBLOD packaging, update-channel configuration, nor its LibreELEC base resync.
+See [synchronization checks](SYNC-0.2-20261010.txt). YBLOD playback performance
+numbers must not be presented as newly measured CB1-adapter performance.
+
 ### YBLOD pre2/pre3 applicability (2026-10-10)
 
-The standalone `native-dv/src` source is byte-identical to YBLOD's pre3 engine
-source. Its recent fixes are in YBLOD's separate Kodi adapter, not new engine
-math that is missing here:
+At the pre3 synchronization, the standalone `native-dv/src` source matched
+YBLOD's pre3 engine. Those fixes were in YBLOD's separate Kodi adapter:
 
 - Pre2 removes YBLOD's `dvbridge.qsvmode` and `dvbridge.matchhardware`
   settings. Neither setting exists in this CB1-based adapter.
