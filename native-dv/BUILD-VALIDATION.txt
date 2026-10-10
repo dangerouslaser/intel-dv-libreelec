@@ -69,3 +69,39 @@ approximately scene-matched windows show variability,not a packaging speedup.
 The original optimized-vs-general reconstruction accuracy gates are separate
 from these exported-build/driver checks. Complete image,Kodi integration,
 YBLOD-specific behavior and wider profile qualification remain required.
+
+2026-10-10 polynomial chroma with FEL residuals
+The dual-layer path now selects polynomial or MMR per chroma component.
+Polynomial tables preserve the mapped Q16 value and signed FEL residual;
+the existing GPU table-add kernel rounds/clamps to 12-bit only after addition.
+EL decoding, pairing, phase preparation and scaling are unchanged. There is
+no single-layer substitution or pixel readback in playback.
+
+CPU regression: 6,291,456 BL/EL combinations, covering identity/piecewise
+quadratic curves, endpoint clamps, signed correction and residual-disabled
+metadata. Independent identity/deadzone expectations also pass. Invalid
+mapping leaves prepared tables unchanged; the MMR preparer rejects polynomial.
+
+Intel GPU regression on 192.168.1.175: 32 combinations of half/equal EL size,
+both phase settings, polynomial/MMR channel pairings and piecewise curves.
+98,304 output samples match scalar spatial/composer reference exactly;
+16,344 polynomial chroma samples differ from their neutral-EL result.
+Both baseline and packaged optimization settings pass. Existing structural,
+geometry and scanout tests pass. This is implementation consistency, not
+licensed Dolby conformance or an independent HDMI capture comparison.
+
+Previously black DT/DL P7 CMV4.0 4000nits v3 clip: initial fixed candidate
+completed with processed=1458, presented=1458 and zero renderer rejections.
+Logged cumulative engine processing mean at frame1440: 7.502 ms/frame.
+This includes submit/present service, not complete decode-to-display latency;
+it is not an old-versus-new speed comparison (old build presented zero frames).
+Final library SHA256:
+c741e415b7d3023dd3d872cfb561284c11a687f72d8c28952331d6be0f99dbfc
+Final OpenCL source SHA256:
+afa2b7618d6584729add2e4d948a258ce5a0007ae001365dbb07423278c01027
+The shared table-add kernel rejects filter overshoot before indexing either
+1024-entry table. A deliberate ringing fixture returns DV_SAMPLE_RANGE;
+all 32 valid GPU cases still match with both optimization configurations.
+The final library/resources also pass a live replay: first480frames averaged
+7.626 ms engine processing, no renderer rejection, direct GPU surfaces and
+asynchronous prefetch active. Visual TV confirmation is a separate user check.

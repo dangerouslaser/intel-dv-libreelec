@@ -21,7 +21,7 @@
 #include <time.h>
 static double host_seconds(void){struct timespec t;if(clock_gettime(CLOCK_MONOTONIC,&t))return 0;return (double)t.tv_sec+(double)t.tv_nsec/1e9;}
 int dv_reference_luma(const dv_intel_composer_config *,uint16_t,uint16_t,int32_t *,int32_t *,uint16_t *);
-enum {B=0,E=3,BP=6,EP=8,V=9,ES=10,G=12,MT=13,RT=14,P=17,O=19,M=22,R=25,S=28,ERR=31,CP=32,CS=33,CO=34,CT=37,DL=38,ELUT=39,MASK=40,PCR=41,PCT=42,PRC=43,PRN=44,FDL=45,FELUT=46,PATCH=47,UL=48,VP=50,SM=51,SL=52,NB=53};
+enum {B=0,E=3,BP=6,EP=8,V=9,ES=10,G=12,MT=13,RT=14,P=17,O=19,M=22,R=25,S=28,ERR=31,CP=32,CS=33,CO=34,CT=37,DL=38,ELUT=39,MASK=40,PCR=41,PCT=42,PRC=43,PRN=44,FDL=45,FELUT=46,PATCH=47,UL=48,VP=50,SM=51,SL=52,CM=53,NB=55};
 typedef struct {
     cl_context context;cl_command_queue queue;cl_program program,input_program;cl_kernel kernel[29];int filter_fused,verify_filter,luma_pair,mmr_pair,mmr_uniform,mmr_mulhi,mmr_dual,verify_recon;
     int direct_p010,direct_active,defer_va_release;
@@ -46,6 +46,7 @@ typedef struct {
     cl_mem owned_va[4],owned_gl[3];unsigned va_count,gl_count;cl_event va_release,gl_release;
     cl_event unpack_event[2],pack_event;unsigned unpack_event_count;
     uint16_t mapping[1024];int32_t residual_table[3][1024];uint32_t mmr_params[2][96],reconstruction_error;
+    uint16_t chroma_mapping[2][1024];
     float colour_params[78];uint32_t colour_source[13],colour_candidates,colour_repair_count;
     dv_identity identity;dv_intel_composer_config config;int mmr96,mmr64,mmr_lut,recon2d;
     dv_mmr64_lut_cache mmr_lut_cache[2];
@@ -437,7 +438,12 @@ static dv_status reconstruct_impl(void *opaque,const dv_frame_settings *s,unsign
         mt[i]=(uint16_t)mapped;
         if(dv_reference_luma(&s->composer,0,(uint16_t)i,&mapped,&rt[0][i],&unused))return DV_UNSUPPORTED;
     }
-    for(unsigned c=1;c<3;++c)if(dv_mmr_prepare(&s->composer,c,params[c-1],rt[c])!=DV_OK)return DV_UNSUPPORTED;
+    for(unsigned c=1;c<3;++c){
+        if(!s->composer.component[c].mapping){
+            if(dv_prepare_polynomial_component(&s->composer,c,b->chroma_mapping[c-1],rt[c]))return DV_UNSUPPORTED;
+            memset(params[c-1],0,sizeof(params[c-1]));
+        }else if(dv_mmr_prepare(&s->composer,c,params[c-1],rt[c])!=DV_OK)return DV_UNSUPPORTED;
+    }
     if(tracing)prepared=host_seconds();
     for(unsigned c=0;!b->shared_prepared && c<3;++c){size_t count=c?n/4:n;
         uint32_t bits=0;
@@ -452,18 +458,23 @@ static dv_status reconstruct_impl(void *opaque,const dv_frame_settings *s,unsign
      * preparation and blocking upload in frame service time. On shared input,
      * this upload may also wait for already-queued VA unpack work. */
     if(b->mmr_lut)for(unsigned c=0;c<2;++c)
-        if(dv_mmr64_eligible(params[c],NULL))DO(prepare_mmr_lut(b,c,params[c]));
+        if(s->composer.component[c+1].mapping&&dv_mmr64_eligible(params[c],NULL))DO(prepare_mmr_lut(b,c,params[c]));
     if(!b->shared_prepared){b->reconstruction_error=0;DO(write_buffer(b,ERR,&b->reconstruction_error,4));}DO(write_buffer(b,MT,mt,sizeof(b->mapping)));
     for(unsigned c=0;c<3;++c){size_t count=c?n/4:n;
         if(!b->shared_prepared){if(enqueue_only){DO(write_buffer(b,B+c,bl[c],count*2));DO(write_buffer(b,E+c,el[c],count*2/area_scale));}
             else {DO(write_buffer_sync(b,B+c,bl[c],count*2));DO(write_buffer_sync(b,E+c,el[c],count*2/area_scale));}}DO(write_buffer(b,RT+c,rt[c],sizeof(rt[c])));
-        if(c)DO(write_buffer(b,P+c-1,params[c-1],sizeof(params[c-1])));
+        if(c){
+            if(!s->composer.component[c].mapping){
+                DO(reserve_one(b,CM+c-1,sizeof(b->chroma_mapping[c-1])));
+                DO(write_buffer(b,CM+c-1,b->chroma_mapping[c-1],sizeof(b->chroma_mapping[c-1])));
+            }else DO(write_buffer(b,P+c-1,params[c-1],sizeof(params[c-1])));
+        }
     }
     if(tracing)uploaded=host_seconds();
     /* Both phase-adjusted BL chroma planes are needed by either MMR. */
     DO(prepare_base(b,s->chroma_phase,w,h,b->base_fused));
     if(b->direct_active&&b->base_fused&&b->verify_base&&b->base_checks<3)DO(verify_base_preparation(b,s,w,h));
-    int dual=b->mmr_dual&&b->mmr_lut&&!diag&&dv_mmr64_eligible(params[0],NULL)&&dv_mmr64_eligible(params[1],NULL)&&!memcmp(params[0]+2,params[1]+2,6*sizeof(uint32_t));
+    int dual=s->composer.component[1].mapping&&s->composer.component[2].mapping&&b->mmr_dual&&b->mmr_lut&&!diag&&dv_mmr64_eligible(params[0],NULL)&&dv_mmr64_eligible(params[1],NULL)&&!memcmp(params[0]+2,params[1]+2,6*sizeof(uint32_t));
     int horizontal_fused=!equal&&dual&&b->horizontal_fused&&b->direct_active&&b->filter_fused&&!b->verify_filter;
     int verify_horizontal=horizontal_fused&&b->verify_horizontal&&b->horizontal_checks<3;
     if(b->mmr_dual)fprintf(stderr,"{\"mmr_dual_pts\":%lld,\"eligible\":%d,\"diagnostics\":%d}\n",(long long)s->identity.pts,dual,diag);
@@ -504,6 +515,17 @@ static dv_status reconstruct_impl(void *opaque,const dv_frame_settings *s,unsign
         else {
             if(!equal&&(!horizontal_fused||b->verify_recon||verify_horizontal)){
                 DO(memarg(b,2,0,b->direct_active&&c==2?VP:V));DO(memarg(b,2,1,ES+c-1));DO(memarg(b,2,2,ERR));DO(uintarg(b,2,3,cw));DO(uintarg(b,2,4,ch));DO(dispatch_spatial(b,2,cw,ch));}
+            if(!s->composer.component[c].mapping){
+                /* Scaling/phase preparation above is unchanged. This generic
+                 * table-add kernel preserves Q16 mapping plus FEL residual,
+                 * then performs the same single final 12-bit quantization. */
+                unsigned slots[9]={BP+c-1,ES+c-1,CM+c-1,RT+c,M+c,R+c,S+c,O+c,ERR};
+                for(unsigned a=0;a<9;++a)DO(memarg(b,27,a,slots[a]));
+                DO(uintarg(b,27,9,cw));DO(uintarg(b,27,10,ch));DO(uintarg(b,27,11,(unsigned)diag));
+                DO(dispatch_spatial(b,27,cw,ch));
+                b->event_kind[b->event_count-1]=5; /* Chroma work, despite shared kernel. */
+                continue;
+            }
             if(dual){if(c==1)continue;
                 unsigned k=horizontal_fused?26u:16u;
                 unsigned slots[12]={G,BP,BP+1,horizontal_fused?V:ES,horizontal_fused?VP:ES+1,P,P+1,RT+1,RT+2,O+1,O+2,ERR};for(unsigned a=0;a<12;++a)DO(memarg(b,k,a,slots[a]));

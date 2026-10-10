@@ -85,6 +85,8 @@ kernel void luma_equal(INPUT_PLANE bl,INPUT_PLANE el,global const ushort *mt,glo
 #else
     uint base=bl[i],enh=el[i];
 #endif
+    /* Scaled FEL chroma can overshoot. Reject before indexing either table. */
+    if((base|enh)>1023u){atomic_or(error,1u);return;}
     uint m=mt[base];int r=rt[enh];long total=(long)m+r;
     if(total>2147483647L || total<(-2147483647L-1L)){atomic_or(error,2u);return;}
     out[i]=(ushort)clamp(total>-8?(total+8)/16:0L,0L,4095L);

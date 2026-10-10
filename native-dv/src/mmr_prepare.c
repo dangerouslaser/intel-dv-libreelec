@@ -8,6 +8,7 @@ static void words(uint32_t *out,__int128 value)
 dv_status dv_mmr_prepare(const dv_intel_composer_config *cfg,unsigned component,uint32_t params[96],int32_t table[1024])
 {
     if(!cfg || !params || !table || component<1 || component>2)return DV_INVALID;
+    if(cfg->component[component].mapping!=1)return DV_UNSUPPORTED;
     uint16_t zeros[1024]={0},el[1024],mapped[1024],out[1024];int32_t sum[1024],residual[1024];
     for(unsigned i=0;i<1024;++i)el[i]=(uint16_t)i;
     if(dv_reference_chroma_batch(cfg,component,1024,zeros,zeros,zeros,el,mapped,residual,sum,out))return DV_UNSUPPORTED;

@@ -97,3 +97,18 @@ int dv_prepare_polynomial_tables(const dv_intel_composer_config *cfg,uint16_t ta
         if(dv_reference_polynomial(cfg,c,(uint16_t)code,0,&mapped,&residual,&result[c][code]))return -1;
     memcpy(table,result,sizeof(result));return 0;
 }
+
+int dv_prepare_polynomial_component(const dv_intel_composer_config *cfg,unsigned c,
+                                    uint16_t mapped_table[1024],int32_t residual_table[1024])
+{
+    if(!cfg||c>2||!mapped_table||!residual_table)return -1;
+    uint16_t mapping[1024],code;int32_t residuals[1024],mapped,residual;
+    for(unsigned i=0;i<1024;++i){
+        if(dv_reference_polynomial(cfg,c,(uint16_t)i,(uint16_t)cfg->component[c].nlq_offset,
+                                   &mapped,&residual,&code))return -1;
+        mapping[i]=(uint16_t)mapped;
+        if(dv_reference_polynomial(cfg,c,0,(uint16_t)i,&mapped,&residuals[i],&code))return -1;
+    }
+    memcpy(mapped_table,mapping,sizeof(mapping));
+    memcpy(residual_table,residuals,sizeof(residuals));return 0;
+}

@@ -1,8 +1,9 @@
-/* Private integer MMR reference. No sampling/scaling/display mapping.
- * Initial scope: 10/10/12-bit, one MMR interval per chroma component.
+/* Integer chroma reference. No sampling/scaling/display mapping.
+ * 10/10/12-bit polynomial or one MMR interval per chroma component.
  * __int128 keeps all supported coefficient/intermediate products bounded.
  */
 #include "intel_composer_config.h"
+#include "pixel_polynomial.h"
 #include <stddef.h>
 #include <stdint.h>
 #if defined(DV_BOUNDED_MMR64) && !defined(DV_PREPARED_CHROMA)
@@ -52,6 +53,20 @@ int dv_reference_chroma_batch(const dv_intel_composer_config *cfg, unsigned comp
     const uint16_t *el, uint16_t *mapped, int32_t *residual, int32_t *sum,
     uint16_t *output)
 {
+    if(cfg&&component>=1&&component<=2&&!cfg->component[component].mapping){
+        if(!y||!cb||!cr||!el||!mapped||!residual||!sum||!output||
+           count>SIZE_MAX/sizeof(int32_t))return -1;
+        int32_t v,r;uint16_t code;
+        if(dv_reference_polynomial(cfg,component,0,0,&v,&r,&code))return -1;
+        for(size_t i=0;i<count;++i)
+            if(y[i]>1023||cb[i]>1023||cr[i]>1023||el[i]>1023)return -1;
+        const uint16_t *base=component==1?cb:cr;
+        for(size_t i=0;i<count;++i){
+            if(dv_reference_polynomial(cfg,component,base[i],el[i],&v,&r,&code))return -1;
+            mapped[i]=(uint16_t)v;residual[i]=r;sum[i]=(int32_t)((int64_t)v+r);output[i]=code;
+        }
+        return 0;
+    }
     if (!valid(cfg,component) || !y || !cb || !cr || !el || !mapped ||
         !residual || !sum || !output || count > SIZE_MAX/sizeof(int32_t)) return -1;
     for (size_t i = 0; i < count; ++i)
