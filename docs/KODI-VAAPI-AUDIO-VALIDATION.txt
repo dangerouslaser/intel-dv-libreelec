@@ -137,3 +137,35 @@ private tracing instance disabled; QMS remains enabled.
 Shutdown of this test session exceeded its 30s service timeout and systemd
 killed the test process before normal YBLOD started. Clean shutdown is not
 qualified by this run; the normal Kodi service was then verified active.
+
+Frame-supply investigation and live-TV comparison
+The original Gemini stall followed ActiveAE::OnLostDisplay timing out and
+ActiveAE::MakeStream failing, with ProcessDecoderOutput unable to create its
+audio renderer. The initial roughly four seconds of queued video drained,
+then the renderer repeatedly consumed PTS 184067000. This is not evidence
+that reconstruction is too slow. Kodi's VideoPlayer read loop gates further
+demux reads if either audio or video stops accepting data; an audio blockage
+can therefore starve video. An actual blocked-thread capture is still needed
+to establish that mechanism in this incident.
+
+Pre-fix replay checks: fresh Gemini start, FEL-to-Gemini, and the original
+live-channel-to-FEL-to-Gemini sequence all progressed beyond the formerly
+stuck position, with approximately 99% video queue occupancy. The sustained
+stall did not reproduce, so no stalled-thread debugger capture was obtained.
+
+At the user's request, Sky Sports Main Event UHD replaced France 2 as the
+known-live channel. Pre-fix: user confirmed black picture, with repeated
+avcodec_receive_frame and vaSyncSurface failures. Patched binary: user
+confirmed a correct live picture; ff-hevc-vaapi at 50fps, 10-bit output, and
+no corresponding decoder/surface errors in that session. This provides a
+direct visual before/after smoke test for the live-10-bit fix. The binaries
+also differ in the audio fix; it is not a one-patch-only experiment.
+
+Patched Sky-to-FEL-to-Gemini: source PTS continues through 203070000, video
+queue ~99%, no sustained stall or MakeStream/DISPLAYLOST timeout observed.
+The sampled steady ten-second window has zero drop/skip deltas, but totals
+include 4 drops/3 skips accumulated around transitions. Do not claim a
+flawless startup or that the intermittent QMS artifact has been fixed.
+These results narrow the earlier stall toward audio/error-state recovery;
+they do not prove a root cause or complete a regression qualification.
+No additional playback code was changed during this investigation.
