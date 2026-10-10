@@ -169,3 +169,16 @@ flawless startup or that the intermittent QMS artifact has been fixed.
 These results narrow the earlier stall toward audio/error-state recovery;
 they do not prove a root cause or complete a regression qualification.
 No additional playback code was changed during this investigation.
+
+Normal YBLOD comparison
+Repeated Sky Sports Main Event UHD -> FEL test -> Gemini Man (03:00) using
+the installed YBLOD pre3 Kodi/kernel and pre4 native-engine override, normal
+profile, QMS enabled. The experimental service remained stopped.
+The user confirmed correct pictures for Sky and FEL. Gemini advanced beyond
+the former 184.067s stall point through at least 208.291s; steady ten-second
+windows show 59.94fps, ~99% video queue, stalled=false and zero drop/skip
+deltas. Totals remain 4 drops/3 skips accumulated during transitions; this
+does not establish flawless startup. Cumulative engine service around the
+20s mark is ~4.0ms/frame, not total playback latency. Gemini visual response
+was still pending when this log note was recorded. Per-stage logs and display
+snapshots are retained as yblod-cycle-*. No new build was installed.
