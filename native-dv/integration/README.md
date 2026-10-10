@@ -38,6 +38,33 @@ are disabled in this configuration.
 
 ## Qualification scope
 
+### YBLOD pre2/pre3 applicability (2026-10-10)
+
+The standalone `native-dv/src` source is byte-identical to YBLOD's pre3 engine
+source. Its recent fixes are in YBLOD's separate Kodi adapter, not new engine
+math that is missing here:
+
+- Pre2 removes YBLOD's `dvbridge.qsvmode` and `dvbridge.matchhardware`
+  settings. Neither setting exists in this CB1-based adapter.
+- Pre3 recreates the movie-shared GUI framebuffer when returning directly to
+  YBLOD's DV-enabled menu. This adapter has no `BeginDVMenu`/`m_dvMenu` path.
+  Its successful `EndDVBridge()` calls `SetGuiCompositing(0)`, which already
+  cleans up the GUI framebuffer and resets its dimensions and native GUI state.
+- YBLOD's earlier startup-signal fix targets its own deferred-modeset/menu
+  handoff. It is not a drop-in fix for this adapter's different output-session
+  handling; YBLOD playback results do not qualify the CB1 adapter.
+
+Consequently, these changes do not require a code port here. If a persistent
+DV-menu path is added later, it must invalidate the movie-shared GUI target
+at the handoff and include a visual play/stop regression check: successful
+DRM signalling alone did not detect YBLOD's distorted-menu defect.
+
+See the [YBLOD pre3 fix](https://github.com/dangerouslaser/libreelec-yblod/commit/7559397e7d04688d5f1cdb761905db1151ae9721)
+and its [qualification report](https://github.com/dangerouslaser/libreelec-yblod/blob/c01d3e39/native-dv/integration/PRE3-20261009.txt).
+This applicability review is source inspection, not a new CB1 build or playback test.
+
+### Existing adapter qualification
+
 The exported code was built and exercised on an Intel N150 with the separately
 CMake-built native engine and pinned Intel OpenCL runtime. The exported patch
 was also applied to a clean snapshot of the prepared Kodi tree; its complete
