@@ -112,7 +112,15 @@ static dv_status settings_from_ffmpeg(const void *data,size_t bytes,unsigned wid
     put16(payload+50,s->eotf);payload[60]=12;payload[61]=(unsigned char)s->space;payload[62]=1;payload[63]=1;
     put16(payload+64,color.source_min_pq);put16(payload+66,color.source_max_pq);put16(payload+68,color.source_diagonal);
     size_t used=71;int area_seen=0;
-    for(int i=0;i<metadata.num_ext_blocks;++i){AVDOVIDmData ext={0};
+    /* Wire order as CB1's serializer: by level, the DM v2 blocks (L3, L8-L11,
+     * L254) after the others, ties in stream order. */
+    int order[AV_DOVI_MAX_EXT_BLOCKS];unsigned rank[AV_DOVI_MAX_EXT_BLOCKS];
+    for(int i=0;i<metadata.num_ext_blocks;++i){AVDOVIDmData head={0};
+        memcpy(&head,raw+metadata.ext_block_offset+(size_t)i*metadata.ext_block_size,EXT_PREFIX);
+        unsigned level=head.level,r=level+((level==3||(level>=8&&level<=11)||level==254)?256u:0u);
+        int at=i;while(at>0&&rank[at-1]>r){rank[at]=rank[at-1];order[at]=order[at-1];--at;}
+        rank[at]=r;order[at]=i;}
+    for(int k=0;k<metadata.num_ext_blocks;++k){AVDOVIDmData ext={0};int i=order[k];
         const unsigned char *block=raw+metadata.ext_block_offset+(size_t)i*metadata.ext_block_size;
         memcpy(&ext,block,EXT_PREFIX);
         uint16_t fields[7];unsigned count;

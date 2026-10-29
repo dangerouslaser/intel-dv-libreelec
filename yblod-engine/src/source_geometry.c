@@ -62,13 +62,20 @@ int dv_source_place_scaled_metadata(const dv_source_geometry *g,unsigned width,u
     if(left+right>=g->width||top+bottom>=g->height)return -1;
     uint32_t active[4]={left,top,g->width-right,g->height-bottom},placed[4];
     if(dv_source_map_active(g,width,height,active,placed))return -1;
-    if(placed[0]==left&&placed[1]==top&&g->canvas_width-placed[2]==right&&
+    if(area&&placed[0]==left&&placed[1]==top&&g->canvas_width-placed[2]==right&&
        g->canvas_height-placed[3]==bottom)return 0;
     if(!area){if(at>512-13||copy[70]==255)return -1;
         memset(copy+at,0,13);copy[at+3]=8;copy[at+4]=5;area=at+5;at+=13;++copy[70];}
     put16(copy+area,placed[0]);put16(copy+area+2,g->canvas_width-placed[2]);
     put16(copy+area+4,placed[1]);put16(copy+area+6,g->canvas_height-placed[3]);
     memcpy(payload,copy,at);*bytes=at;return 0;
+}
+unsigned dv_packet_sequence_next(dv_packet_sequence *s,const unsigned char *payload,size_t bytes)
+{
+    if(!s||!payload||bytes>sizeof(s->previous))return 0;
+    if(s->frames&&(s->size!=bytes||memcmp(s->previous,payload,bytes)))s->id=(s->id+1)&15u;
+    memcpy(s->previous,payload,bytes);s->size=bytes;s->frames++;
+    return s->id;
 }
 int dv_source_place_metadata(const dv_source_geometry *g,unsigned char payload[512],size_t *bytes)
 {

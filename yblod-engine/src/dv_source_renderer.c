@@ -25,7 +25,7 @@ typedef struct {
     /* DV_CB1_CONTRACT=1: CB1 Master Reference's spatial contract (the stream's
      * siting with an EL too, 4:2:0 reshaping, no chroma phase pre-filter and
      * the Annex B 4:2:2 output filters), as yblod-engine-vk's cb1_contract. */
-    int contract;
+    int contract;dv_packet_sequence sequence;
     cl_program full_program;cl_kernel full_kernel;
     int submitted;unsigned char dm[512];size_t dm_bytes;int overlay_visible;unsigned wait_profiles;
     dv_source_geometry geometry;
@@ -557,6 +557,7 @@ static int present_internal(void *opaque,uint64_t frame_id,int64_t pts,unsigned 
     unsigned w=geometry->width,h=geometry->height;unsigned char dm[512],packed[640];
     memcpy(dm,r->dm,r->dm_bytes);if(refresh)dm[1]=1;
     if(dv_source_overlay_metadata(dm,r->dm_bytes,gui!=0,r->overlay_visible))return DV_INVALID;
+    if(r->contract)packet_id=dv_packet_sequence_next(&r->sequence,dm,r->dm_bytes);
     unsigned count=packetize(dm,r->dm_bytes,packet_id,packed);
     unsigned dw=dv_source_destination_width(geometry),dh=dv_source_destination_height(geometry);
     int resized=dw!=w||dh!=h;
