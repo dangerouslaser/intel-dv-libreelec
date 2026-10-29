@@ -93,7 +93,7 @@ index ba0fb42..43984a6 100644
      list(APPEND SOURCES HDR10AISource.cpp)
      list(APPEND HEADERS HDR10AISource.h)
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
-index 3f4b8dc..edb38c1 100644
+index 3f4b8dc..09b9160 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 @@ -1,5 +1,6 @@
@@ -216,24 +216,37 @@ index 3f4b8dc..edb38c1 100644
    if (imported->scaled)
    {
      layer.planes[0] = imported->scaled->plane;
-@@ -2128,6 +2189,8 @@ void CDVBridgeGLES::CountPresentation(bool committed)
+@@ -2128,7 +2189,11 @@ void CDVBridgeGLES::CountPresentation(bool committed)
  bool CDVBridgeGLES::Presented(bool success)
  {
    if (m_live) return Presented(success,m_submission);
-+  if (m_yblod) m_yblod->Presented(success && m_yblodFrame && m_prepared && m_packed);
+-  const bool committed = success && m_prepared && m_packed && dvbridge_render_commit(m_renderer);
++  // A YBLOD engine's picture never went through CB1's renderer: nothing of its to commit.
++  const bool yblod = m_yblodFrame;
++  if (m_yblod) m_yblod->Presented(success && yblod && m_prepared && m_packed);
 +  m_yblodFrame = false;
-   const bool committed = success && m_prepared && m_packed && dvbridge_render_commit(m_renderer);
++  const bool committed = success && m_prepared && m_packed && (yblod || dvbridge_render_commit(m_renderer));
    CountPresentation(committed);
    if (!committed && m_prepared) Failure("presentation");
-@@ -2179,6 +2242,8 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+   if (committed)
+@@ -2179,12 +2244,15 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
        hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
        m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
        m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
-+  if (m_yblod) m_yblod->Presented(success && m_yblodFrame && m_prepared && m_packed);
+-  const bool committed = success && m_prepared && m_packed &&
++  const bool yblod = m_yblodFrame;
++  if (m_yblod) m_yblod->Presented(success && yblod && m_prepared && m_packed);
 +  m_yblodFrame = false;
-   const bool committed = success && m_prepared && m_packed &&
++  const bool committed = success && m_prepared && m_packed && (yblod ||
        (m_advanced ? (m_dvPolicyActive ?
            dvbridge_render_dv_policy_commit(m_renderer,&submission.identity,
+               submission.target,submission.resolveSerial) :
+           dvbridge_render_policy_commit(m_renderer,&submission.identity,submission.target)) :
+-          dvbridge_render_commit(m_renderer));
++          dvbridge_render_commit(m_renderer)));
+   CountPresentation(committed);
+   if (!committed)
+   {
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
 index ade1f23..c87e680 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
