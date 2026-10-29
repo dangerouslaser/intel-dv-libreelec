@@ -408,6 +408,18 @@ int main(int argc, char **argv)
     size_t luma_hist[5] = {0}, chroma_hist[5] = {0};   /* |d| = 1, 2, 3-4, 5-16, more */
     double cb1_ms = 0, vk_ms = 0;
     double *cb1_t = calloc((size_t)frames + 1, sizeof(double)), *vk_t = calloc((size_t)frames + 1, sizeof(double));
+    /* CB1's GPU time alone (EXT_disjoint_timer_query): its CPU work overlaps the
+     * GPU in Kodi, so the CPU-clock time above is the synchronous worst case. */
+    double *cb1_gpu = calloc((size_t)frames + 1, sizeof(double));
+    int timed_cb1_gpu = 0;
+    PFNGLGENQUERIESEXTPROC gen_queries = (void *)eglGetProcAddress("glGenQueriesEXT");
+    PFNGLBEGINQUERYEXTPROC begin_query = (void *)eglGetProcAddress("glBeginQueryEXT");
+    PFNGLENDQUERYEXTPROC end_query = (void *)eglGetProcAddress("glEndQueryEXT");
+    PFNGLGETQUERYOBJECTUI64VEXTPROC query_result = (void *)eglGetProcAddress("glGetQueryObjectui64vEXT");
+    GLuint query = 0;
+    int gpu_timing = gen_queries && begin_query && end_query && query_result;
+    if (gpu_timing)
+        gen_queries(1, &query);
     int timed_cb1 = 0, timed_vk = 0;
     struct dv_pair p;
     while (n < frames && dv_decoder_next(&dec, &p) == 1) {
@@ -464,9 +476,18 @@ int main(int argc, char **argv)
                 dvbridge_renderer_set_processing_optimizations(cb1, false);
                 dvbridge_renderer_set_fel_nearest(cb1, el != NULL);
                 dvbridge_renderer_set_overlay_visible(cb1, false);
+                if (gpu_timing)
+                    begin_query(GL_TIME_ELAPSED_EXT, query);
                 cs = (ipt ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference)(
                     cb1, &bl.frame, meta, meta_size, pts, el ? pts : NAN, g, target, flip, NULL);
+                if (gpu_timing)
+                    end_query(GL_TIME_ELAPSED_EXT);
                 pl_gpu_finish(gl->gpu);
+                if (gpu_timing && n > warmup) {
+                    GLuint64 ns = 0;
+                    query_result(query, GL_QUERY_RESULT_EXT, &ns);
+                    cb1_gpu[timed_cb1_gpu++] = ns / 1e6;
+                }
             }
         }
         double dt = now_ms() - t0;
@@ -595,6 +616,8 @@ int main(int argc, char **argv)
     }
     if (timed_cb1)
         printf("timing cb1: %s\n", stats(cb1_t, timed_cb1));
+    if (timed_cb1_gpu)
+        printf("timing cb1 gpu: %s\n", stats(cb1_gpu, timed_cb1_gpu));
     if (timed_vk)
         printf("timing vk:  %s\n", stats(vk_t, timed_vk));
     printf("{\"file\":\"%s\",\"profile\":%d,\"fel\":%d,\"ipt\":%d,\"cb1_contract\":%d,\"frames\":%d,\"compared\":%d,"
