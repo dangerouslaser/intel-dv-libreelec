@@ -1,5 +1,5 @@
 diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
-index 8db6587..94ae8fa 100644
+index 8db6587..aababb2 100644
 --- a/addons/resource.language.en_gb/resources/strings.po
 +++ b/addons/resource.language.en_gb/resources/strings.po
 @@ -25870,6 +25870,27 @@ msgctxt "#40926"
@@ -12,7 +12,7 @@ index 8db6587..94ae8fa 100644
 +msgstr ""
 +
 +msgctxt "#40961"
-+msgid "Which engine renders Master Reference. YBLOD's engines produce the same picture byte for byte, on Vulkan compute (Intel and AMD) or OpenCL (Intel). Pictures they do not take, and pictures with menus or subtitles shown, use CB1."
++msgid "Which engine renders Master Reference. YBLOD's engines produce the same picture byte for byte, on Vulkan compute (Intel and AMD) or OpenCL (Intel). Menus and subtitles are mixed in as CB1 does (Vulkan; with OpenCL those pictures use CB1), and pictures they do not take use CB1."
 +msgstr ""
 +
 +msgctxt "#40962"
@@ -151,7 +151,7 @@ index ba0fb42..43984a6 100644
      list(APPEND SOURCES HDR10AISource.cpp)
      list(APPEND HEADERS HDR10AISource.h)
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
-index 3f4b8dc..cc98123 100644
+index 3f4b8dc..f8e9e38 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 @@ -1,5 +1,6 @@
@@ -194,7 +194,7 @@ index 3f4b8dc..cc98123 100644
    cb1_hdr10plus_analysis_destroy(&m_hdr10plusAnalysis);
    ClearFELPrefetch();
    Summary("closed");
-@@ -1206,6 +1214,106 @@ void CDVBridgeGLES::Reset()
+@@ -1206,6 +1214,117 @@ void CDVBridgeGLES::Reset()
  #endif
    m_pendingHDR10Fallback = 0;
    dvbridge_renderer_reset(m_renderer);
@@ -266,7 +266,8 @@ index 3f4b8dc..cc98123 100644
 +bool CDVBridgeGLES::PrepareYblod(const Layer& base, const Layer* enhancement,
 +                                 const CDVMetadataBuffer& metadata, const dvbridge_geometry& geometry)
 +{
-+  // Unscaled pictures without menus or subtitles; everything else is CB1's.
++  // Unscaled pictures; menus and subtitles too with the Vulkan engine (CB1's
++  // native overlay, mixed in as CB1 does). Everything else is CB1's.
 +  // Kodi gives the whole source as the crop and the integer destination as the
 +  // placement (all zero keeps both too); the engines place at even x, y.
 +  const float crop[4]{0, 0, float(base.width), float(base.height)};
@@ -280,28 +281,38 @@ index 3f4b8dc..cc98123 100644
 +      (zero(geometry.placement) || std::equal(std::begin(placed), std::end(placed), std::begin(geometry.placement)));
 +  // CB1 keeps its overlay shader primed with an empty rectangle: nothing is drawn.
 +  const bool overlay = m_nativeOverlayEnabled && !zero(m_nativeOverlay.rect);
++  const auto backend = m_requested.masterEngine == 2 ? CDVYblodEngine::Backend::OpenCL :
++      CDVYblodEngine::Backend::Vulkan;
++  const bool overlayTaken = !overlay || CDVYblodEngine::TakesOverlay(backend);
 +  static unsigned declined = 0;
-+  if (m_requested.masterEngine >= 1 && (!unscaled || overlay) && declined++ < 4)
++  if (m_requested.masterEngine >= 1 && (!unscaled || !overlayTaken) && declined++ < 4)
 +    CLog::Log(LOGINFO, "YBLOD engine: CB1 renders this picture (unscaled={} overlay={} {}x{} at {},{})",
 +              unscaled, overlay, geometry.width, geometry.height, geometry.x, geometry.y);
-+  if (m_requested.masterEngine < 1 || m_requested.masterIPT || overlay || !unscaled ||
++  if (m_requested.masterEngine < 1 || m_requested.masterIPT || !overlayTaken || !unscaled ||
 +      !base.vaDisplay || base.vaSurface == 0xffffffff || (enhancement && enhancement->vaSurface == 0xffffffff) ||
 +      m_scanoutFramebuffer != 0)
 +    return false;
 +  if (!m_yblod) m_yblod = std::make_unique<CDVYblodEngine>();
 +  // CB1's siting (Kodi's SourceChroma).
 +  const bool topLeft = SourceChroma(base.chromaLocation, base.sourceInfo.profile) == PL_CHROMA_TOP_LEFT;
-+  const auto backend = m_requested.masterEngine == 2 ? CDVYblodEngine::Backend::OpenCL :
-+      CDVYblodEngine::Backend::Vulkan;
++  CDVYblodEngine::Overlay layer;
++  if (overlay)
++  {
++    layer.texture = m_nativeOverlayTextures[0];
++    layer.pq = m_nativeOverlay.input_pq;
++    std::copy(std::begin(m_nativeOverlay.rect), std::end(m_nativeOverlay.rect), std::begin(layer.rect));
++    layer.content = m_nativeOverlayContent;
++  }
 +  m_yblodFrame = m_yblod->Render(backend, base.vaDisplay, base.vaSurface,
 +      enhancement ? enhancement->vaSurface : 0xffffffffu, base.width, base.height, geometry.x, geometry.y,
 +      topLeft, base.layout == DVBRIDGE_NV12, metadata.Data(), metadata.Size(), base.pts,
-+      m_scanoutFramebuffer, geometry.target_width, geometry.target_height, true);
++      m_scanoutFramebuffer, geometry.target_width, geometry.target_height, true,
++      overlay ? &layer : nullptr, m_overlayVisible);
 +  return m_yblodFrame;
  }
  
  bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
-@@ -1255,11 +1363,16 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+@@ -1255,11 +1374,16 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
    if (!m_hdr10 && allowPacked && (m_directUsable || m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE) &&
        m_scanout)
    {
@@ -319,7 +330,7 @@ index 3f4b8dc..cc98123 100644
        m_direct=status==CB1_MASTER_READY;
        if(!m_direct) Failure(status==CB1_MASTER_INVALID ? "master-reference-invalid-metadata" :
            status==CB1_MASTER_UNSUPPORTED ? "master-reference-unsupported-contract" :
-@@ -1825,6 +1938,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+@@ -1825,6 +1949,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
    layer.pts = static_cast<double>(enhancement->pts);
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -332,7 +343,7 @@ index 3f4b8dc..cc98123 100644
    for (int i = 0; i < 3; ++i)
      layer.planes[i] = imported.planes[i];
    bool result = Prepare(base, &layer, metadata, geometry, allowPacked);
-@@ -2020,6 +2139,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
+@@ -2020,6 +2150,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
    layer.lease = imported;
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -345,7 +356,7 @@ index 3f4b8dc..cc98123 100644
    if (imported->scaled)
    {
      layer.planes[0] = imported->scaled->plane;
-@@ -2128,7 +2253,19 @@ void CDVBridgeGLES::CountPresentation(bool committed)
+@@ -2128,7 +2264,19 @@ void CDVBridgeGLES::CountPresentation(bool committed)
  bool CDVBridgeGLES::Presented(bool success)
  {
    if (m_live) return Presented(success,m_submission);
@@ -366,7 +377,7 @@ index 3f4b8dc..cc98123 100644
    CountPresentation(committed);
    if (!committed && m_prepared) Failure("presentation");
    if (committed)
-@@ -2179,12 +2316,23 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+@@ -2179,12 +2327,23 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
        hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
        m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
        m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
@@ -459,10 +470,10 @@ index ade1f23..c891d5c 100644
  };
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
 new file mode 100644
-index 0000000..156214d
+index 0000000..993e6f3
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,648 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#include "DVYblodEngine.h"
 +
@@ -473,6 +484,7 @@ index 0000000..156214d
 +
 +#include <GLES3/gl3.h>
 +#include <GLES2/gl2ext.h>
++#include <algorithm>
 +#include <chrono>
 +#include <cmath>
 +#include <cstdlib>
@@ -483,6 +495,11 @@ index 0000000..156214d
 +#include <sys/ioctl.h>
 +#include <unistd.h>
 +
++extern "C"
++{
++#include "dvbridge_placebo.h"
++}
++
 +namespace
 +{
 +constexpr int CARRIER_WIDTH = 3840;
@@ -491,6 +508,21 @@ index 0000000..156214d
 +const char* Name(CDVYblodEngine::Backend backend)
 +{
 +  return backend == CDVYblodEngine::Backend::Vulkan ? "Vulkan" : "OpenCL";
++}
++
++// Kodi's GUI transfer tables (CGuiCompositeShaderGLES: GenerateDegammaLUT,
++// GeneratePQLUT with its 203-nit SDR peak).
++void KodiLUTs(float degamma[256], float pq[256])
++{
++  constexpr float m1 = 0.1593017578125f, m2 = 78.84375f, c1 = 0.8359375f, c2 = 18.8515625f,
++                  c3 = 18.6875f;
++  for (int i = 0; i < 256; i++)
++  {
++    const float v = static_cast<float>(i) / 255;
++    degamma[i] = v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
++    const float l = std::pow(static_cast<float>(i) / 255 * (203.0f / 10000.0f), m1);
++    pq[i] = std::pow((c1 + c2 * l) / (1.0f + c3 * l), m2);
++  }
 +}
 +} // namespace
 +
@@ -608,6 +640,10 @@ index 0000000..156214d
 +  m_lastGpuMs = reinterpret_cast<decltype(m_lastGpuMs)>(dlsym(m_library, "dvvk_last_gpu_ms"));
 +  LOAD(m_reset, dvvk_reset);
 +  LOAD(m_destroy, dvvk_destroy);
++  // Without them CB1 draws the pictures that have an overlay.
++  m_setOverlayEx = reinterpret_cast<decltype(m_setOverlayEx)>(dlsym(m_library, "dvvk_set_overlay_ex"));
++  m_setCB1Overlay = reinterpret_cast<decltype(m_setCB1Overlay)>(dlsym(m_library, "dvvk_set_cb1_overlay"));
++  KodiLUTs(m_cb1Overlay.degamma, m_cb1Overlay.pq);
 +  // The engine logs its reasons on stderr (the journal).
 +  if (m_create(drmFd, vaDisplay, &m_engine) != 0 || !m_engine)
 +  {
@@ -657,10 +693,135 @@ index 0000000..156214d
 +  return m_clAttach(m_renderer, m_slots[1].texture) == 0 && m_clScaler(m_renderer, 1) == 0;
 +}
 +
++bool CDVYblodEngine::SetOverlay(const Overlay* overlay, bool nv12, bool paired, const void* metadata,
++                                size_t size)
++{
++  if (!overlay)
++  {
++    if (m_overlaySet)
++      m_setCB1Overlay(m_engine, nullptr);
++    m_overlaySet = false;
++    return true;
++  }
++  if (!m_setCB1Overlay || !m_setOverlayEx)
++    return false;
++  // The layer, copied as it is (rows bottom first) into a buffer the engine
++  // imports, when its pixels change. The engine's reads leave implicit fences
++  // on it, so the next copy waits for them on the GPU.
++  const unsigned format = overlay->pq ? 1 : 0;
++  Gui& gui = m_gui[format];
++  if (!gui.bo)
++  {
++    auto create = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
++    auto target = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
++        eglGetProcAddress("glEGLImageTargetTexture2DOES"));
++    const uint32_t fourcc = overlay->pq ? DRM_FORMAT_ABGR16161616F : DRM_FORMAT_ABGR8888;
++    const uint64_t linear = DRM_FORMAT_MOD_LINEAR;
++    gui.bo = gbm_bo_create_with_modifiers2(m_device, CARRIER_WIDTH, CARRIER_HEIGHT, fourcc, &linear, 1,
++                                           GBM_BO_USE_RENDERING);
++    gui.fd = gui.bo ? gbm_bo_get_fd(gui.bo) : -1;
++    if (gui.fd < 0 || !create || !target)
++      return false;
++    const EGLint attrs[] = {EGL_WIDTH, CARRIER_WIDTH, EGL_HEIGHT, CARRIER_HEIGHT,
++        EGL_LINUX_DRM_FOURCC_EXT, static_cast<EGLint>(fourcc), EGL_DMA_BUF_PLANE0_FD_EXT, gui.fd,
++        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0, EGL_DMA_BUF_PLANE0_PITCH_EXT,
++        static_cast<EGLint>(gbm_bo_get_stride(gui.bo)), EGL_NONE};
++    gui.image = create(m_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
++    if (gui.image == EGL_NO_IMAGE_KHR)
++      return false;
++    GLint texture;
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++    glGenTextures(1, &gui.texture);
++    glBindTexture(GL_TEXTURE_2D, gui.texture);
++    target(GL_TEXTURE_2D, gui.image);
++    glBindTexture(GL_TEXTURE_2D, texture);
++    glGenFramebuffers(1, &gui.framebuffer);
++    m_guiContent = 0;
++  }
++  if (m_guiSet != format || overlay->texture != m_guiSource || overlay->content != m_guiContent ||
++      !overlay->content)
++  {
++    GLint read, draw;
++    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++    const bool scissor = glIsEnabled(GL_SCISSOR_TEST);
++    glDisable(GL_SCISSOR_TEST);
++    GLuint source;
++    glGenFramebuffers(1, &source);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, overlay->texture, 0);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gui.framebuffer);
++    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gui.texture, 0);
++    glBlitFramebuffer(0, 0, CARRIER_WIDTH, CARRIER_HEIGHT, 0, 0, CARRIER_WIDTH, CARRIER_HEIGHT,
++                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, read);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw);
++    glDeleteFramebuffers(1, &source);
++    if (scissor)
++      glEnable(GL_SCISSOR_TEST);
++    // Flushed, the copy's fence is on the buffer: the engine waits for it on the GPU.
++    glFlush();
++    if (glGetError() != GL_NO_ERROR)
++      return false;
++    m_guiSource = overlay->texture;
++    m_guiContent = overlay->content;
++  }
++  if (m_guiSet != format)
++  {
++    dvvk_dmabuf buffer{};
++    buffer.width = CARRIER_WIDTH;
++    buffer.height = CARRIER_HEIGHT;
++    buffer.format = overlay->pq ? DRM_FORMAT_ABGR16161616F : DRM_FORMAT_ABGR8888;
++    buffer.modifier = DRM_FORMAT_MOD_LINEAR;
++    buffer.num_planes = 1;
++    buffer.fd[0] = gui.fd;
++    buffer.fd[1] = buffer.fd[2] = buffer.fd[3] = -1;
++    buffer.stride[0] = gbm_bo_get_stride(gui.bo);
++    if (m_setOverlayEx(m_engine, &buffer, format + 1, DVVK_OVERLAY_FLIP_Y) != 0)
++      return false;
++    m_guiSet = format;
++  }
++  // CB1's coefficients for this picture (dvbridge_render.c render() and
++  // source_overlay_coefficients()): the inverse of the mapped source's decode,
++  // with the BL texture's bits, and of BT.2020 from the RPU's LMS.
++  dvbridge_color mapped{};
++  if (!dvbridge_map_color(&mapped, metadata, size, paired))
++    return false;
++  mapped.repr.bits.sample_depth = nv12 ? 8 : 16;
++  mapped.repr.bits.color_depth = nv12 ? 8 : 10;
++  mapped.repr.bits.bit_shift = nv12 ? 0 : 6;
++  pl_color_repr post = mapped.repr;
++  pl_color_repr_normalize(&post);
++  pl_transform3x3 tr = pl_color_repr_decode(&post, nullptr);
++  pl_matrix3x3 linear = {{{3.06441879f, -2.16597676f, .10155818f},
++                          {-.65612108f, 1.78554118f, -.12943749f},
++                          {.01736321f, -.04725154f, 1.03004253f}}};
++  pl_matrix3x3_mul(&linear, &mapped.dovi.linear);
++  pl_matrix3x3_invert(&tr.mat);
++  pl_matrix3x3_invert(&linear);
++  for (int i = 0; i < 3; i++)
++  {
++    m_cb1Overlay.offset[i] = tr.c[i];
++    for (int j = 0; j < 3; j++)
++    {
++      m_cb1Overlay.decode[j * 3 + i] = tr.mat.m[i][j];
++      m_cb1Overlay.linear[j * 3 + i] = linear.m[i][j];
++    }
++  }
++  std::copy(std::begin(overlay->rect), std::end(overlay->rect), std::begin(m_cb1Overlay.rect));
++  m_cb1Overlay.input_pq = overlay->pq;
++  m_overlaySet = m_setCB1Overlay(m_engine, &m_cb1Overlay) == 0;
++  return m_overlaySet;
++}
++
 +int CDVYblodEngine::RenderVulkan(unsigned slot, unsigned blSurface, unsigned elSurface, int width,
 +                                 int height, int x, int y, bool topLeft, bool nv12,
-+                                 const void* metadata, size_t size, double pts)
++                                 const void* metadata, size_t size, double pts,
++                                 const Overlay* overlay, bool overlayVisible)
 +{
++  // The overlay (or none) for this picture; one the engine can't take is CB1's.
++  if (!SetOverlay(overlay, nv12, elSurface != UINT32_MAX, metadata, size))
++    return -2;
 +  dvvk_frame frame{};
 +  frame.plan.width = static_cast<uint32_t>(width);
 +  frame.plan.height = static_cast<uint32_t>(height);
@@ -677,6 +838,9 @@ index 0000000..156214d
 +  frame.plan.white_nits = 203.0;
 +  // CB1's spatial contract: siting, 4:2:0 reshaping and the Annex B filters.
 +  frame.plan.cb1_contract = 1;
++  // CB1's metadata with an overlay shown: the full raster in L5, a refresh on either edge.
++  frame.plan.overlay = overlayVisible;
++  frame.plan.overlay_visible_before = m_visiblePresented;
 +  frame.bl_surface = blSurface;
 +  frame.el_surface = elSurface;
 +  frame.metadata = metadata;
@@ -765,9 +929,13 @@ index 0000000..156214d
 +bool CDVYblodEngine::Render(Backend backend, void* vaDisplay, unsigned blSurface,
 +                            unsigned elSurface, int width, int height, int x, int y, bool topLeft,
 +                            bool nv12, const void* metadata, size_t size, double pts,
-+                            unsigned framebuffer, int targetWidth, int targetHeight, bool flipY)
++                            unsigned framebuffer, int targetWidth, int targetHeight, bool flipY,
++                            const Overlay* overlay, bool overlayVisible)
 +{
 +  m_rendered = false;
++  m_visibleRendered = overlayVisible;
++  if (overlay && !TakesOverlay(backend))
++    return false;
 +  if (!vaDisplay || targetWidth != CARRIER_WIDTH || targetHeight != CARRIER_HEIGHT ||
 +      !Initialize(backend, vaDisplay))
 +    return false;
@@ -787,7 +955,8 @@ index 0000000..156214d
 +    m_refresh = pts < m_lastPts || pts - m_lastPts > 0.1;
 +  const auto started = std::chrono::steady_clock::now();
 +  const int result = backend == Backend::Vulkan ?
-+      RenderVulkan(slot, blSurface, elSurface, width, height, x, y, topLeft, nv12, metadata, size, pts) :
++      RenderVulkan(slot, blSurface, elSurface, width, height, x, y, topLeft, nv12, metadata, size, pts,
++                   overlay, overlayVisible) :
 +      RenderOpenCL(slot, blSurface, elSurface, width, height, x, y, topLeft, nv12, metadata, size, pts);
 +  if (result == 0)
 +  {
@@ -883,6 +1052,7 @@ index 0000000..156214d
 +  {
 +    m_packetId = (m_packetId + 1) & 15u;
 +    m_lastPts = m_renderedPts;
++    m_visiblePresented = m_visibleRendered;
 +    ++m_shown;
 +  }
 +  m_rendered = false;
@@ -897,6 +1067,7 @@ index 0000000..156214d
 +    m_clCancel(m_renderer);
 +  m_shown = 0;
 +  m_rendered = false;
++  m_visiblePresented = false;
 +  m_reports = 0;
 +}
 +
@@ -927,6 +1098,22 @@ index 0000000..156214d
 +      gbm_bo_destroy(slot.bo);
 +    slot = Slot{};
 +  }
++  for (Gui& gui : m_gui)
++  {
++    if (gui.framebuffer)
++      glDeleteFramebuffers(1, &gui.framebuffer);
++    if (gui.texture)
++      glDeleteTextures(1, &gui.texture);
++    if (gui.image != EGL_NO_IMAGE_KHR && m_destroyImage)
++      m_destroyImage(m_display, gui.image);
++    if (gui.fd >= 0)
++      close(gui.fd);
++    if (gui.bo)
++      gbm_bo_destroy(gui.bo);
++    gui = Gui{};
++  }
++  m_guiSet = 2;
++  m_overlaySet = false;
 +  if (m_device)
 +    gbm_device_destroy(m_device);
 +  m_device = nullptr;
@@ -937,10 +1124,10 @@ index 0000000..156214d
 +}
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
 new file mode 100644
-index 0000000..6f29b0c
+index 0000000..eabcdac
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,138 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#pragma once
 +#include <EGL/egl.h>
@@ -960,17 +1147,29 @@ index 0000000..6f29b0c
 + * Reference. They reconstruct and pack the unscaled picture from the decoded VA
 + * surfaces into a linear buffer of their own; the finished carrier is copied
 + * 1:1 into CB1's output framebuffer, so presentation, metadata admission and
-+ * the HDMI handshake stay CB1's. All methods require Kodi's GL context. */
++ * the HDMI handshake stay CB1's. The Vulkan engine also mixes in CB1's native
++ * overlay (menus, subtitles) as CB1 does; pixels it doesn't cover stay CB1's
++ * byte for byte. All methods require Kodi's GL context. */
 +class CDVYblodEngine
 +{
 +public:
 +  enum class Backend { Vulkan, OpenCL };
++  // CB1's native overlay as CDVBridgeGLES holds it (SetNativeOverlay).
++  struct Overlay
++  {
++    unsigned texture{0};   // Kodi's GUI (or PQ subtitle) framebuffer texture, rows bottom first
++    bool pq{false};        // RGBA16F BT.2020 PQ, not RGBA8 sRGB
++    float rect[4]{};       // CB1's overlay area
++    uint64_t content{0};   // changes with the layer's pixels
++  };
++  static bool TakesOverlay(Backend backend) { return backend == Backend::Vulkan; }
 +  ~CDVYblodEngine();
 +  /* true: the carrier is in `framebuffer`. false: this picture is not the
 +   * engine's (or it failed); nothing was written there. */
 +  bool Render(Backend backend, void* vaDisplay, unsigned blSurface, unsigned elSurface, int width,
 +              int height, int x, int y, bool topLeft, bool nv12, const void* metadata, size_t size,
-+              double pts, unsigned framebuffer, int targetWidth, int targetHeight, bool flipY);
++              double pts, unsigned framebuffer, int targetWidth, int targetHeight, bool flipY,
++              const Overlay* overlay, bool overlayVisible);
 +  /* The rendered picture was (not) presented: the metadata state follows it. */
 +  void Presented(bool success);
 +  void Reset();
@@ -992,7 +1191,9 @@ index 0000000..6f29b0c
 +  bool InitializeOpenCL(void* vaDisplay);
 +  bool InitializeSlots();
 +  int RenderVulkan(unsigned slot, unsigned blSurface, unsigned elSurface, int width, int height,
-+                   int x, int y, bool topLeft, bool nv12, const void* metadata, size_t size, double pts);
++                   int x, int y, bool topLeft, bool nv12, const void* metadata, size_t size, double pts,
++                   const Overlay* overlay, bool overlayVisible);
++  bool SetOverlay(const Overlay* overlay, bool nv12, bool paired, const void* metadata, size_t size);
 +  int RenderOpenCL(unsigned slot, unsigned blSurface, unsigned elSurface, int width, int height,
 +                   int x, int y, bool topLeft, bool nv12, const void* metadata, size_t size, double pts);
 +  void Close();
@@ -1007,6 +1208,20 @@ index 0000000..6f29b0c
 +  decltype(&dvvk_poll) m_poll{nullptr};
 +  decltype(&dvvk_implicit_failed) m_implicitFailed{nullptr};
 +  decltype(&dvvk_last_gpu_ms) m_lastGpuMs{nullptr};   // optional
++  decltype(&dvvk_set_overlay_ex) m_setOverlayEx{nullptr};
++  decltype(&dvvk_set_cb1_overlay) m_setCB1Overlay{nullptr};   // optional: else CB1 draws overlays
++  // The overlay's copy the engine reads (a linear dmabuf), per format.
++  struct Gui
++  {
++    gbm_bo* bo{nullptr};
++    EGLImageKHR image{EGL_NO_IMAGE_KHR};
++    unsigned texture{0}, framebuffer{0};
++    int fd{-1};
++  } m_gui[2];   // RGBA8, RGBA16F
++  unsigned m_guiSource{0}, m_guiSet{2};   // the texture copied; the copy given to the engine (2: none)
++  uint64_t m_guiContent{0};
++  dvvk_cb1_overlay m_cb1Overlay{};
++  bool m_overlaySet{false}, m_visibleRendered{false}, m_visiblePresented{false};
 +  double m_frameMs{-1.0};
 +  void AddFrameMs(double ms);
 +  // Submitted without waiting: the frame's fence is on the carrier (implicit

@@ -20,7 +20,9 @@
  *     --overlay         a GUI layer as Kodi gives CB1 its native overlay (a test
  *                       pattern, Kodi's transfer LUTs): off for frames 1-6, the
  *                       whole raster for 7-30, a subtitle area for 31-42, then
- *                       off again; Vulkan engine only
+ *                       off again; Vulkan engine only. Pixels the layer covers
+ *                       (in the area, it or its pair neighbour not transparent)
+ *                       are counted apart: only the others must be identical
  *
  * Timing is per picture on the CPU clock, synchronous (each engine finishes
  * before the next starts), from decoded surfaces (vaSyncSurface first), and
@@ -548,7 +550,8 @@ int main(int argc, char **argv)
      * a step back or a gap over 0.1 s; a repeated picture keeps its value. */
     double last_pts = 0;
     int shown = 0, refresh = 1, n = 0, compared = 0, identical = 0, mismatched = 0, refused_cb1 = 0, refused_vk = 0;
-    size_t luma_px = 0, chroma_px = 0, meta_px = 0, border_px = 0, total_px = 0;
+    size_t luma_px = 0, chroma_px = 0, meta_px = 0, border_px = 0, total_px = 0, osd_px = 0;
+    int osd_only = 0;   /* --overlay: pictures differing under the layer alone */
     unsigned luma_max = 0, chroma_max = 0;
     size_t luma_hist[5] = {0}, chroma_hist[5] = {0};   /* |d| = 1, 2, 3-4, 5-16, more */
     double cb1_ms = 0, vk_ms = 0;
@@ -724,10 +727,20 @@ int main(int argc, char **argv)
         } else {
             read_bo(&out, b);
             compared++;
-            size_t diff = 0, first = (size_t)-1;
+            size_t diff = 0, first = (size_t)-1, osd = 0;
             for (size_t i = 0; i < (size_t)W * H; i++) {
                 if (!memcmp(a + 4 * i, b + 4 * i, 3))
                     continue;
+                if (layer) {
+                    /* covered: in the area, the pixel or its pair neighbour drawn */
+                    unsigned ox = (unsigned)(i % W), oy = (unsigned)(i / W);
+                    const float *r = cb1_overlay.rect;
+                    if (ox >= r[0] && ox < r[2] && oy >= r[1] && oy < r[3] &&
+                        (gui[i * 4 + 3] || gui[(i ^ 1) * 4 + 3])) {
+                        osd++;
+                        continue;
+                    }
+                }
                 diff++;
                 if (first == (size_t)-1)
                     first = i;
@@ -756,6 +769,9 @@ int main(int argc, char **argv)
                 }
             }
             total_px += diff;
+            osd_px += osd;
+            if (!diff && osd)
+                osd_only++;
             if (!diff)
                 identical++;
             else {
@@ -791,6 +807,9 @@ int main(int argc, char **argv)
         printf("timing cb1 gpu: %s\n", stats(cb1_gpu, timed_cb1_gpu));
     if (timed_vk)
         printf("timing vk:  %s\n", stats(vk_t, timed_vk));
+    if (overlay)
+        printf("overlay: %d pictures differ under the layer only (%zu covered pixels); "
+               "pixels the layer doesn't cover: %zu differ\n", osd_only, osd_px, total_px);
     printf("{\"file\":\"%s\",\"profile\":%d,\"fel\":%d,\"ipt\":%d,\"cb1_contract\":%d,\"frames\":%d,\"compared\":%d,"
            "\"identical\":%d,\"mismatched\":%d,\"refused_cb1\":%d,\"refused_vk\":%d,"
            "\"differ_pixels\":%zu,\"metadata_row_pixels\":%zu,\"border_pixels\":%zu,"
