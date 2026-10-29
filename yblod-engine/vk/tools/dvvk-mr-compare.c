@@ -457,6 +457,13 @@ int main(int argc, char **argv)
                 struct dvbridge_geometry g = {.source_width = (int)w, .source_height = (int)h, .x = (int)x,
                                               .y = (int)y, .width = (int)w, .height = (int)h,
                                               .target_width = W, .target_height = H};
+                /* The options Kodi sets before each picture (CDVBridgeGLES::PrepareFrame
+                 * with default preferences): optimized DV on, processing optimizations
+                 * off, the EL "nearest" flag for an untransformed raw EL. */
+                dvbridge_renderer_set_optimized_dv(cb1, true);
+                dvbridge_renderer_set_processing_optimizations(cb1, false);
+                dvbridge_renderer_set_fel_nearest(cb1, el != NULL);
+                dvbridge_renderer_set_overlay_visible(cb1, false);
                 cs = (ipt ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference)(
                     cb1, &bl.frame, meta, meta_size, pts, el ? pts : NAN, g, target, flip, NULL);
                 pl_gpu_finish(gl->gpu);
