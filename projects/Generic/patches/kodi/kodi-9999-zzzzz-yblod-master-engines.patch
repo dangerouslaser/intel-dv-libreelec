@@ -48,19 +48,22 @@ index 2f57948..e80f447 100755
            <requirement>HAVE_DVBRIDGE</requirement><level>2</level><default>false</default>
            <dependencies><dependency type="visible" setting="dvbridge.outputmode" operator="is">4</dependency></dependencies>
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h
-index c124268..01ef685 100644
+index c124268..6c4e531 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h
-@@ -22,6 +22,8 @@ enum class HDR10SourceMode : int { Native = 0, ReferenceDV = 1, EnhancedDV = 2 }
+@@ -22,6 +22,11 @@ enum class HDR10SourceMode : int { Native = 0, ReferenceDV = 1, EnhancedDV = 2 }
  // Decoder ingress sees the last complete frame-boundary preference snapshot.
  inline std::atomic<OutputMode> playbackMode{OutputMode::Standard};
  inline std::atomic<HDR10SourceMode> hdr10PlaybackMode{HDR10SourceMode::Native};
 +// The engine that drew the last presented picture: 0 CB1, YBLOD's 1 Vulkan, 2 OpenCL.
 +inline std::atomic<int> presentedPipeline{0};
++// Its frame time (ms, smoothed over about a second): GPU time for CB1 and the
++// Vulkan engine, submit to finished for the OpenCL engine; < 0 unknown.
++inline std::atomic<double> presentedFrameMs{-1.0};
  
  #ifdef HAVE_DVBRIDGE
  inline int PolicyCode(const dvbridge_policy& policy)
-@@ -41,6 +43,7 @@ struct OutputPreferences
+@@ -41,6 +46,7 @@ struct OutputPreferences
    bool masterIPT{false}, allowMasterFallback{false};
    bool disableL2Trims{false};
    int felUpscaling{0};
@@ -68,7 +71,7 @@ index c124268..01ef685 100644
    bool processingOptimizations{false};
    uint64_t revision{1};
  
-@@ -56,7 +59,7 @@ struct OutputPreferences
+@@ -56,7 +62,7 @@ struct OutputPreferences
          panel == other.panel && gamut == other.gamut && optimizedDV == other.optimizedDV &&
          masterIPT == other.masterIPT && allowMasterFallback == other.allowMasterFallback &&
          disableL2Trims == other.disableL2Trims &&
@@ -77,7 +80,7 @@ index c124268..01ef685 100644
          processingOptimizations == other.processingOptimizations &&
          std::bit_cast<uint64_t>(peak) == std::bit_cast<uint64_t>(other.peak);
    }
-@@ -143,6 +146,8 @@ inline OutputPreferences FrameOutputSettings()
+@@ -143,6 +149,8 @@ inline OutputPreferences FrameOutputSettings()
      next.gamut = settings->GetInt("dvbridge.tvgamut");
      next.felUpscaling = settings->GetInt("dvbridge.felupscaling");
      next.masterIPT = settings->GetInt("dvbridge.masteroutput")==1;
@@ -102,7 +105,7 @@ index ba0fb42..43984a6 100644
      list(APPEND SOURCES HDR10AISource.cpp)
      list(APPEND HEADERS HDR10AISource.h)
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
-index 3f4b8dc..e02f15c 100644
+index 3f4b8dc..dfcc69d 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 @@ -1,5 +1,6 @@
@@ -120,7 +123,7 @@ index 3f4b8dc..e02f15c 100644
  #include "dvbridge_placebo.h"
  #include "dvbridge_cache.h"
  }
-@@ -24,6 +26,8 @@ extern "C"
+@@ -24,9 +26,12 @@ extern "C"
  #include <EGL/egl.h>
  #include <algorithm>
  #include <chrono>
@@ -129,7 +132,11 @@ index 3f4b8dc..e02f15c 100644
  #include <deque>
  #include <filesystem>
  #include <GLES3/gl3.h>
-@@ -1037,8 +1041,11 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::TakeFELPrefetch(const std::shared_ptr<
++#include <GLES2/gl2ext.h>
+ #include <limits>
+ #include <mutex>
+ #include <string_view>
+@@ -1037,8 +1042,11 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::TakeFELPrefetch(const std::shared_ptr<
    return FrameStatus::Ready;
  }
  
@@ -141,12 +148,58 @@ index 3f4b8dc..e02f15c 100644
    cb1_hdr10plus_analysis_destroy(&m_hdr10plusAnalysis);
    ClearFELPrefetch();
    Summary("closed");
-@@ -1206,6 +1213,45 @@ void CDVBridgeGLES::Reset()
+@@ -1206,6 +1214,91 @@ void CDVBridgeGLES::Reset()
  #endif
    m_pendingHDR10Fallback = 0;
    dvbridge_renderer_reset(m_renderer);
 +  if (m_yblod) m_yblod->Reset();
 +  m_yblodFrame = false;
++}
++
++void CDVBridgeGLES::BeginCB1Timer()
++{
++  m_cb1Timing = false;
++  static const auto gen = reinterpret_cast<PFNGLGENQUERIESEXTPROC>(eglGetProcAddress("glGenQueriesEXT"));
++  static const auto begin = reinterpret_cast<PFNGLBEGINQUERYEXTPROC>(eglGetProcAddress("glBeginQueryEXT"));
++  static const auto available = reinterpret_cast<PFNGLGETQUERYOBJECTUIVEXTPROC>(eglGetProcAddress("glGetQueryObjectuivEXT"));
++  static const auto result = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VEXTPROC>(eglGetProcAddress("glGetQueryObjectui64vEXT"));
++  if (!m_cb1QueryUsable || !gen || !begin || !available || !result)
++  {
++    m_cb1QueryUsable = false;
++    return;
++  }
++  if (!m_cb1Queries[0])
++    gen(4, m_cb1Queries);
++  // Finished queries into the smoothed time, never waiting for one.
++  for (unsigned i = 0; i < 4; ++i)
++  {
++    GLuint ready = 0;
++    if (!m_cb1QueryPending[i])
++      continue;
++    available(m_cb1Queries[i], GL_QUERY_RESULT_AVAILABLE_EXT, &ready);
++    if (!ready)
++      continue;
++    GLuint64 ns = 0;
++    result(m_cb1Queries[i], GL_QUERY_RESULT_EXT, &ns);
++    m_cb1QueryPending[i] = false;
++    const double ms = ns / 1e6;
++    m_cb1FrameMs = m_cb1FrameMs < 0 ? ms : m_cb1FrameMs + (ms - m_cb1FrameMs) / 32.0;
++  }
++  const unsigned slot = m_cb1QueryHead % 4;
++  if (m_cb1QueryPending[slot])
++    return;   // still running: skip timing this picture
++  begin(GL_TIME_ELAPSED_EXT, m_cb1Queries[slot]);
++  m_cb1Timing = true;
++}
++
++void CDVBridgeGLES::EndCB1Timer()
++{
++  static const auto end = reinterpret_cast<PFNGLENDQUERYEXTPROC>(eglGetProcAddress("glEndQueryEXT"));
++  if (!m_cb1Timing || !end)
++    return;
++  end(GL_TIME_ELAPSED_EXT);
++  m_cb1QueryPending[m_cb1QueryHead++ % 4] = true;
++  m_cb1Timing = false;
 +}
 +
 +bool CDVBridgeGLES::PrepareYblod(const Layer& base, const Layer* enhancement,
@@ -187,7 +240,7 @@ index 3f4b8dc..e02f15c 100644
  }
  
  bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
-@@ -1255,7 +1301,10 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+@@ -1255,11 +1348,16 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
    if (!m_hdr10 && allowPacked && (m_directUsable || m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE) &&
        m_scanout)
    {
@@ -198,8 +251,14 @@ index 3f4b8dc..e02f15c 100644
 +    else if(m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE)
      {
        auto renderMaster=m_requested.masterIPT ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference;
++      BeginCB1Timer();
        const auto status=renderMaster(m_renderer,&bl.frame,metadata.Data(),metadata.Size(),
-@@ -1825,6 +1874,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+           base.pts,elPts,geometry,m_scanout,true,m_nativeOverlayEnabled ? &m_nativeOverlay : nullptr);
++      EndCB1Timer();
+       m_direct=status==CB1_MASTER_READY;
+       if(!m_direct) Failure(status==CB1_MASTER_INVALID ? "master-reference-invalid-metadata" :
+           status==CB1_MASTER_UNSUPPORTED ? "master-reference-unsupported-contract" :
+@@ -1825,6 +1923,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
    layer.pts = static_cast<double>(enhancement->pts);
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -212,7 +271,7 @@ index 3f4b8dc..e02f15c 100644
    for (int i = 0; i < 3; ++i)
      layer.planes[i] = imported.planes[i];
    bool result = Prepare(base, &layer, metadata, geometry, allowPacked);
-@@ -2020,6 +2075,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
+@@ -2020,6 +2124,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
    layer.lease = imported;
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -225,7 +284,7 @@ index 3f4b8dc..e02f15c 100644
    if (imported->scaled)
    {
      layer.planes[0] = imported->scaled->plane;
-@@ -2128,7 +2189,13 @@ void CDVBridgeGLES::CountPresentation(bool committed)
+@@ -2128,7 +2238,17 @@ void CDVBridgeGLES::CountPresentation(bool committed)
  bool CDVBridgeGLES::Presented(bool success)
  {
    if (m_live) return Presented(success,m_submission);
@@ -236,11 +295,15 @@ index 3f4b8dc..e02f15c 100644
 +  m_yblodFrame = false;
 +  const bool committed = success && m_prepared && m_packed && (yblod || dvbridge_render_commit(m_renderer));
 +  if (committed)
++  {
 +    DVBRIDGE::presentedPipeline.store(yblod ? (m_requested.masterEngine == 2 ? 2 : 1) : 0);
++    DVBRIDGE::presentedFrameMs.store(yblod && m_yblod ? m_yblod->FrameMs() :
++        m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE ? m_cb1FrameMs : -1.0);
++  }
    CountPresentation(committed);
    if (!committed && m_prepared) Failure("presentation");
    if (committed)
-@@ -2179,12 +2246,17 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+@@ -2179,12 +2299,21 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
        hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
        m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
        m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
@@ -256,12 +319,16 @@ index 3f4b8dc..e02f15c 100644
 -          dvbridge_render_commit(m_renderer));
 +          dvbridge_render_commit(m_renderer)));
 +  if (committed)
++  {
 +    DVBRIDGE::presentedPipeline.store(yblod ? (m_requested.masterEngine == 2 ? 2 : 1) : 0);
++    DVBRIDGE::presentedFrameMs.store(yblod && m_yblod ? m_yblod->FrameMs() :
++        m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE ? m_cb1FrameMs : -1.0);
++  }
    CountPresentation(committed);
    if (!committed)
    {
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
-index ade1f23..c87e680 100644
+index ade1f23..93458ca 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
 @@ -6,6 +6,7 @@
@@ -299,7 +366,7 @@ index ade1f23..c87e680 100644
    ~CDVBridgeGLES();
    CDVBridgeGLES(const CDVBridgeGLES&) = delete;
    CDVBridgeGLES& operator=(const CDVBridgeGLES&) = delete;
-@@ -303,4 +308,9 @@ private:
+@@ -303,4 +308,18 @@ private:
    bool m_packed = false;
    unsigned m_pendingInfo = 0;
    unsigned int m_framebuffer = 0;
@@ -308,13 +375,22 @@ index ade1f23..c87e680 100644
 +                    const dvbridge_geometry& geometry);
 +  std::unique_ptr<CDVYblodEngine> m_yblod;
 +  bool m_yblodFrame{};
++  // CB1's Master Reference GPU time (EXT_disjoint_timer_query), for the
++  // player information's frame time; read back a few frames later.
++  void BeginCB1Timer();
++  void EndCB1Timer();
++  unsigned m_cb1Queries[4]{};
++  bool m_cb1QueryPending[4]{};
++  unsigned m_cb1QueryHead{0};
++  bool m_cb1QueryUsable{true}, m_cb1Timing{false};
++  double m_cb1FrameMs{-1.0};
  };
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
 new file mode 100644
-index 0000000..04573f5
+index 0000000..d4cdff4
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,425 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#include "DVYblodEngine.h"
 +
@@ -325,6 +401,7 @@ index 0000000..04573f5
 +
 +#include <GLES3/gl3.h>
 +#include <GLES2/gl2ext.h>
++#include <chrono>
 +#include <cmath>
 +#include <cstdlib>
 +#include <dlfcn.h>
@@ -440,6 +517,7 @@ index 0000000..04573f5
 +  LOAD(m_submit, dvvk_submit);
 +  LOAD(m_poll, dvvk_poll);
 +  LOAD(m_implicitFailed, dvvk_implicit_failed);
++  m_lastGpuMs = reinterpret_cast<decltype(m_lastGpuMs)>(dlsym(m_library, "dvvk_last_gpu_ms"));
 +  LOAD(m_reset, dvvk_reset);
 +  LOAD(m_destroy, dvvk_destroy);
 +  // The engine logs its reasons on stderr (the journal).
@@ -619,9 +697,17 @@ index 0000000..04573f5
 +    m_refresh = true;
 +  else if (pts != m_lastPts)
 +    m_refresh = pts < m_lastPts || pts - m_lastPts > 0.1;
++  const auto started = std::chrono::steady_clock::now();
 +  const int result = backend == Backend::Vulkan ?
 +      RenderVulkan(slot, blSurface, elSurface, width, height, x, y, topLeft, nv12, metadata, size, pts) :
 +      RenderOpenCL(slot, blSurface, elSurface, width, height, x, y, topLeft, nv12, metadata, size, pts);
++  if (result == 0)
++  {
++    if (backend == Backend::OpenCL)
++      AddFrameMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
++    else if (m_lastGpuMs)
++      AddFrameMs(m_lastGpuMs(m_engine));   // a frame or two back: timestamps are read on reuse
++  }
 +  if (result != 0)
 +  {
 +    if (m_reports < 16)
@@ -662,6 +748,14 @@ index 0000000..04573f5
 +  m_renderedPts = pts;
 +  m_rendered = true;
 +  return true;
++}
++
++void CDVYblodEngine::AddFrameMs(double ms)
++{
++  if (ms < 0)
++    return;
++  // About a second of frames.
++  m_frameMs = m_frameMs < 0 ? ms : m_frameMs + (ms - m_frameMs) / 32.0;
 +}
 +
 +void CDVYblodEngine::Presented(bool success)
@@ -724,10 +818,10 @@ index 0000000..04573f5
 +}
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
 new file mode 100644
-index 0000000..209ca97
+index 0000000..aa984bf
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,100 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#pragma once
 +#include <EGL/egl.h>
@@ -761,6 +855,9 @@ index 0000000..209ca97
 +  /* The rendered picture was (not) presented: the metadata state follows it. */
 +  void Presented(bool success);
 +  void Reset();
++  /* Frame time, ms, smoothed (< 0 unknown): the Vulkan engine's GPU time, the
++   * OpenCL engine's submit to finished. */
++  double FrameMs() const { return m_frameMs; }
 +
 +private:
 +  bool Initialize(Backend backend, void* vaDisplay);
@@ -782,6 +879,9 @@ index 0000000..209ca97
 +  decltype(&dvvk_submit) m_submit{nullptr};
 +  decltype(&dvvk_poll) m_poll{nullptr};
 +  decltype(&dvvk_implicit_failed) m_implicitFailed{nullptr};
++  decltype(&dvvk_last_gpu_ms) m_lastGpuMs{nullptr};   // optional
++  double m_frameMs{-1.0};
++  void AddFrameMs(double ms);
 +  // Submitted without waiting: the frame's fence is on the carrier (implicit
 +  // sync), so the GL copy waits on the GPU. Tickets still to report errors.
 +  uint64_t m_tickets[4]{};
@@ -839,16 +939,19 @@ index da284ac..4e03846 100644
    {
      layer.fullRange = source.color_range != 0;
 diff --git a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp b/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
-index cb8ac6f..99c7050 100644
+index cb8ac6f..b9b7d15 100644
 --- a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
 +++ b/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
-@@ -143,6 +143,9 @@ void CGUIDialogPlayerProcessInfo::RefreshInfo()
+@@ -143,6 +143,12 @@ void CGUIDialogPlayerProcessInfo::RefreshInfo()
          (data.output.felUpscaling == 2 ? "Reference GPU" : data.output.felUpscaling == 0 ? "VAAPI" : data.output.felUpscaling == 1 ? "Nearest neighbour (GPU)" : "") : "");
      SetProperty("DV.Mode", active ? VideoProcessingInfoGUI::Mode(data) : "Kodi default");
      SetProperty("DV.Engine", data.output.engine);
 +    static const char* const pipelines[]{"CB1 (OpenGL ES)", "YBLOD (Vulkan)", "YBLOD (OpenCL)"};
 +    const int pipeline = std::clamp(DVBRIDGE::presentedPipeline.load(), 0, 2);
 +    SetProperty("DV.Pipeline", data.output.engine.empty() ? "" : pipelines[pipeline]);
++    const double frameMs = DVBRIDGE::presentedFrameMs.load();
++    SetProperty("DV.FrameTime", data.output.engine.empty() || frameMs < 0 ? "" :
++        StringUtils::Format("{:.2f} ms{}", frameMs, pipeline == 2 ? " (submit to finished)" : " GPU"));
      SetProperty("DV.Circuit", data.output.circuit);
      SetProperty("DV.Reconstruction", "");
      SetProperty("DV.AIL1", "");

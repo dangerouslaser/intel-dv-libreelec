@@ -262,6 +262,8 @@ pub struct Engine {
     pub implicit_failed: bool,
     trace: Option<(u32, u32, u32, [u32; 2], u32, u32, u32, u32)>,
     profile: Option<Profile>,
+    /// GPU time of the last frame read back (reconstruction to pack), ms; < 0 unknown.
+    pub last_gpu_ms: f64,
     verify: Option<Verify>,
     // The query pool record_fel stamps into (this frame's, not the reference's).
     fel_query: std::cell::Cell<Option<vk::QueryPool>>,
@@ -377,7 +379,9 @@ impl Engine {
         let sampler = gpu::nearest_sampler(&d)?;
         let push = PushDescriptor::new(&d);
         let shot = OneShot::new(&d)?;
-        let profile = std::env::var("DVVK_PROFILE").map(|v| v == "1").unwrap_or(false) && d.timestamp_period > 0.0;
+        // Timestamps are always taken (dvvk_last_gpu_ms); DVVK_PROFILE=1 also logs windows of them.
+        let timing = d.timestamp_period > 0.0;
+        let profile = std::env::var("DVVK_PROFILE").map(|v| v == "1").unwrap_or(false) && timing;
         let verify_every: u64 = std::env::var("DVVK_VERIFY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let verify = if verify_every > 0 {
             Some(Verify {
@@ -417,7 +421,7 @@ impl Engine {
                 decode: [sem(&d)?, sem(&d)?, sem(&d)?],
                 done: sem(&d)?,
                 ticket: 0,
-                query: if profile {
+                query: if timing {
                     let info = vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(PROFILE_FEL_POINTS);
                     Some(unsafe { d.device.create_query_pool(&info, None) }?)
                 } else {
@@ -490,6 +494,7 @@ impl Engine {
             implicit_failed: false,
             trace: None,
             profile: profile.then(Profile::default),
+            last_gpu_ms: -1.0,
             verify,
             fel_query: std::cell::Cell::new(None),
             reference_pass: std::cell::Cell::new(false),
@@ -740,7 +745,7 @@ impl Engine {
 
     /// The finished frame of context `ci`: its timestamps into the profile.
     fn collect_profile(&mut self, ci: usize) {
-        let (Some(profile), Some(q)) = (self.profile.as_mut(), self.ring[ci].query) else { return };
+        let Some(q) = self.ring[ci].query else { return };
         let c = &self.ring[ci];
         let mut ts = [0u64; PROFILE_FEL_POINTS as usize];
         let n = if c.fel_stamped { PROFILE_FEL_POINTS } else { PROFILE_POINTS } as usize;
@@ -751,7 +756,11 @@ impl Engine {
         let period = self.d.timestamp_period as f64 / 1e6;
         let ms = |a: usize, b: usize| ts[b].wrapping_sub(ts[a]) as f64 * period;
         let fel = c.fel_stamped.then(|| [ms(0, 4), ms(4, 5), ms(5, 6), ms(6, 1)]);
-        profile.add([ms(0, 1), ms(1, 2), ms(2, 3), c.plan_ms], c.prepared, fel);
+        let (stages, prepared, plan) = ([ms(0, 1), ms(1, 2), ms(2, 3)], c.prepared, c.plan_ms);
+        self.last_gpu_ms = stages[0] + stages[1] + stages[2];
+        if let Some(profile) = self.profile.as_mut() {
+            profile.add([stages[0], stages[1], stages[2], plan], prepared, fel);
+        }
     }
 
     /// Plans and submits one frame into output `f.output`; returns at once.

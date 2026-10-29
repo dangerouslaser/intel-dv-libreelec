@@ -247,6 +247,15 @@ pub unsafe extern "C" fn dvvk_set_overlay_rgba(e: *mut Engine, rgba: *const u8, 
     (*e).set_overlay_rgba(std::slice::from_raw_parts(rgba, stride * 2160), stride);
 }
 
+/// GPU time of the most recent frame whose timestamps were read back (ms), or
+/// a negative value when not known (no timestamp support, no frame yet).
+/// # Safety
+/// `e` from dvvk_create.
+#[no_mangle]
+pub unsafe extern "C" fn dvvk_last_gpu_ms(e: *mut Engine) -> f64 {
+    (*e).last_gpu_ms
+}
+
 /// # Safety
 /// `e` from dvvk_create.
 #[no_mangle]

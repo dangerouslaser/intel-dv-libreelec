@@ -79,6 +79,8 @@ int dvvk_wait(dvvk_engine *, uint64_t ticket, uint64_t timeout_ns);
  * release points. The caller owns the fds. */
 int dvvk_timelines(dvvk_engine *, int *acquire_syncobj_fd, int *release_syncobj_fd);
 void dvvk_decode_waits(dvvk_engine *, uint64_t *fence, uint64_t *vasync);
+/* GPU time of the most recent frame read back (ms); < 0 unknown. */
+double dvvk_last_gpu_ms(dvvk_engine *);
 void dvvk_reset(dvvk_engine *);
 void dvvk_destroy(dvvk_engine *);
 #ifdef __cplusplus
