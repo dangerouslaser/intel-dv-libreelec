@@ -88,7 +88,7 @@ index ba0fb42..5a175d4 100644
      list(APPEND SOURCES HDR10AISource.cpp)
      list(APPEND HEADERS HDR10AISource.h)
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
-index 3f4b8dc..dfa93a2 100644
+index 3f4b8dc..36d76c1 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 @@ -1,5 +1,6 @@
@@ -152,7 +152,7 @@ index 3f4b8dc..dfa93a2 100644
 +  const bool topLeft = SourceChroma(base.chromaLocation, base.sourceInfo.profile) == PL_CHROMA_TOP_LEFT;
 +  m_yblodFrame = m_yblod->Render(base.vaDisplay, base.vaSurface,
 +      enhancement ? enhancement->vaSurface : 0xffffffffu, base.width, base.height, geometry.x, geometry.y,
-+      topLeft, metadata.Data(), metadata.Size(), static_cast<int64_t>(base.pts * 1e6),
++      topLeft, metadata.Data(), metadata.Size(), base.pts,
 +      m_scanoutFramebuffer, geometry.target_width, geometry.target_height, true);
 +  return m_yblodFrame;
  }
@@ -265,10 +265,10 @@ index ade1f23..e84ac9f 100644
  };
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp
 new file mode 100644
-index 0000000..a89edba
+index 0000000..6ce6e58
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,240 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#include "DVYblodVulkan.h"
 +
@@ -278,6 +278,7 @@ index 0000000..a89edba
 +#include "windowing/gbm/drm/DRMUtils.h"
 +
 +#include <GLES3/gl3.h>
++#include <cmath>
 +#include <GLES2/gl2ext.h>
 +#include <dlfcn.h>
 +#include <drm_fourcc.h>
@@ -385,7 +386,7 @@ index 0000000..a89edba
 +
 +bool CDVYblodVulkan::Render(void* vaDisplay, unsigned blSurface, unsigned elSurface, int width,
 +                            int height, int x, int y, bool topLeft, const void* metadata,
-+                            size_t size, int64_t pts, unsigned framebuffer, int targetWidth,
++                            size_t size, double pts, unsigned framebuffer, int targetWidth,
 +                            int targetHeight, bool flipY)
 +{
 +  m_rendered = false;
@@ -393,6 +394,12 @@ index 0000000..a89edba
 +      !Initialize(vaDisplay))
 +    return false;
 +  const unsigned slot = m_slot ^ 1u;
++  // As CB1: the first picture, a step back or a gap over 0.1 s refreshes the
++  // display; a repeated picture keeps its value; otherwise the RPU's own flag.
++  if (!m_shown)
++    m_refresh = true;
++  else if (pts != m_lastPts)
++    m_refresh = pts < m_lastPts || pts - m_lastPts > 0.1;
 +  dvvk_frame frame{};
 +  frame.plan.width = static_cast<uint32_t>(width);
 +  frame.plan.height = static_cast<uint32_t>(height);
@@ -405,7 +412,7 @@ index 0000000..a89edba
 +  frame.plan.fel = 1;
 +  frame.plan.packet_id = m_packetId;
 +  frame.plan.refresh = m_refresh;
-+  frame.plan.pts = pts;
++  frame.plan.pts = static_cast<int64_t>(std::llround(pts * 1e6));
 +  frame.plan.white_nits = 203.0;
 +  // CB1's spatial contract: siting, 4:2:0 reshaping and the Annex B filters.
 +  frame.plan.cb1_contract = 1;
@@ -453,6 +460,7 @@ index 0000000..a89edba
 +  if (glGetError() != GL_NO_ERROR)
 +    return false;
 +  m_slot = slot;
++  m_renderedPts = pts;
 +  m_rendered = true;
 +  return true;
 +}
@@ -462,7 +470,8 @@ index 0000000..a89edba
 +  if (m_rendered && success)
 +  {
 +    m_packetId = (m_packetId + 1) & 15u;
-+    m_refresh = false;
++    m_lastPts = m_renderedPts;
++    ++m_shown;
 +  }
 +  m_rendered = false;
 +}
@@ -471,7 +480,7 @@ index 0000000..a89edba
 +{
 +  if (m_engine)
 +    m_reset(m_engine);
-+  m_refresh = true;
++  m_shown = 0;
 +  m_rendered = false;
 +  m_reports = 0;
 +}
@@ -502,10 +511,10 @@ index 0000000..a89edba
 +}
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.h
 new file mode 100644
-index 0000000..fbe33e0
+index 0000000..db446f3
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,56 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#pragma once
 +#include <EGL/egl.h>
@@ -530,7 +539,7 @@ index 0000000..fbe33e0
 +  /* true: the carrier is in `framebuffer` (GPU complete). false: this picture
 +   * is not the engine's (or it failed); nothing was written there. */
 +  bool Render(void* vaDisplay, unsigned blSurface, unsigned elSurface, int width, int height,
-+              int x, int y, bool topLeft, const void* metadata, size_t size, int64_t pts,
++              int x, int y, bool topLeft, const void* metadata, size_t size, double pts,
 +              unsigned framebuffer, int targetWidth, int targetHeight, bool flipY);
 +  /* The rendered picture was (not) presented: the metadata packet state follows it. */
 +  void Presented(bool success);
@@ -557,6 +566,9 @@ index 0000000..fbe33e0
 +    unsigned texture{0}, framebuffer{0};
 +  } m_slots[2];
 +  unsigned m_slot{0}, m_packetId{0}, m_reports{0};
++  // CB1's metadata refresh (dvbridge_dv_metadata_output), over presented pictures.
++  uint64_t m_shown{0};
++  double m_lastPts{0}, m_renderedPts{0};
 +  bool m_refresh{true}, m_rendered{false}, m_failed{false};
 +};
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp

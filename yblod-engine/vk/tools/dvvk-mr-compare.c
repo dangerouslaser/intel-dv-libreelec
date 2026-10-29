@@ -251,7 +251,10 @@ int main(int argc, char **argv)
 
     uint8_t *a = malloc((size_t)W * H * 4), *b = malloc((size_t)W * H * 4);
     unsigned packet_id = 0;
-    int refresh = 1, n = 0, compared = 0, identical = 0, mismatched = 0, refused_cb1 = 0, refused_vk = 0;
+    /* CB1's dvbridge_dv_metadata_output: refresh on the first picture, after
+     * a step back or a gap over 0.1 s; a repeated picture keeps its value. */
+    double last_pts = 0;
+    int shown = 0, refresh = 1, n = 0, compared = 0, identical = 0, mismatched = 0, refused_cb1 = 0, refused_vk = 0;
     size_t luma_px = 0, chroma_px = 0, meta_px = 0, border_px = 0, total_px = 0;
     unsigned luma_max = 0, chroma_max = 0;
     size_t luma_hist[5] = {0}, chroma_hist[5] = {0};   /* |d| = 1, 2, 3-4, 5-16, more */
@@ -273,7 +276,8 @@ int main(int argc, char **argv)
         unsigned x = ((W - w) / 2) & ~1u, y = ((H - h) / 2) & ~1u;
         const void *meta = p.dovi->data;
         size_t meta_size = p.dovi->size;
-        double pts = (double)p.bl->pts;
+        /* seconds, as Kodi gives CB1 (its 0.1 s discontinuity test) */
+        double pts = p.bl->pts * av_q2d(dec.time_base);
 
         /* CB1 Master Reference, as CDVBridgeGLES::Prepare */
         struct dvbridge_dmabuf bl_import = {0}, el_import = {0};
@@ -323,6 +327,11 @@ int main(int argc, char **argv)
                                  .cb1_contract = (uint32_t)contract},
                         .bl_surface = p.bl_surface, .el_surface = el ? p.el_surface : 0xffffffffu,
                         .metadata = meta, .metadata_size = meta_size, .output = 0};
+        if (shown && pts != last_pts)
+            refresh = pts < last_pts || pts - last_pts > 0.1;
+        else if (!shown)
+            refresh = 1;
+        f.plan.refresh = (uint32_t)refresh;
         uint32_t flags = 0;
         t0 = now_ms();
         int rv = vk.render_sync(vke, &f, &flags);
@@ -391,7 +400,8 @@ int main(int argc, char **argv)
             dvbridge_renderer_reset(cb1);
         if (!rv) {
             packet_id = (packet_id + 1) & 15;
-            refresh = 0;
+            last_pts = pts;
+            shown++;
         }
         dv_pair_free(&p);
     }
