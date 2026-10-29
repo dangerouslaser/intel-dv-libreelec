@@ -289,7 +289,8 @@ int main(int argc, char **argv)
                         dvbridge_gl_frame_import(&elf, gl->gpu, el_import.layout, el->width, el->height,
                                                  el_import.planes);
                 if (el_ok) {
-                    dvbridge_gl_frame_set_chroma(&elf, cb1_chroma(el->chroma_location, 0));
+                    /* CDVBridgeGLES::PrepareHardwareFrame: an unspecified EL is top-left */
+                    dvbridge_gl_frame_set_chroma(&elf, cb1_chroma(el->chroma_location, 7));
                     bl.frame.enhancement_layer = &elf.frame;
                 }
             }

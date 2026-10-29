@@ -1,0 +1,564 @@
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 8db6587..c8ce8f4 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -25870,6 +25870,23 @@ msgctxt "#40926"
+ msgid "Standard and Master Reference only. L8 trims remain active."
+ msgstr ""
+ 
++#. Master Reference engine
++msgctxt "#40960"
++msgid "Master Reference engine"
++msgstr ""
++
++msgctxt "#40961"
++msgid "Which engine renders Master Reference. YBLOD runs the same integer reconstruction on Vulkan compute and writes the HDMI picture directly. Pictures it does not take, and pictures with menus or subtitles shown, use CB1."
++msgstr ""
++
++msgctxt "#40962"
++msgid "CB1 (OpenGL ES)"
++msgstr ""
++
++msgctxt "#40963"
++msgid "YBLOD (Vulkan)"
++msgstr ""
++
+ msgctxt "#40822"
+ msgid "HDR10 Reference Basic"
+ msgstr ""
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+index 2f57948..27bdeb8 100755
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -96,6 +96,12 @@
+           <constraints><options><option label="40918">0</option><option label="40919">1</option></options></constraints>
+           <control type="list" format="string" />
+         </setting>
++        <setting id="dvbridge.masterengine" type="integer" label="40960" help="40961">
++          <requirement>HAVE_DVBRIDGE</requirement><level>2</level><default>0</default>
++          <dependencies><dependency type="visible" setting="dvbridge.outputmode" operator="is">4</dependency></dependencies>
++          <constraints><options><option label="40962">0</option><option label="40963">1</option></options></constraints>
++          <control type="list" format="string" />
++        </setting>
+         <setting id="dvbridge.masterfallback" type="boolean" label="40920" help="40921">
+           <requirement>HAVE_DVBRIDGE</requirement><level>2</level><default>false</default>
+           <dependencies><dependency type="visible" setting="dvbridge.outputmode" operator="is">4</dependency></dependencies>
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h
+index c124268..9b7231f 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h
+@@ -41,6 +41,7 @@ struct OutputPreferences
+   bool masterIPT{false}, allowMasterFallback{false};
+   bool disableL2Trims{false};
+   int felUpscaling{0};
++  int masterEngine{0}; // 0 CB1, 1 YBLOD's Vulkan engine
+   bool processingOptimizations{false};
+   uint64_t revision{1};
+ 
+@@ -56,7 +57,7 @@ struct OutputPreferences
+         panel == other.panel && gamut == other.gamut && optimizedDV == other.optimizedDV &&
+         masterIPT == other.masterIPT && allowMasterFallback == other.allowMasterFallback &&
+         disableL2Trims == other.disableL2Trims &&
+-        felUpscaling == other.felUpscaling &&
++        felUpscaling == other.felUpscaling && masterEngine == other.masterEngine &&
+         processingOptimizations == other.processingOptimizations &&
+         std::bit_cast<uint64_t>(peak) == std::bit_cast<uint64_t>(other.peak);
+   }
+@@ -143,6 +144,7 @@ inline OutputPreferences FrameOutputSettings()
+     next.gamut = settings->GetInt("dvbridge.tvgamut");
+     next.felUpscaling = settings->GetInt("dvbridge.felupscaling");
+     next.masterIPT = settings->GetInt("dvbridge.masteroutput")==1;
++    next.masterEngine = settings->GetInt("dvbridge.masterengine")==1 ? 1 : 0;
+     next.allowMasterFallback = settings->GetBool("dvbridge.masterfallback");
+     next.disableL2Trims = settings->GetBool("dvbridge.disablel2");
+   }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+index ba0fb42..5a175d4 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+@@ -59,8 +59,8 @@ if(ENABLE_DVBRIDGE)
+   file(READ "${DVBRIDGE_SOURCE_DIR}/pack_gles300.vert" DVBRIDGE_VERTEX_SOURCE)
+   file(READ "${DVBRIDGE_SOURCE_DIR}/pack_gles300.frag" DVBRIDGE_FRAGMENT_SOURCE)
+   configure_file(DVBridgeShaders.h.in DVBridgeShaders.h @ONLY)
+-  list(APPEND SOURCES DVBridgeGLES.cpp)
+-  list(APPEND HEADERS DVBridgeGLES.h)
++  list(APPEND SOURCES DVBridgeGLES.cpp DVYblodVulkan.cpp)
++  list(APPEND HEADERS DVBridgeGLES.h DVYblodVulkan.h)
+   if(CB1_ENABLE_HDR10_AI)
+     list(APPEND SOURCES HDR10AISource.cpp)
+     list(APPEND HEADERS HDR10AISource.h)
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 3f4b8dc..dc7125c 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0-or-later */
+ #include "DVBridgeGLES.h"
++#include "DVYblodVulkan.h"
+ #include "VideoShaders/VideoFilterShaderGLES.h"
+ #include "utils/DVBridgeDiagnosticLog.h"
+ #include "DVBridgeShaders.h"
+@@ -17,6 +18,7 @@ extern "C"
+ #include <libavutil/dovi_meta.h>
+ #include <libavutil/avutil.h>
+ #include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_vaapi.h>
+ #include "dvbridge_placebo.h"
+ #include "dvbridge_cache.h"
+ }
+@@ -24,6 +26,8 @@ extern "C"
+ #include <EGL/egl.h>
+ #include <algorithm>
+ #include <chrono>
++#include <cstdlib>
++#include <cstring>
+ #include <deque>
+ #include <filesystem>
+ #include <GLES3/gl3.h>
+@@ -1039,6 +1043,7 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::TakeFELPrefetch(const std::shared_ptr<
+ 
+ CDVBridgeGLES::~CDVBridgeGLES()
+ {
++  m_yblod.reset();
+   cb1_hdr10plus_analysis_destroy(&m_hdr10plusAnalysis);
+   ClearFELPrefetch();
+   Summary("closed");
+@@ -1206,6 +1211,33 @@ void CDVBridgeGLES::Reset()
+ #endif
+   m_pendingHDR10Fallback = 0;
+   dvbridge_renderer_reset(m_renderer);
++  if (m_yblod) m_yblod->Reset();
++  m_yblodFrame = false;
++}
++
++bool CDVBridgeGLES::PrepareYblod(const Layer& base, const Layer* enhancement,
++                                 const CDVMetadataBuffer& metadata, const dvbridge_geometry& geometry)
++{
++  // Unscaled pictures without menus or subtitles; everything else is CB1's.
++  const bool unscaled = geometry.width == base.width && geometry.height == base.height &&
++      geometry.source_width == base.width && geometry.source_height == base.height &&
++      std::all_of(std::begin(geometry.crop), std::end(geometry.crop), [](float v) { return v == 0; }) &&
++      std::all_of(std::begin(geometry.placement), std::end(geometry.placement), [](float v) { return v == 0; });
++  if (m_requested.masterEngine != 1 || m_requested.masterIPT || m_nativeOverlayEnabled || !unscaled ||
++      !base.vaDisplay || base.vaSurface == 0xffffffff || (enhancement && enhancement->vaSurface == 0xffffffff) ||
++      m_scanoutFramebuffer != 0)
++    return false;
++  if (!m_yblod) m_yblod = std::make_unique<CDVYblodVulkan>();
++  // CB1's siting (Kodi's SourceChroma) unless DV_YBLOD_SITING=yblod.
++  const char* siting = std::getenv("DV_YBLOD_SITING");
++  const bool topLeft = siting && std::strcmp(siting, "yblod") == 0 ?
++      base.chromaLocation == AVCHROMA_LOC_TOPLEFT && !enhancement :
++      SourceChroma(base.chromaLocation, base.sourceInfo.profile) == PL_CHROMA_TOP_LEFT;
++  m_yblodFrame = m_yblod->Render(base.vaDisplay, base.vaSurface,
++      enhancement ? enhancement->vaSurface : 0xffffffffu, base.width, base.height, geometry.x, geometry.y,
++      topLeft, metadata.Data(), metadata.Size(), static_cast<int64_t>(base.pts * 1e6),
++      m_scanoutFramebuffer, geometry.target_width, geometry.target_height, true);
++  return m_yblodFrame;
+ }
+ 
+ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+@@ -1255,7 +1287,10 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+   if (!m_hdr10 && allowPacked && (m_directUsable || m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE) &&
+       m_scanout)
+   {
+-    if(m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE)
++    m_yblodFrame = false;
++    if(m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE && PrepareYblod(base, enhancement, metadata, geometry))
++      m_direct = true;
++    else if(m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE)
+     {
+       auto renderMaster=m_requested.masterIPT ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference;
+       const auto status=renderMaster(m_renderer,&bl.frame,metadata.Data(),metadata.Size(),
+@@ -1825,6 +1860,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+   layer.pts = static_cast<double>(enhancement->pts);
+   layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
+       AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
++  if (enhancement->format == AV_PIX_FMT_VAAPI && enhancement->hw_frames_ctx)
++  {
++    const auto* frames = reinterpret_cast<const AVHWFramesContext*>(enhancement->hw_frames_ctx->data);
++    layer.vaDisplay = static_cast<const AVVAAPIDeviceContext*>(frames->device_ctx->hwctx)->display;
++    layer.vaSurface = static_cast<unsigned>(reinterpret_cast<uintptr_t>(enhancement->data[3]));
++  }
+   for (int i = 0; i < 3; ++i)
+     layer.planes[i] = imported.planes[i];
+   bool result = Prepare(base, &layer, metadata, geometry, allowPacked);
+@@ -2020,6 +2061,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
+   layer.lease = imported;
+   layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
+       AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
++  if (enhancement->format == AV_PIX_FMT_VAAPI && enhancement->hw_frames_ctx)
++  {
++    const auto* frames = reinterpret_cast<const AVHWFramesContext*>(enhancement->hw_frames_ctx->data);
++    layer.vaDisplay = static_cast<const AVVAAPIDeviceContext*>(frames->device_ctx->hwctx)->display;
++    layer.vaSurface = static_cast<unsigned>(reinterpret_cast<uintptr_t>(enhancement->data[3]));
++  }
+   if (imported->scaled)
+   {
+     layer.planes[0] = imported->scaled->plane;
+@@ -2128,6 +2175,8 @@ void CDVBridgeGLES::CountPresentation(bool committed)
+ bool CDVBridgeGLES::Presented(bool success)
+ {
+   if (m_live) return Presented(success,m_submission);
++  if (m_yblod) m_yblod->Presented(success && m_yblodFrame && m_prepared && m_packed);
++  m_yblodFrame = false;
+   const bool committed = success && m_prepared && m_packed && dvbridge_render_commit(m_renderer);
+   CountPresentation(committed);
+   if (!committed && m_prepared) Failure("presentation");
+@@ -2179,6 +2228,8 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+       hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
+       m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
+       m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
++  if (m_yblod) m_yblod->Presented(success && m_yblodFrame && m_prepared && m_packed);
++  m_yblodFrame = false;
+   const bool committed = success && m_prepared && m_packed &&
+       (m_advanced ? (m_dvPolicyActive ?
+           dvbridge_render_dv_policy_commit(m_renderer,&submission.identity,
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index ade1f23..91d6e07 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -6,6 +6,7 @@
+ #include "utils/DVBridgeDiagnosticState.h"
+ #include "utils/Geometry.h"
+ #include "cores/VideoSettings.h"
++#include <memory>
+ #include <optional>
+ #include <span>
+ #include <vector>
+@@ -28,6 +29,7 @@ extern "C"
+ #endif
+ 
+ class VideoSourceSideData;
++class CDVYblodVulkan;
+ namespace KODI::RENDERING::CAPTURE { struct ReadbackBuffer; }
+ 
+ class CDVBridgeGLES
+@@ -99,6 +101,9 @@ public:
+     bool fullRange{};
+     pl_hdr_metadata hdr{};
+     AVChromaLocation chromaLocation{AVCHROMA_LOC_UNSPECIFIED};
++    // The decoded VAAPI surface, for YBLOD's Vulkan Master Reference engine.
++    void* vaDisplay{};
++    unsigned vaSurface{0xffffffff}; // VA_INVALID_SURFACE
+   };
+   enum class FrameStatus { Failed, Pending, Busy, Ready, Reused, Unsupported };
+ #ifdef CB1_HAS_HDR10_AI
+@@ -303,4 +308,9 @@ private:
+   bool m_packed = false;
+   unsigned m_pendingInfo = 0;
+   unsigned int m_framebuffer = 0;
++  // YBLOD's Vulkan engine for Master Reference (dvbridge.masterengine).
++  bool PrepareYblod(const Layer& base, const Layer* enhancement, const CDVMetadataBuffer& metadata,
++                    const dvbridge_geometry& geometry);
++  std::unique_ptr<CDVYblodVulkan> m_yblod;
++  bool m_yblodFrame{};
+ };
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp
+new file mode 100644
+index 0000000..980202c
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp
+@@ -0,0 +1,228 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "DVYblodVulkan.h"
++
++#include "ServiceBroker.h"
++#include "utils/log.h"
++#include "windowing/gbm/WinSystemGbm.h"
++#include "windowing/gbm/drm/DRMUtils.h"
++
++#include <GLES3/gl3.h>
++#include <dlfcn.h>
++#include <drm_fourcc.h>
++#include <gbm.h>
++#include <unistd.h>
++
++namespace
++{
++constexpr int CARRIER_WIDTH = 3840;
++constexpr int CARRIER_HEIGHT = 2160;
++} // namespace
++
++CDVYblodVulkan::~CDVYblodVulkan()
++{
++  Close();
++}
++
++bool CDVYblodVulkan::Initialize(void* vaDisplay)
++{
++  if (m_engine)
++    return m_vaDisplay == vaDisplay;
++  if (m_failed)
++    return false;
++  m_failed = true; // until everything below is ready
++  auto* winSystem = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  const int drmFd = winSystem && winSystem->GetDrm() ? winSystem->GetDrm()->GetFileDescriptor() : -1;
++  if (drmFd < 0)
++    return false;
++  m_library = dlopen("libdv_engine_vk.so.0", RTLD_NOW | RTLD_LOCAL);
++  if (!m_library)
++  {
++    CLog::Log(LOGERROR, "YBLOD Vulkan engine: {}", dlerror());
++    return false;
++  }
++#define LOAD(member, symbol) \
++  member = reinterpret_cast<decltype(member)>(dlsym(m_library, #symbol)); \
++  if (!member) \
++    return false;
++  LOAD(m_create, dvvk_create);
++  LOAD(m_setOutput, dvvk_set_output);
++  LOAD(m_renderSync, dvvk_render_sync);
++  LOAD(m_reset, dvvk_reset);
++  LOAD(m_destroy, dvvk_destroy);
++#undef LOAD
++  // The engine logs its reasons on stderr (the journal).
++  if (m_create(drmFd, vaDisplay, &m_engine) != 0 || !m_engine)
++  {
++    m_engine = nullptr;
++    CLog::Log(LOGERROR, "YBLOD Vulkan engine did not start (no Vulkan device for the display?)");
++    return false;
++  }
++  m_vaDisplay = vaDisplay;
++  m_device = gbm_create_device(drmFd);
++  m_display = eglGetCurrentDisplay();
++  auto create = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
++  m_destroyImage = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
++  auto target = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
++      eglGetProcAddress("glEGLImageTargetTexture2DOES"));
++  if (!m_device || !create || !m_destroyImage || !target || m_display == EGL_NO_DISPLAY)
++    return false;
++  GLint texture, read;
++  glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++  for (unsigned index = 0; index < 2; ++index)
++  {
++    // The carrier as the engine writes it: linear ARGB8888, top row first.
++    Slot& slot = m_slots[index];
++    slot.bo = gbm_bo_create(m_device, CARRIER_WIDTH, CARRIER_HEIGHT, GBM_FORMAT_ARGB8888,
++                            GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
++    const int fd = slot.bo ? gbm_bo_get_fd(slot.bo) : -1;
++    if (fd < 0)
++      return false;
++    const uint32_t stride = gbm_bo_get_stride(slot.bo);
++    const EGLint attrs[] = {EGL_WIDTH, CARRIER_WIDTH, EGL_HEIGHT, CARRIER_HEIGHT,
++        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888, EGL_DMA_BUF_PLANE0_FD_EXT, fd,
++        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0, EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(stride),
++        EGL_NONE};
++    slot.image = create(m_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
++    // The engine imports its own duplicate.
++    const bool output = m_setOutput(m_engine, index, fd, stride) == 0;
++    close(fd);
++    if (slot.image == EGL_NO_IMAGE_KHR || !output)
++      return false;
++    glGenTextures(1, &slot.texture);
++    glBindTexture(GL_TEXTURE_2D, slot.texture);
++    target(GL_TEXTURE_2D, slot.image);
++    glGenFramebuffers(1, &slot.framebuffer);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, slot.framebuffer);
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot.texture, 0);
++    const bool complete = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
++    if (!complete)
++    {
++      glBindTexture(GL_TEXTURE_2D, texture);
++      glBindFramebuffer(GL_READ_FRAMEBUFFER, read);
++      return false;
++    }
++  }
++  glBindTexture(GL_TEXTURE_2D, texture);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, read);
++  m_failed = glGetError() != GL_NO_ERROR;
++  if (!m_failed)
++    CLog::Log(LOGINFO, "YBLOD Vulkan engine started for Master Reference");
++  return !m_failed;
++}
++
++bool CDVYblodVulkan::Render(void* vaDisplay, unsigned blSurface, unsigned elSurface, int width,
++                            int height, int x, int y, bool topLeft, const void* metadata,
++                            size_t size, int64_t pts, unsigned framebuffer, int targetWidth,
++                            int targetHeight, bool flipY)
++{
++  m_rendered = false;
++  if (!vaDisplay || targetWidth != CARRIER_WIDTH || targetHeight != CARRIER_HEIGHT ||
++      !Initialize(vaDisplay))
++    return false;
++  const unsigned slot = m_slot ^ 1u;
++  dvvk_frame frame{};
++  frame.plan.width = static_cast<uint32_t>(width);
++  frame.plan.height = static_cast<uint32_t>(height);
++  frame.plan.x = static_cast<uint32_t>(x);
++  frame.plan.y = static_cast<uint32_t>(y);
++  frame.plan.chroma_top_left = topLeft;
++  frame.plan.has_el = elSurface != UINT32_MAX;
++  // Master Reference enlarges the EL with the Annex B filters only.
++  frame.plan.el_scaler = 1;
++  frame.plan.fel = 1;
++  frame.plan.packet_id = m_packetId;
++  frame.plan.refresh = m_refresh;
++  frame.plan.pts = pts;
++  frame.plan.white_nits = 203.0;
++  frame.bl_surface = blSurface;
++  frame.el_surface = elSurface;
++  frame.metadata = metadata;
++  frame.metadata_size = size;
++  frame.output = slot;
++  uint32_t flags = 0;
++  const int result = m_renderSync(m_engine, &frame, &flags);
++  // An out-of-range sample is shown clamped by the engine; Master rejects instead.
++  if (result != 0 || (flags & 3u))
++  {
++    if (m_reports < 16)
++    {
++      ++m_reports;
++      CLog::Log(LOGINFO, "YBLOD Vulkan engine {} picture pts={} ({}, flags {:#x}): {}x{}{}; CB1 renders it",
++                result == -2 ? "does not take this" : "failed on", pts, result, flags, width, height,
++                frame.plan.has_el ? " + EL" : "");
++    }
++    return false;
++  }
++  GLint read, draw;
++  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++  const bool scissor = glIsEnabled(GL_SCISSOR_TEST), blend = glIsEnabled(GL_BLEND);
++  glDisable(GL_SCISSOR_TEST);
++  glDisable(GL_BLEND);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, m_slots[slot].framebuffer);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
++  // Same size, nearest: every carrier byte unchanged. The engine's row 0 is
++  // the HDMI top row; an EGL window's GL origin is bottom-left.
++  if (flipY)
++    glBlitFramebuffer(0, 0, CARRIER_WIDTH, CARRIER_HEIGHT, 0, CARRIER_HEIGHT, CARRIER_WIDTH, 0,
++                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
++  else
++    glBlitFramebuffer(0, 0, CARRIER_WIDTH, CARRIER_HEIGHT, 0, 0, CARRIER_WIDTH, CARRIER_HEIGHT,
++                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, read);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw);
++  if (scissor)
++    glEnable(GL_SCISSOR_TEST);
++  if (blend)
++    glEnable(GL_BLEND);
++  if (glGetError() != GL_NO_ERROR)
++    return false;
++  m_slot = slot;
++  m_rendered = true;
++  return true;
++}
++
++void CDVYblodVulkan::Presented(bool success)
++{
++  if (m_rendered && success)
++  {
++    m_packetId = (m_packetId + 1) & 15u;
++    m_refresh = false;
++  }
++  m_rendered = false;
++}
++
++void CDVYblodVulkan::Reset()
++{
++  if (m_engine)
++    m_reset(m_engine);
++  m_refresh = true;
++  m_rendered = false;
++  m_reports = 0;
++}
++
++void CDVYblodVulkan::Close()
++{
++  if (m_engine)
++    m_destroy(m_engine);
++  m_engine = nullptr;
++  for (Slot& slot : m_slots)
++  {
++    if (slot.framebuffer)
++      glDeleteFramebuffers(1, &slot.framebuffer);
++    if (slot.texture)
++      glDeleteTextures(1, &slot.texture);
++    if (slot.image != EGL_NO_IMAGE_KHR && m_destroyImage)
++      m_destroyImage(m_display, slot.image);
++    if (slot.bo)
++      gbm_bo_destroy(slot.bo);
++    slot = Slot{};
++  }
++  if (m_device)
++    gbm_device_destroy(m_device);
++  m_device = nullptr;
++  if (m_library)
++    dlclose(m_library);
++  m_library = nullptr;
++}
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.h
+new file mode 100644
+index 0000000..fbe33e0
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <cstddef>
++#include <cstdint>
++#include <dv-engine-vk/dv_engine_vk.h>
++
++struct gbm_device;
++struct gbm_bo;
++
++/* YBLOD's Dolby Vision engine on Vulkan compute (libdv_engine_vk.so.0) as a
++ * Master Reference engine. It reconstructs and packs the unscaled picture on
++ * the decoded VA surfaces into one of two linear buffers of its own; the
++ * finished carrier is then copied 1:1 into CB1's output framebuffer, so the
++ * presentation, metadata admission and HDMI handshake stay CB1's.
++ * All methods require Kodi's GL context. */
++class CDVYblodVulkan
++{
++public:
++  ~CDVYblodVulkan();
++  /* true: the carrier is in `framebuffer` (GPU complete). false: this picture
++   * is not the engine's (or it failed); nothing was written there. */
++  bool Render(void* vaDisplay, unsigned blSurface, unsigned elSurface, int width, int height,
++              int x, int y, bool topLeft, const void* metadata, size_t size, int64_t pts,
++              unsigned framebuffer, int targetWidth, int targetHeight, bool flipY);
++  /* The rendered picture was (not) presented: the metadata packet state follows it. */
++  void Presented(bool success);
++  void Reset();
++
++private:
++  bool Initialize(void* vaDisplay);
++  void Close();
++  void* m_library{nullptr};
++  dvvk_engine* m_engine{nullptr};
++  decltype(&dvvk_create) m_create{nullptr};
++  decltype(&dvvk_set_output) m_setOutput{nullptr};
++  decltype(&dvvk_render_sync) m_renderSync{nullptr};
++  decltype(&dvvk_reset) m_reset{nullptr};
++  decltype(&dvvk_destroy) m_destroy{nullptr};
++  void* m_vaDisplay{nullptr};
++  gbm_device* m_device{nullptr};
++  EGLDisplay m_display{EGL_NO_DISPLAY};
++  PFNEGLDESTROYIMAGEKHRPROC m_destroyImage{nullptr};
++  struct Slot
++  {
++    gbm_bo* bo{nullptr};
++    EGLImageKHR image{EGL_NO_IMAGE_KHR};
++    unsigned texture{0}, framebuffer{0};
++  } m_slots[2];
++  unsigned m_slot{0}, m_packetId{0}, m_reports{0};
++  bool m_refresh{true}, m_rendered{false}, m_failed{false};
++};
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+index da284ac..4e03846 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+@@ -259,6 +259,11 @@ bool CRendererVAAPIGLES::BuildDVBridgeLayer(int idx, CDVBridgeGLES::Layer& layer
+   if (!texture || !buffer.doviSourcePicture) return false;
+   layer.sourceInfo = buffer.doviSourcePicture->doviSourceInfo;
+   layer.chromaLocation = source.chroma_position;
++  if (auto* picture = dynamic_cast<CVaapiRenderPicture*>(buffer.videoBuffer); picture && picture->valid)
++  {
++    layer.vaDisplay = picture->vadsp;
++    layer.vaSurface = picture->procPic.videoSurface;
++  }
+   if (hdr10)
+   {
+     layer.fullRange = source.color_range != 0;
