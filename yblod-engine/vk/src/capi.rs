@@ -146,6 +146,21 @@ pub unsafe extern "C" fn dvvk_set_overlay_ex(e: *mut Engine, buf: *const crate::
     }
 }
 
+/// CB1 Master Reference's native overlay for the following frames; NULL:
+/// none. Its layer is the overlay set with dvvk_set_overlay_ex.
+/// # Safety
+/// `e` from dvvk_create; `o` NULL or valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn dvvk_set_cb1_overlay(e: *mut Engine, o: *const crate::engine::Cb1Overlay) -> i32 {
+    match (*e).set_cb1_overlay(o.as_ref()) {
+        Ok(()) => 0,
+        Err(err) => {
+            log_error("CB1 overlay", err);
+            -2
+        }
+    }
+}
+
 /// 1 if a fence could not be attached as an implicit fence (an older
 /// kernel): wait for each ticket before committing the output or drawing
 /// into the overlay again. 0 otherwise.

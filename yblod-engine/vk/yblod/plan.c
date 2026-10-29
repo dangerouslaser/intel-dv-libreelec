@@ -319,7 +319,7 @@ int dvvk_plan_frame(const dvvk_plan_in *in, const void *metadata, size_t metadat
     o->source_w = w;
     o->source_h = h;
     o->overlay_visible = in->overlay != 0;
-    if (in->overlay) {
+    if (in->overlay && !contract) {   /* the CB1 contract's overlay is CB1's (dvvk_set_cb1_overlay) */
         /* prepare_overlay() in dv_source_renderer.c */
         dv_overlay_colour colour;
         if (dv_overlay_colour_init(&settings.source, in->rgb_to_lms, in->white_nits, &colour))

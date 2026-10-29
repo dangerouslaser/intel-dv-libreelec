@@ -38,6 +38,18 @@ pub struct Output {
     fd: i32,    // a dup, for the implicit fence
 }
 
+/// dvvk_cb1_overlay (dv_engine_vk.h): CB1 Master Reference's native overlay.
+#[repr(C)]
+pub struct Cb1Overlay {
+    pub rect: [f32; 4],
+    pub decode: [f32; 9],
+    pub offset: [f32; 3],
+    pub linear: [f32; 9],
+    pub input_pq: u32,
+    pub degamma: [f32; 256],
+    pub pq: [f32; 256],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PackPush {
@@ -218,8 +230,8 @@ pub struct Engine {
     single: Pipeline,
     fel: FelPipelines,
     fel_buffers: [DeviceBuffer; 5],
-    pack: Vec<Pipeline>,      // [(source * 2 + overlay) * 3 + PACK]
-    pack_annexb: Vec<Pipeline>,   // [source]: workgroups of 32x8 with the chroma tile
+    pack: Vec<Pipeline>,      // [(source * 4 + overlay) * 3 + PACK]
+    pack_annexb: Vec<Pipeline>,   // [source * 2 + CB1 overlay]: workgroups of 32x8 with the chroma tile
     fel_chroma: Pipeline,
     staged: bool,
     annexb_fused: bool,
@@ -235,6 +247,12 @@ pub struct Engine {
     keys_valid: bool,
     overlay_prepare: [Pipeline; 2],   // from the test RGBA buffer, from the sources
     linear: vk::Sampler,
+    // CB1 Master Reference's native overlay (set_cb1_overlay): Kodi's
+    // transfer LUTs as uploaded, and the coefficients the pack reads; the
+    // layer itself is the shell.
+    cb1_luts: [gpu::SampledImage; 2],
+    cb1_lut_values: Vec<f32>,
+    cb1: Option<[f32; 32]>,
     pub sources: Sources,
     sources_used: bool,       // the overlay comes from `sources`, not set_overlay_rgba
     prev_overlay: bool,
@@ -290,21 +308,25 @@ impl Engine {
         let mut pack_bindings = vec![storage; 9];
         pack_bindings.extend([sampled, sampled, sampled, storage, storage, storage]);
         pack_bindings.extend([sampled, storage, storage]);   // the fused overlay: shell, keys, coefficients
+        pack_bindings.extend([sampled, sampled]);   // CB1's overlay: Kodi's degamma and PQ LUTs
         let pack_push = std::mem::size_of::<PackPush>() as u32;
         let mut pack = Vec::new();
         for source in 0..3u32 {
-            for overlay in 0..3u32 {
+            for overlay in 0..4u32 {
                 for kind in 0..3u32 {
                     pack.push(Pipeline::new(&d, "pack", &pack_bindings, pack_push,
                         &[(0, kind), (1, fma), (2, overlay), (3, blend_fma), (4, source), (6, 2)])?);
                 }
             }
         }
-        // CB1 contract: the sited pack, no overlay, staged (0) or fused single-layer (1) sources.
+        // CB1 contract: the sited pack, staged (0) or fused single-layer (1)
+        // sources, without or with CB1's overlay (OVERLAY 0, 3).
         let mut pack_annexb = Vec::new();
         for source in 0..2u32 {
-            pack_annexb.push(Pipeline::new(&d, "pack", &pack_bindings, pack_push,
-                &[(0, 0), (1, fma), (2, 0), (3, blend_fma), (4, source), (5, 1), (6, 8)])?);
+            for overlay in [0u32, 3] {
+                pack_annexb.push(Pipeline::new(&d, "pack", &pack_bindings, pack_push,
+                    &[(0, 0), (1, fma), (2, overlay), (3, blend_fma), (4, source), (5, 1), (6, 8)])?);
+            }
         }
         let fel_chroma = Pipeline::new(&d, "fel_chroma",
             &[sampled, sampled, sampled, storage, storage, storage, storage, storage, storage, storage, storage], 32, &[])?;
@@ -379,6 +401,13 @@ impl Engine {
         let sampler = gpu::nearest_sampler(&d)?;
         let push = PushDescriptor::new(&d);
         let shot = OneShot::new(&d)?;
+        let cb1_luts = [
+            gpu::SampledImage::new(&d, vk::Format::R16_SFLOAT, 256, 1)?,
+            gpu::SampledImage::new(&d, vk::Format::R16_SFLOAT, 256, 1)?,
+        ];
+        for lut in &cb1_luts {
+            lut.upload(&d, &shot, &[0u8; 512], 256, 1)?;   // defined (GENERAL) before any frame binds it
+        }
         // Timestamps are always taken (dvvk_last_gpu_ms); DVVK_PROFILE=1 also logs windows of them.
         let timing = d.timestamp_period > 0.0;
         let profile = std::env::var("DVVK_PROFILE").map(|v| v == "1").unwrap_or(false) && timing;
@@ -470,6 +499,9 @@ impl Engine {
             keys_valid: false,
             overlay_prepare,
             linear,
+            cb1_luts,
+            cb1_lut_values: Vec::new(),
+            cb1: None,
             sources,
             sources_used: false,
             prev_overlay: false,
@@ -533,6 +565,44 @@ impl Engine {
             dst[y * row..(y + 1) * row].copy_from_slice(&rgba[y * stride..y * stride + row]);
         }
         self.overlay_dirty = true;
+    }
+
+    /// CB1 Master Reference's native overlay for the following frames (None:
+    /// off). Its layer is the shell (set_shell: Kodi's GUI framebuffer, RGBA8,
+    /// or RGBA16F PQ subtitles); CB1-contract frames mix it into the source
+    /// signal as CB1 does. The LUTs are uploaded again only when they change.
+    pub fn set_cb1_overlay(&mut self, o: Option<&Cb1Overlay>) -> Result<()> {
+        let Some(o) = o else {
+            self.cb1 = None;
+            return Ok(());
+        };
+        let mut c = [0f32; 32];
+        c[..9].copy_from_slice(&o.decode);
+        c[9..12].copy_from_slice(&o.offset);
+        c[12..21].copy_from_slice(&o.linear);
+        c[21..25].copy_from_slice(&o.rect);
+        c[25] = (o.input_pq != 0) as u32 as f32;
+        let values: Vec<f32> = o.degamma.iter().chain(o.pq.iter()).copied().collect();
+        if c.iter().chain(values.iter()).any(|v| !v.is_finite()) {
+            return Err(Error::Unsupported("CB1 overlay values".into()));
+        }
+        if values != self.cb1_lut_values {
+            // Frames in flight may sample the old tables.
+            self.idle();
+            for (lut, src) in self.cb1_luts.iter().zip([&o.degamma, &o.pq]) {
+                let halves: Vec<u8> = src.iter().flat_map(|&v| gpu::half_rne(v).to_le_bytes()).collect();
+                lut.upload(&self.d, &self.shot, &halves, 256, 1)?;
+            }
+            self.cb1_lut_values = values;
+        }
+        self.cb1 = Some(c);
+        Ok(())
+    }
+
+    /// This frame mixes CB1's overlay in: the CB1 contract, an overlay set and
+    /// a layer to read.
+    fn cb1_overlay(&self) -> bool {
+        self.cb1.is_some() && self.plan.chroma_filter != 0 && self.sources.shell().is_some()
     }
 
     /// mpv's subtitles / OSD bitmaps for the following frames (none: empty).
@@ -714,11 +784,17 @@ impl Engine {
         Ok(0)
     }
 
+    /// yblod's own overlay: visible, outside the CB1 contract (where the
+    /// overlay is CB1's, or the picture alone).
+    fn yblod_overlay(&self) -> bool {
+        self.plan.overlay_visible != 0 && self.plan.chroma_filter == 0
+    }
+
     /// Whether this frame's overlay is the shell's layer alone, read and kept
     /// by the pack itself (no overlay_prepare pass; DVVK_OVERLAY_PREPARE=1
     /// keeps the pass). Every such frame reads the shell.
     fn fused_overlay(&self) -> bool {
-        self.plan.overlay_visible != 0 && self.sources_used && self.sources.shell().is_some()
+        self.yblod_overlay() && self.sources_used && self.sources.shell().is_some()
             && self.sources.subs_parts == 0
             && !std::env::var("DVVK_OVERLAY_PREPARE").map(|v| v == "1").unwrap_or(false)
     }
@@ -819,10 +895,10 @@ impl Engine {
                 waits.push(s);
             }
         }
-        // The shell's OSD buffer: Qt's rendering into it may still be running.
-        let compose = self.sources_used && self.sources.dirty && self.plan.overlay_visible != 0;
+        // The shell's OSD buffer: Qt's (or Kodi's GUI) rendering into it may still be running.
+        let compose = self.sources_used && self.sources.dirty && self.yblod_overlay();
         let fused = self.fused_overlay();
-        if compose || fused {
+        if compose || fused || self.cb1_overlay() {
             if let Some(sh) = self.sources.shell() {
                 if let Ok(sync_file) = crate::interop::sync::export_sync_file(sh.fd, crate::interop::sync::DMA_BUF_SYNC_READ) {
                     if crate::interop::sync::signalled(sync_file) {
@@ -884,7 +960,7 @@ impl Engine {
         self.ring[ci].ticket = ticket;
         self.ring[ci].plan_ms = self.last_plan_ms;
         self.next = (ci + 1) % RING;
-        if compose || fused {
+        if compose || fused || self.cb1_overlay() {
             self.sources.used(ticket);
             self.sources.dirty = false;
             self.sources.dirty_rect = Some([0, 0, 0, 0]);
@@ -915,15 +991,16 @@ impl Engine {
         // The overlay's colour error belongs to the prepared overlay: every
         // frame that uses it reports it.
         self.gui_error.bytes_mut()[..4].copy_from_slice(&self.overlay_error_flag.to_le_bytes());
-        let compose = self.sources_used && self.sources.dirty && p.overlay_visible != 0;
+        let compose = self.sources_used && self.sources.dirty && self.yblod_overlay();
         let fused = self.fused_overlay();
+        let cb1 = self.cb1_overlay();
         if p.overlay_visible != 0 && fused != self.overlay_fused {
             // The other path's cache: start over.
             self.keys_valid = false;
             self.overlay_fused = fused;
         }
         let coeff_changed = self.overlay_coeff != p.gui_coeff;
-        let prepare_overlay = !fused && p.overlay_visible != 0 && (compose || self.overlay_dirty || coeff_changed);
+        let prepare_overlay = !fused && self.yblod_overlay() && (compose || self.overlay_dirty || coeff_changed);
         let fused_invalidate = fused && (coeff_changed || !self.keys_valid);
         if check {
             // The reference prepares the overlay afresh from this frame's coefficients.
@@ -940,6 +1017,11 @@ impl Engine {
             self.overlay_coeff = p.gui_coeff;
             self.overlay_dirty = false;
             self.keys_valid = true;
+        }
+        if let (true, Some(mut c)) = (cb1, self.cb1) {
+            // CB1_SOURCE_BLACK: 0 for a Profile 5 transport (black code 0), .0625 otherwise.
+            c[26] = if p.black[0] == 0 { 0.0 } else { 0.0625 };
+            self.gui_coeff.bytes_mut()[..128].copy_from_slice(bytes_of(&c));
         }
         // The area to prepare again: only the subtitles' old and new area when
         // nothing else changed; the whole canvas otherwise.
@@ -1096,17 +1178,21 @@ impl Engine {
         }
 
         // Pack into the output.
-        let overlay_kind = if p.overlay_visible == 0 { 0 } else if fused { 2 } else { 1 };
+        let overlay_kind = if cb1 { 3 } else if !self.yblod_overlay() { 0 } else if fused { 2 } else { 1 };
         let shell_view = match self.sources.shell() {
-            Some(sh) if fused => {
+            Some(sh) if fused || cb1 => {
                 gpu::acquire_foreign_images(d, cmd, &[sh.image.image]);
                 shell_read = Some(sh.fd);
                 sh.image.view
             }
             _ => bl.luma.view,   // unused: a valid view to bind
         };
-        let annexb = p.chroma_filter != 0 && overlay_kind == 0 && p.pack == plan::PACK_SITED && source < 2;
-        let pack = if annexb { &self.pack_annexb[source as usize] } else { &self.pack[((source * 3 + overlay_kind) * 3 + p.pack) as usize] };
+        let annexb = p.chroma_filter != 0 && (overlay_kind == 0 || cb1) && p.pack == plan::PACK_SITED && source < 2;
+        let pack = if annexb {
+            &self.pack_annexb[(source * 2 + cb1 as u32) as usize]
+        } else {
+            &self.pack[((source * 4 + overlay_kind) * 3 + p.pack) as usize]
+        };
         let fused_tables = if source == 1 { Bind::Range(self.tables.buffer, T_SINGLE, 6144) } else { Bind::Range(self.tables.buffer, T_MAPPING, 2048) };
         unsafe { d.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pack.pipeline) };
         self.push.bind(
@@ -1131,6 +1217,8 @@ impl Engine {
                 Bind::Sampled(shell_view, self.linear),
                 Bind::Buffer(self.gui_keys.buffer),
                 Bind::Buffer(self.gui_coeff.buffer),
+                Bind::Sampled(self.cb1_luts[0].view, self.linear),
+                Bind::Sampled(self.cb1_luts[1].view, self.linear),
             ],
         );
         let push = PackPush {
@@ -1259,7 +1347,8 @@ impl Engine {
               Bind::Sampled(bl.luma.view, self.sampler), Bind::Sampled(bl.chroma.view, self.sampler),
               Bind::Sampled(el_view, self.sampler), Bind::Range(self.tables.buffer, T_MAPPING, 2048),
               Bind::Range(self.tables.buffer, T_RESIDUAL, 4096), Bind::Buffer(v.err.buffer),
-              Bind::Sampled(bl.luma.view, self.linear), Bind::Buffer(self.gui_keys.buffer), Bind::Buffer(self.gui_coeff.buffer)],
+              Bind::Sampled(bl.luma.view, self.linear), Bind::Buffer(self.gui_keys.buffer), Bind::Buffer(self.gui_coeff.buffer),
+              Bind::Sampled(self.cb1_luts[0].view, self.linear), Bind::Sampled(self.cb1_luts[1].view, self.linear)],
             &reference_push, ((CANVAS_W / 4).div_ceil(32), (CANVAS_H / 2).div_ceil(2)));
         barrier();
         self.dispatch(cmd, &v.compare,
@@ -1496,6 +1585,9 @@ impl Drop for Engine {
             p.destroy(d);
         }
         unsafe { d.device.destroy_sampler(self.linear, None) };
+        for lut in &self.cb1_luts {
+            lut.destroy(d);
+        }
         self.sources.destroy(d);
         self.gui_coeff.destroy(d);
         self.gui_error.destroy(d);

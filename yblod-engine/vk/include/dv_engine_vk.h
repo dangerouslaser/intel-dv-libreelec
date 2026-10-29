@@ -48,6 +48,20 @@ int dvvk_set_overlay(dvvk_engine *, const dvvk_dmabuf *, uint64_t id);   /* NULL
  * next contents into it at once (no copy, no CPU wait). */
 #define DVVK_OVERLAY_FLIP_Y 1u
 int dvvk_set_overlay_ex(dvvk_engine *, const dvvk_dmabuf *, uint64_t id, uint32_t flags);
+/* CB1 Master Reference's native overlay (cb1_composite_glsl.h), for frames
+ * planned with plan.cb1_contract: the overlay set with dvvk_set_overlay_ex
+ * (Kodi's GUI framebuffer, premultiplied; RGBA8, or RGBA16F BT.2020 PQ with
+ * input_pq) mixed into the source signal exactly as CB1 does. The matrices are
+ * CB1's overlay_decode, overlay_offset and overlay_linear for the picture, in
+ * column order (libplacebo's mat3 variables); the LUTs Kodi's GUI transfer
+ * tables (CGuiCompositeShaderGLES, stored as GL_R16F). NULL: none. */
+typedef struct {
+    float rect[4];                      /* overlay_area: x0, y0, x1, y1 (x even); empty: none */
+    float decode[9], offset[3], linear[9];
+    uint32_t input_pq;
+    float degamma[256], pq[256];
+} dvvk_cb1_overlay;
+int dvvk_set_cb1_overlay(dvvk_engine *, const dvvk_cb1_overlay *);
 /* 1 once a fence could not be attached as an implicit fence (older kernel):
  * wait for each ticket before committing or drawing into the overlay. */
 int dvvk_implicit_failed(dvvk_engine *);

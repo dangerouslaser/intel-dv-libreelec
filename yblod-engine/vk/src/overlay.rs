@@ -243,6 +243,7 @@ impl Sources {
                 0x3432_5258 => (vk::Format::B8G8R8A8_UNORM, true),  // XR24
                 0x3432_4241 => (vk::Format::R8G8B8A8_UNORM, false), // AB24
                 0x3432_4258 => (vk::Format::R8G8B8A8_UNORM, true),  // XB24
+                0x4834_4241 => (vk::Format::R16G16B16A16_SFLOAT, false), // AB4H (Kodi's PQ subtitles)
                 f => return Err(Error::Unsupported(format!("overlay format {f:#010x}"))),
             };
             if (1..b.num_planes as usize).any(|i| va::dmabuf_inode(b.fd[i]) != inode) {

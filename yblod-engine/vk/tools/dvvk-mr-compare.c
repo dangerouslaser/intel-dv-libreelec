@@ -17,6 +17,10 @@
  *                       its production settings, /usr/lib/kodi/native-dv.env)
  *     --only cb1|vk     time one engine alone (no comparison; vk = YBLOD's)
  *     --warmup N        frames left out of the timing (default 12)
+ *     --overlay         a GUI layer as Kodi gives CB1 its native overlay (a test
+ *                       pattern, Kodi's transfer LUTs): off for frames 1-6, the
+ *                       whole raster for 7-30, a subtitle area for 31-42, then
+ *                       off again; Vulkan engine only
  *
  * Timing is per picture on the CPU clock, synchronous (each engine finishes
  * before the next starts), from decoded surfaces (vaSyncSurface first), and
@@ -36,6 +40,7 @@
 #include "dvbridge_render.h"
 #include "dvbridge_dmabuf.h"
 #include "dvbridge_gl_frame.h"
+#include "dvbridge_placebo.h"
 #include <libplacebo/opengl.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -61,6 +66,8 @@ static struct {
     int (*create)(int, void *, dvvk_engine **);
     int (*set_output)(dvvk_engine *, uint32_t, int, uint32_t);
     int (*render_sync)(dvvk_engine *, const dvvk_frame *, uint32_t *);
+    int (*set_overlay_ex)(dvvk_engine *, const dvvk_dmabuf *, uint64_t, uint32_t);
+    int (*set_cb1_overlay)(dvvk_engine *, const dvvk_cb1_overlay *);
     void (*reset)(dvvk_engine *);
     void (*destroy)(dvvk_engine *);
 } vk;
@@ -125,6 +132,8 @@ static int load_engine(void)
     vk.create = dlsym(lib, "dvvk_create");
     vk.set_output = dlsym(lib, "dvvk_set_output");
     vk.render_sync = dlsym(lib, "dvvk_render_sync");
+    vk.set_overlay_ex = dlsym(lib, "dvvk_set_overlay_ex");
+    vk.set_cb1_overlay = dlsym(lib, "dvvk_set_cb1_overlay");
     vk.reset = dlsym(lib, "dvvk_reset");
     vk.destroy = dlsym(lib, "dvvk_destroy");
     return vk.create && vk.set_output && vk.render_sync && vk.reset && vk.destroy ? 0 : -1;
@@ -242,6 +251,84 @@ static struct dvbridge_gl_frame *cb1_import(pl_gpu gpu, const AVFrame *f, VASurf
     return &c->frame;
 }
 
+/* Kodi's GUI transfer tables (CGuiCompositeShaderGLES: GenerateDegammaLUT,
+ * GeneratePQLUT with its default 203-nit SDR peak). */
+static void kodi_luts(float degamma[256], float pq[256])
+{
+    const float m1 = 0.1593017578125f, m2 = 78.84375f, c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+    for (int i = 0; i < 256; i++) {
+        float v = (float)i / 255;
+        degamma[i] = v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f);
+        float l = powf((float)i / 255 * (203.0f / 10000.0f), m1);
+        pq[i] = powf((c1 + c2 * l) / (1.0f + c3 * l), m2);
+    }
+}
+
+/* CB1's overlay coefficients for this picture, as render() and
+ * source_overlay_coefficients() in dvbridge_render.c make them: the inverse of
+ * libplacebo's decode of the mapped source (with the BL texture's bits) and of
+ * BT.2020 <- the RPU's LMS. GLSL column order. */
+static int cb1_overlay_coefficients(const void *meta, size_t size, bool paired, struct pl_bit_encoding bits,
+                                    dvvk_cb1_overlay *o)
+{
+    struct dvbridge_color mapped;
+    if (!dvbridge_map_color(&mapped, meta, size, paired))
+        return -1;
+    mapped.repr.bits = bits;
+    struct pl_color_repr post = mapped.repr;
+    pl_color_repr_normalize(&post);
+    pl_transform3x3 tr = pl_color_repr_decode(&post, NULL);
+    pl_matrix3x3 linear = {{{3.06441879f, -2.16597676f, .10155818f},
+                            {-.65612108f, 1.78554118f, -.12943749f},
+                            {.01736321f, -.04725154f, 1.03004253f}}};
+    pl_matrix3x3_mul(&linear, &mapped.dovi.linear);
+    pl_matrix3x3_invert(&tr.mat);
+    pl_matrix3x3_invert(&linear);
+    for (int i = 0; i < 3; i++) {
+        o->offset[i] = tr.c[i];
+        for (int j = 0; j < 3; j++) {
+            o->decode[j * 3 + i] = tr.mat.m[i][j];
+            o->linear[j * 3 + i] = linear.m[i][j];
+        }
+    }
+    return 0;
+}
+
+static uint32_t mix32(uint32_t h)
+{
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    return h ^ (h >> 16);
+}
+
+/* A premultiplied RGBA8 GUI test layer, rows top first, in bands of 270 rows:
+ * isolated pixels on clear, an alpha ramp, random alphas, opaque colours,
+ * alpha alternating by pixel and by pair, faint alphas, and text-like mixes. */
+static void gui_pattern(uint8_t *rgba, int frame)
+{
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            uint32_t r = mix32((uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u ^ (uint32_t)frame * 83492791u);
+            unsigned a;
+            switch (y / 270) {
+            case 0: a = (x + y + frame) % 37 == 0 ? 255 : (x + y + frame) % 37 == 1 ? 128 : 0; break;
+            case 1: a = (unsigned)x * 255 / (W - 1); break;
+            case 2: a = r & 255; break;
+            case 3: a = 255; break;
+            case 4: a = x & 1 ? 255 : 0; break;
+            case 5: a = (x >> 1) & 1 ? 200 : 0; break;
+            case 6: a = 1 + (r & 7); break;
+            default: a = (r & 3) == 0 ? 0 : (r & 3) == 1 ? 255 : (r >> 8) & 255; break;
+            }
+            uint8_t *p = rgba + ((size_t)y * W + x) * 4;
+            for (int c = 0; c < 3; c++)
+                p[c] = (uint8_t)(((r >> (8 + 8 * c)) & 255) * a / 255);
+            p[3] = (uint8_t)a;
+        }
+}
+
 static const char *master_status(enum cb1_master_status s)
 {
     switch (s) {
@@ -267,7 +354,7 @@ static void dump_frame(const char *dir, const char *name, int n, const uint8_t *
 int main(int argc, char **argv)
 {
     int frames = 48, fel = 1, ipt = 0, contract = 1, flip = 0, warmup = 12;
-    int run_cb1 = 1, run_vk = 1, opencl = 0;
+    int run_cb1 = 1, run_vk = 1, opencl = 0, overlay = 0;
     double start = 0;
     const char *file = NULL, *dump = NULL, *node = "/dev/dri/renderD128";
     for (int i = 1; i < argc; i++) {
@@ -295,12 +382,14 @@ int main(int argc, char **argv)
             contract = 0;
         else if (!strcmp(argv[i], "--flip"))
             flip = 1;
+        else if (!strcmp(argv[i], "--overlay"))
+            overlay = 1;
         else
             file = argv[i];
     }
     if (!file) {
         fprintf(stderr, "usage: dvvk-mr-compare [--frames N] [--start S] [--fel 0|1] [--ipt] [--yblod] "
-                        "[--flip] [--dump DIR] [--node PATH] FILE\n");
+                        "[--flip] [--overlay] [--dump DIR] [--node PATH] FILE\n");
         return 2;
     }
     if (opencl) {
@@ -397,6 +486,62 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* --overlay: the GUI layer both engines read (a GL texture on a linear bo,
+     * as Kodi's GUI framebuffer is for CB1; its dmabuf for the Vulkan engine,
+     * rows bottom first) and Kodi's LUTs, as GL_R16F textures for CB1. */
+    struct dvbridge_native_overlay cb1_overlay = {0};
+    static dvvk_cb1_overlay vk_overlay;
+    uint8_t *gui = NULL;
+    GLuint gui_tex = 0;
+    if (overlay) {
+        if (opencl || !vk.set_overlay_ex || !vk.set_cb1_overlay) {
+            fprintf(stderr, "--overlay: needs the Vulkan engine with dvvk_set_cb1_overlay\n");
+            return 1;
+        }
+        const uint64_t linear = DRM_FORMAT_MOD_LINEAR;
+        struct gbm_bo *gbo = gbm_bo_create_with_modifiers2(gbm, W, H, GBM_FORMAT_ABGR8888, &linear, 1,
+                                                           GBM_BO_USE_RENDERING);
+        int gfd = gbo ? gbm_bo_get_fd(gbo) : -1;
+        if (gfd < 0) {
+            fprintf(stderr, "GUI bo failed\n");
+            return 1;
+        }
+        const EGLint gui_attr[] = {EGL_WIDTH, W, EGL_HEIGHT, H, EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
+                                   EGL_DMA_BUF_PLANE0_FD_EXT, gfd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+                                   EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)gbm_bo_get_stride(gbo), EGL_NONE};
+        EGLImageKHR gui_image = create_image(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, gui_attr);
+        glGenTextures(1, &gui_tex);
+        glBindTexture(GL_TEXTURE_2D, gui_tex);
+        image_target(GL_TEXTURE_2D, gui_image);
+        cb1_overlay.texture = pl_opengl_wrap(gl->gpu, pl_opengl_wrap_params(.texture = gui_tex, .width = W, .height = H,
+                                                                            .iformat = GL_RGBA8));
+        kodi_luts(vk_overlay.degamma, vk_overlay.pq);
+        const float *tables[2] = {vk_overlay.degamma, vk_overlay.pq};
+        pl_tex *wrapped[2] = {&cb1_overlay.degamma, &cb1_overlay.pq};
+        for (int i = 0; i < 2; i++) {
+            /* as CGuiCompositeShaderGLES::CreateLUTTexture */
+            GLuint t;
+            glGenTextures(1, &t);
+            glBindTexture(GL_TEXTURE_2D, t);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, 256, 1, 0, GL_RED, GL_FLOAT, tables[i]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            *wrapped[i] = pl_opengl_wrap(gl->gpu, pl_opengl_wrap_params(.texture = t, .width = 256, .height = 1,
+                                                                        .iformat = GL_R16F));
+        }
+        dvvk_dmabuf d = {.width = W, .height = H, .format = DRM_FORMAT_ABGR8888, .modifier = gbm_bo_get_modifier(gbo),
+                         .num_planes = 1, .fd = {gfd, -1, -1, -1}, .stride = {gbm_bo_get_stride(gbo)}};
+        gui = malloc((size_t)W * H * 4);
+        if (!gui_image || !cb1_overlay.texture || !cb1_overlay.degamma || !cb1_overlay.pq ||
+            vk.set_overlay_ex(vke, &d, 1, DVVK_OVERLAY_FLIP_Y)) {
+            fprintf(stderr, "GUI layer import failed\n");
+            return 1;
+        }
+    }
+    int visible_before = 0;
+
     uint8_t *a = malloc((size_t)W * H * 4), *b = malloc((size_t)W * H * 4);
     unsigned packet_id = 0;
     /* CB1's dvbridge_dv_metadata_output: refresh on the first picture, after
@@ -446,6 +591,20 @@ int main(int argc, char **argv)
         if (el)
             vaSyncSurface(dec.display, p.el_surface);
 
+        /* --overlay: this picture's GUI (0 none, 1 the whole raster, 2 subtitles) */
+        int layer = !overlay || n <= 6 || n > 42 ? 0 : n <= 30 ? 1 : 2;
+        if (layer) {
+            gui_pattern(gui, n);
+            /* GL rows are bottom first: the layer's top row is the texture's last */
+            glBindTexture(GL_TEXTURE_2D, gui_tex);
+            for (int r = 0; r < H; r++)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, H - 1 - r, W, 1, GL_RGBA, GL_UNSIGNED_BYTE, gui + (size_t)r * W * 4);
+            glFinish();
+            const float full[4] = {0, 0, W, H}, subtitles[4] = {600, 1700, 3240, 2000};
+            memcpy(cb1_overlay.rect, layer == 1 ? full : subtitles, sizeof(full));
+            memcpy(vk_overlay.rect, cb1_overlay.rect, sizeof(full));
+        }
+
         /* CB1 Master Reference, as CDVBridgeGLES::Prepare */
         struct dvbridge_gl_frame *blp = NULL, *elp = NULL;
         enum cb1_master_status cs = CB1_MASTER_FAILED;
@@ -475,11 +634,11 @@ int main(int argc, char **argv)
                 dvbridge_renderer_set_optimized_dv(cb1, true);
                 dvbridge_renderer_set_processing_optimizations(cb1, false);
                 dvbridge_renderer_set_fel_nearest(cb1, el != NULL);
-                dvbridge_renderer_set_overlay_visible(cb1, false);
+                dvbridge_renderer_set_overlay_visible(cb1, layer != 0);
                 if (gpu_timing)
                     begin_query(GL_TIME_ELAPSED_EXT, query);
                 cs = (ipt ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference)(
-                    cb1, &bl.frame, meta, meta_size, pts, el ? pts : NAN, g, target, flip, NULL);
+                    cb1, &bl.frame, meta, meta_size, pts, el ? pts : NAN, g, target, flip, layer ? &cb1_overlay : NULL);
                 if (gpu_timing)
                     end_query(GL_TIME_ELAPSED_EXT);
                 pl_gpu_finish(gl->gpu);
@@ -513,6 +672,17 @@ int main(int argc, char **argv)
         else if (!shown)
             refresh = 1;
         f.plan.refresh = (uint32_t)refresh;
+        f.plan.overlay = layer != 0;
+        f.plan.overlay_visible_before = (uint32_t)visible_before;
+        if (run_vk && overlay) {
+            /* the BL texture's bits, as CB1's import gives them (P010) */
+            struct pl_bit_encoding bits = {.sample_depth = 16, .color_depth = 10, .bit_shift = 6};
+            if (layer && cb1_overlay_coefficients(meta, meta_size, el != NULL, bits, &vk_overlay)) {
+                fprintf(stderr, "frame %d: no overlay coefficients\n", n);
+                return 1;
+            }
+            vk.set_cb1_overlay(vke, layer ? &vk_overlay : NULL);
+        }
         uint32_t flags = 0;
         t0 = now_ms();
         int rv = -1;
@@ -611,6 +781,7 @@ int main(int argc, char **argv)
             packet_id = (packet_id + 1) & 15;
             last_pts = pts;
             shown++;
+            visible_before = layer != 0;
         }
         dv_pair_free(&p);
     }

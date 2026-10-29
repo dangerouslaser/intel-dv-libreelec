@@ -358,6 +358,127 @@ impl DeviceBuffer {
     }
 }
 
+/// A small device image the host fills (Kodi's GUI LUTs for CB1's overlay):
+/// written through a staging buffer, kept in GENERAL layout for sampling.
+pub struct SampledImage {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+}
+
+impl SampledImage {
+    pub fn new(d: &Device, format: vk::Format, width: u32, height: u32) -> Result<Self> {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { d.device.create_image(&info, None) }?;
+        let req = unsafe { d.device.get_image_memory_requirements(image) };
+        let index = d
+            .memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            .ok_or(Error::Missing("device-local memory"))?;
+        let memory = unsafe {
+            d.device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(index), None)
+        }?;
+        unsafe { d.device.bind_image_memory(image, memory, 0) }?;
+        let view = unsafe {
+            d.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(color_range()),
+                None,
+            )
+        }?;
+        Ok(SampledImage { image, memory, view })
+    }
+
+    /// Replaces the whole image with `data` (tightly packed rows) and waits.
+    /// The caller makes sure no frame in flight samples it.
+    pub fn upload(&self, d: &Device, shot: &OneShot, data: &[u8], width: u32, height: u32) -> Result<()> {
+        let mut staging = HostBuffer::new(d, data.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        staging.bytes_mut()[..data.len()].copy_from_slice(data);
+        let cmd = shot.begin(d)?;
+        let to_transfer = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(self.image)
+            .subresource_range(color_range())];
+        let region = [vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+            .image_extent(vk::Extent3D { width, height, depth: 1 })];
+        let to_shader = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(self.image)
+            .subresource_range(color_range())];
+        unsafe {
+            d.device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&to_transfer));
+            d.device.cmd_copy_buffer_to_image(cmd, staging.buffer, self.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &region);
+            d.device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&to_shader));
+        }
+        let result = shot.submit_wait(d, &[], &[]);
+        staging.destroy(d);
+        result
+    }
+
+    pub fn destroy(&self, d: &Device) {
+        unsafe {
+            d.device.destroy_image_view(self.view, None);
+            d.device.destroy_image(self.image, None);
+            d.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+fn color_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 }
+}
+
+/// f32 to IEEE half, rounded to nearest even (as Mesa stores GL_FLOAT data
+/// into a GL_R16F texture).
+pub fn half_rne(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 255 {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 112;   // the half's biased exponent
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    let (r, rem, halfway) = if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        (m >> shift, m & ((1 << shift) - 1), 1u32 << (shift - 1))
+    } else {
+        (((e as u32) << 10) | (man >> 13), man & 0x1fff, 0x1000)
+    };
+    // A carry out of the mantissa steps the exponent (up to infinity): still right.
+    let r = if rem > halfway || (rem == halfway && r & 1 == 1) { r + 1 } else { r };
+    sign | r as u16
+}
+
 /// Compute writes → compute reads (and transfer).
 pub fn compute_barrier(d: &Device, cmd: vk::CommandBuffer) {
     let m = [vk::MemoryBarrier2::default()
