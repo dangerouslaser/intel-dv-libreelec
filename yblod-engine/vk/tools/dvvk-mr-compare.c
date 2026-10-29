@@ -269,13 +269,11 @@ int main(int argc, char **argv)
         return 2;
     }
     if (opencl) {
+        setenv("DV_CB1_CONTRACT", contract ? "1" : "0", 1);
         load_env("/usr/lib/kodi/native-dv.env");
         setenv("NEO_CACHE_DIR", "/tmp/neo-cache", 0);
         if (load_opencl())
             return 1;
-        if (contract)
-            fprintf(stderr, "OpenCL engine: no CB1 contract mode yet; comparing YBLOD's own filters\n");
-        contract = 0;
     } else if (load_engine())
         return 1;
 
@@ -462,8 +460,8 @@ int main(int argc, char **argv)
         int rv = -1;
         if (run_vk && opencl) {
             dv_source_geometry g = {.width = w, .height = h, .canvas_width = W, .canvas_height = H, .x = x, .y = y,
-                                    .chroma_siting = !el && top_left ? DV_SOURCE_CHROMA_TOP_LEFT
-                                                                     : DV_SOURCE_CHROMA_CENTER_LEFT,
+                                    .chroma_siting = (contract || !el) && top_left ? DV_SOURCE_CHROMA_TOP_LEFT
+                                                                                   : DV_SOURCE_CHROMA_CENTER_LEFT,
                                     .destination_width = w, .destination_height = h};
             dv_source_input in = {sizeof(in), DV_SOURCE_INPUT_P010, 10u};
             rv = cl.submit(ocl, p.bl_surface, el ? p.el_surface : 0xffffffffu, w, h, meta, meta_size, (uint64_t)n,

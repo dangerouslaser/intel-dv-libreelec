@@ -33,6 +33,8 @@ ushort input_sample(read_only image2d_t src,uint w,uint x,uint y,uint channel,gl
 #endif
 kernel void phase(INPUT_PLANE src,global ushort *dst,uint w,uint h,uint method INPUT_EXTRA){
     uint x=GRID_X(w),y=GRID_Y(w),i=y*w+x;if(i>=w*h)return;int v=0;
+    /* method 2: none, the decoded chroma (CB1's Master Reference contract) */
+    if(method==2){dst[i]=min(INPUT_AT(src,w,x,y),(ushort)1023);return;}
     if(!method)v=3*(int)INPUT_AT(src,w,x,y)+INPUT_AT(src,w,x,(uint)edge((int)y+1,h));
     else {int c[4]={-9,111,29,-3};for(int k=0;k<4;k++)v+=c[k]*(int)INPUT_AT(src,w,x,(uint)edge((int)y+k-1,h));}
     dst[i]=min(rounded(v,method?128:4),(ushort)1023);
@@ -52,6 +54,7 @@ kernel void vertical(INPUT_PLANE src,global ushort *dst,uint w,uint h,uint chrom
  * extending the original input before applying the phase filter. */
 ushort phase_sample(INPUT_PLANE src,uint w,uint h,uint x,int row,uint method INPUT_EXTRA){
  uint y=(uint)edge(row,h);int v=0;
+ if(method==2)return min(INPUT_AT(src,w,x,y),(ushort)1023);
  if(!method)v=3*(int)INPUT_AT(src,w,x,y)+INPUT_AT(src,w,x,(uint)edge((int)y+1,h));
  else {int taps[4]={-9,111,29,-3};for(int k=0;k<4;k++)v+=taps[k]*(int)INPUT_AT(src,w,x,(uint)edge((int)y+k-1,h));}
  return min(rounded(v,method?128:4),(ushort)1023);
@@ -127,6 +130,7 @@ ushort2 input_uv(read_only image2d_t src,uint x,uint y,global uint *error){
 }
 ushort2 phase_uv_sample(read_only image2d_t src,uint x,int row,uint h,uint method,global uint *error){
  uint y=(uint)edge(row,h);int2 v=(int2)(0);
+ if(method==2)return min(input_uv(src,x,y,error),(ushort2)(1023));
  if(!method)v=3*convert_int2(input_uv(src,x,y,error))+convert_int2(input_uv(src,x,(uint)edge((int)y+1,h),error));
  else {int taps[4]={-9,111,29,-3};for(int k=0;k<4;++k)v+=taps[k]*convert_int2(input_uv(src,x,(uint)edge((int)y+k-1,h),error));}
  return min((ushort2)(rounded(v.x,method?128:4),rounded(v.y,method?128:4)),(ushort2)(1023));

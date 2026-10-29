@@ -26,10 +26,11 @@ static int shape(const uint16_t *in,size_t count,unsigned w,unsigned h)
 int dv_chroma_phase_left(const uint16_t *in,size_t count,unsigned w,unsigned h,
                          unsigned method,uint16_t *out,size_t out_count)
 {
-    if (!shape(in,count,w,h) || method>1 || !out || out_count!=count) return -1;
+    if (!shape(in,count,w,h) || method>2 || !out || out_count!=count) return -1;
     for (unsigned y=0;y<h;++y) for (unsigned x=0;x<w;++x) {
         uint16_t v;
-        if (!method) v=rounded(3*(int64_t)in[(size_t)y*w+x]+in[(size_t)edge((int)y+1,h)*w+x],4);
+        if (method==2) v=in[(size_t)y*w+x];   /* none (CB1's Master Reference) */
+        else if (!method) v=rounded(3*(int64_t)in[(size_t)y*w+x]+in[(size_t)edge((int)y+1,h)*w+x],4);
         else {
             static const int c[4]={-9,111,29,-3};
             int64_t sum=0;

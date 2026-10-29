@@ -296,13 +296,24 @@ kernel void source_tunnel(global const ushort *yplane,
  /* Explicit full-height reconstructed chroma: never vertically filter again. */
  c=((x&1)?cr:cb)[ly*(sw/2)+lx/2];yy=yplane[ly*sw+lx];
 #else
+ global const ushort *chroma=(x&1)?cr:cb;
+#ifdef SOURCE_ANNEXB
+ /* CB1's Master Reference (ETSI GS CCM 001 Annex B): left siting, the six-tap
+  * phases; top-left, aligned rows copied and the half-phase eight-tap between
+  * them. Rows clamped to the plane, results to 12 bits. */
+ {int r[8],k=(int)(ly/2),last=(int)(sh/2)-1,s;
+  for(int i=0;i<8;++i)r[i]=chroma[clamp(k+i-3,0,last)*(int)(sw/2)+(int)(lx/2)];
+  if(top_left){s=(ly&1)?22*(r[0]+r[7])+94*(r[1]+r[6])-524*(r[2]+r[5])+2456*(r[3]+r[4]):r[3]<<12;s=(s+2048)>>12;}
+  else{s=(ly&1)?4*r[1]-25*r[2]+222*r[3]+65*r[4]-12*r[5]+2*r[6]:2*r[0]-12*r[1]+65*r[2]+222*r[3]-25*r[4]+4*r[5];s=(s+128)>>8;}
+  c=(uint)clamp(s,0,4095);}
+#else
  uint cy=ly/2,top=(ly&1)?cy:(cy?cy-1:0),
       bottom=(ly&1)?min(cy+1,sh/2-1):cy,a=(ly&1)?3:1;
- global const ushort *chroma=(x&1)?cr:cb;
 #ifdef SOURCE_SITED
  if(top_left){top=cy;bottom=min(cy+1,sh/2-1);a=(ly&1)?2:4;}
 #endif
  c=(a*chroma[top*(sw/2)+lx/2]+(4-a)*chroma[bottom*(sw/2)+lx/2]+2)/4;
+#endif
  yy=yplane[ly*sw+lx];
 #endif
  }}

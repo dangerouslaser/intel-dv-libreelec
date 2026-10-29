@@ -22,6 +22,10 @@ typedef struct {
     void *backend;int acquired,valid,queued;cl_event released;
     dv_frame_settings settings;unsigned char packed[640];unsigned count;
     dv_piecewise_surface_settings piecewise_settings;int piecewise_enabled,piecewise,space2_enabled,full_enabled,nv12_enabled,active_rows;
+    /* DV_CB1_CONTRACT=1: CB1 Master Reference's spatial contract (the stream's
+     * siting with an EL too, 4:2:0 reshaping, no chroma phase pre-filter and
+     * the Annex B 4:2:2 output filters), as yblod-engine-vk's cb1_contract. */
+    int contract;
     cl_program full_program;cl_kernel full_kernel;
     int submitted;unsigned char dm[512];size_t dm_bytes;int overlay_visible;unsigned wait_profiles;
     dv_source_geometry geometry;
@@ -178,7 +182,8 @@ void *dv_source_renderer_create_storage(uintptr_t va_display,uintptr_t egl_displ
     const char *gui_profile=getenv("DV_OVERLAY_PROFILE");r->gui_profile=gui_profile&&!strcmp(gui_profile,"1");
     const char *piecewise=getenv("DV_SINGLE_PIECEWISE");r->piecewise_enabled=piecewise&&!strcmp(piecewise,"1");
     const char *nv12=getenv("DV_SINGLE_NV12");r->nv12_enabled=r->piecewise_enabled&&nv12&&!strcmp(nv12,"1");
-    const char *full=getenv("DV_SINGLE_FULL_HEIGHT");r->full_enabled=r->piecewise_enabled&&full&&!strcmp(full,"1");
+    const char *contract=getenv("DV_CB1_CONTRACT");r->contract=contract&&!strcmp(contract,"1");
+    const char *full=getenv("DV_SINGLE_FULL_HEIGHT");r->full_enabled=r->piecewise_enabled&&full&&!strcmp(full,"1")&&!r->contract;
     const char *space2=getenv("DV_SOURCE_SPACE2");r->space2_enabled=space2&&!strcmp(space2,"1");
     const char *active_rows=getenv("DV_RECON_ACTIVE_ROWS");r->active_rows=active_rows&&!strcmp(active_rows,"1");
     r->queue=clCreateCommandQueue(r->context,r->device,(r->profile_async||r->gui_profile)?CL_QUEUE_PROFILING_ENABLE:0,&error);if(!r->queue||error)goto fail;
@@ -193,7 +198,8 @@ void *dv_source_renderer_create_storage(uintptr_t va_display,uintptr_t egl_displ
     FILE *f=fopen(path,"rb");if(!f)goto fail;size_t length=fread(source,1,sizeof(source),f);int invalid=ferror(f)||!feof(f);fclose(f);if(invalid||!length)goto fail;
     const char *ptr=source;r->program=clCreateProgramWithSource(r->context,1,&ptr,&length,&error);if(!r->program||error)goto fail;
     char options[256];const char *order=r->bgra?"-D SOURCE_SCANOUT_BGRA":"";
-    snprintf(options,sizeof(options),"-cl-std=CL1.2 -D SOURCE_GL -D SOURCE_PACK_PAIR -D SOURCE_PLACED -D SOURCE_SITED %s",order);
+    snprintf(options,sizeof(options),"-cl-std=CL1.2 -D SOURCE_GL -D SOURCE_PACK_PAIR -D SOURCE_PLACED -D SOURCE_SITED %s %s",
+             order,r->contract?"-D SOURCE_ANNEXB":"");
     if(clBuildProgram(r->program,1,&r->device,options,NULL,NULL))goto fail;
     r->kernel=clCreateKernel(r->program,"source_tunnel",&error);if(!r->kernel||error)goto fail;
     if(r->full_enabled){
@@ -267,7 +273,8 @@ int dv_source_renderer_submit_input(void *opaque,unsigned bl_surface,unsigned el
     double started=tracing?submit_clock():0,parsed=0,drained=0,sync_ms=0,import_ms=0,queued=0;
     if(!dv_source_geometry_valid(geometry)||
        geometry->width!=w||geometry->height!=h||geometry->canvas_width!=3840||geometry->canvas_height!=2160)return DV_INVALID;
-    if((dv_source_destination_width(geometry)!=w||dv_source_destination_height(geometry)!=h)&&!r->resize_kernel)return DV_UNSUPPORTED;
+    /* CB1 doesn't call resized Master output exact: the contract takes unscaled pictures only. */
+    if((dv_source_destination_width(geometry)!=w||dv_source_destination_height(geometry)!=h)&&(!r->resize_kernel||r->contract))return DV_UNSUPPORTED;
     dv_frame_settings settings;dv_single_frame_settings general={0};unsigned char dm[512];size_t bytes;
     dv_piecewise_surface_settings surface_settings={0};
     int status=r->space2_enabled?
@@ -295,7 +302,7 @@ int dv_source_renderer_submit_input(void *opaque,unsigned bl_surface,unsigned el
      * The general adapter must prove no residual before ignoring a supplied EL.
      * Preserve already-supported dual-layer MMR sampling unchanged. */
     if((single||status==DV_UNSUPPORTED)&&r->piecewise_enabled&&!polynomial){
-        if(!full&&geometry->chroma_siting!=DV_SOURCE_CHROMA_CENTER_LEFT)return DV_UNSUPPORTED;
+        if(!full&&!r->contract&&geometry->chroma_siting!=DV_SOURCE_CHROMA_CENTER_LEFT)return DV_UNSUPPORTED;
         if(full&&(dv_source_destination_width(geometry)!=w||dv_source_destination_height(geometry)!=h))return DV_UNSUPPORTED;
         status=dv_single_settings_from_ffmpeg_for_depth(metadata,metadata_size,w,h,input->bit_depth,(dv_identity){frame_id,pts},&general,dm,&bytes);
         if(status)return status;
@@ -313,7 +320,9 @@ int dv_source_renderer_submit_input(void *opaque,unsigned bl_surface,unsigned el
     if(nv12&&!use_piecewise)return DV_UNSUPPORTED;
     if(settings.source.space==2&&!r->space2_enabled)return DV_UNSUPPORTED;
     if(single&&settings.composer.residual_enabled)return DV_UNSUPPORTED;
-    if(!single&&geometry->chroma_siting!=DV_SOURCE_CHROMA_CENTER_LEFT)return DV_UNSUPPORTED;
+    if(!single&&!r->contract&&geometry->chroma_siting!=DV_SOURCE_CHROMA_CENTER_LEFT)return DV_UNSUPPORTED;
+    /* CB1 reshapes the decoded chroma as it is: no phase pre-filter (2). */
+    if(r->contract&&!single)settings.chroma_phase=2;
     if(dv_source_place_metadata(geometry,dm,&bytes))return DV_UNSUPPORTED;
     for(unsigned c=0;c<3;++c)if((settings.source.offset[c]&65535u)||(settings.source.offset[c]>>16)>4095)return DV_UNSUPPORTED;
     if(tracing)parsed=submit_clock();
@@ -384,7 +393,7 @@ static int compile_overlay(source_renderer *r,unsigned variant,int reference)
         cl_program program=clCreateProgramWithSource(r->context,1,&ptr,NULL,&error);
         if(!program||error){if(program)clReleaseProgram(program);return DV_BACKEND;}
         const char *layout=variant==1?"-D SOURCE_422":variant==2?
-            "-D SOURCE_SITED -D SOURCE_SCALED -D SOURCE_RESIZE_MAPS":"-D SOURCE_SITED";
+            "-D SOURCE_SITED -D SOURCE_SCALED -D SOURCE_RESIZE_MAPS":r->contract?"-D SOURCE_SITED -D SOURCE_ANNEXB":"-D SOURCE_SITED";
         int n=snprintf(options,sizeof(options),"-cl-std=CL1.2 -D SOURCE_GL -D SOURCE_PACK_PAIR -D SOURCE_PLACED -D SOURCE_OVERLAY %s %s %s %s %s %s -I\"%s\"",layout,r->bgra?"-D SOURCE_SCANOUT_BGRA":"",cached?"-D SOURCE_OVERLAY_CACHED":"",r->gui_gray_lut?"-D SOURCE_OVERLAY_GRAY_LUT":"",r->gui_shared?"-D SOURCE_OVERLAY_SHARED":"",r->gui_tiled?"-D SOURCE_OVERLAY_TILES":"",r->directory);
         if(pixel){
             if(n>=0&&(size_t)n+32<sizeof(options)){strcat(options," -D SOURCE_OVERLAY_PIXEL_CACHE");n=(int)strlen(options);}

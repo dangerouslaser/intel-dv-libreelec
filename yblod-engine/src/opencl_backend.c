@@ -509,7 +509,7 @@ static int compare_row_window(backend *b,int64_t pts,unsigned w,unsigned chroma_
 static dv_status reconstruct_impl(void *opaque,const dv_frame_settings *s,unsigned w,unsigned h,
     const uint16_t *const bl[3],const uint16_t *const el[3],uint16_t *const out[3],const dv_observer *observer,int resident_only,int enqueue_only)
 {
-    backend *b=opaque;if(b){b->resident_ready=0;b->output_ready=0;}if(!b || !s || (!b->shared_prepared&&(!bl||!el)) || !out || !w || !h || w>4096 || h>4096 || w%4 || h%4 || s->chroma_phase>1)return DV_INVALID;
+    backend *b=opaque;if(b){b->resident_ready=0;b->output_ready=0;}if(!b || !s || (!b->shared_prepared&&(!bl||!el)) || !out || !w || !h || w>4096 || h>4096 || w%4 || h%4 || s->chroma_phase>2)return DV_INVALID;
     if(s->composer.el_spatial_resampling_flag>1||s->el_scaler>1)return DV_UNSUPPORTED;
     int equal=!s->composer.el_spatial_resampling_flag;unsigned area_scale=equal?1u:4u;b->nearest=!s->el_scaler;
     const char *trace=getenv("DV_SOURCE_SUBMIT_TRACE");int tracing=trace&&!strcmp(trace,"1")&&b->submit_traces<6;
