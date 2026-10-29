@@ -298,8 +298,8 @@ int dvvk_plan_frame(const dvvk_plan_in *in, const void *metadata, size_t metadat
         return DV_INVALID;
     /* CB1: the id advances only when the payload changes (one engine per process). */
     static dv_packet_sequence sequence;
-    unsigned id = in->cb1_contract ? dv_packet_sequence_next(&sequence, dm, bytes) : in->packet_id;
-    o->packet_count = packetize(dm, bytes, id, o->packets);
+    unsigned packet = in->cb1_contract ? dv_packet_sequence_next(&sequence, dm, bytes) : in->packet_id;
+    o->packet_count = packetize(dm, bytes, packet, o->packets);
     int full_pack = use_piecewise && o->layout == 1;
     if (full_pack && resized)
         return DV_UNSUPPORTED;
