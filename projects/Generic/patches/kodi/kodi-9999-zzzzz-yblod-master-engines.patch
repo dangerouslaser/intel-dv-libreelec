@@ -147,7 +147,7 @@ index ba0fb42..43984a6 100644
      list(APPEND SOURCES HDR10AISource.cpp)
      list(APPEND HEADERS HDR10AISource.h)
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
-index 3f4b8dc..1834a76 100644
+index 3f4b8dc..684cefd 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 @@ -1,5 +1,6 @@
@@ -190,7 +190,7 @@ index 3f4b8dc..1834a76 100644
    cb1_hdr10plus_analysis_destroy(&m_hdr10plusAnalysis);
    ClearFELPrefetch();
    Summary("closed");
-@@ -1206,6 +1214,91 @@ void CDVBridgeGLES::Reset()
+@@ -1206,6 +1214,106 @@ void CDVBridgeGLES::Reset()
  #endif
    m_pendingHDR10Fallback = 0;
    dvbridge_renderer_reset(m_renderer);
@@ -244,6 +244,21 @@ index 3f4b8dc..1834a76 100644
 +  m_cb1Timing = false;
 +}
 +
++gbm_bo* CDVBridgeGLES::YblodScanout() const
++{
++  return m_yblodFrame && m_prepared && m_yblod ? m_yblod->Scanout() : nullptr;
++}
++
++int CDVBridgeGLES::YblodFence() const
++{
++  return m_yblodFrame && m_yblod ? m_yblod->ExportFence() : -1;
++}
++
++void CDVBridgeGLES::YblodDirectFailed()
++{
++  if (m_yblod) m_yblod->SetDirect(false);
++}
++
 +bool CDVBridgeGLES::PrepareYblod(const Layer& base, const Layer* enhancement,
 +                                 const CDVMetadataBuffer& metadata, const dvbridge_geometry& geometry)
 +{
@@ -282,7 +297,7 @@ index 3f4b8dc..1834a76 100644
  }
  
  bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
-@@ -1255,11 +1348,16 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+@@ -1255,11 +1363,16 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
    if (!m_hdr10 && allowPacked && (m_directUsable || m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE) &&
        m_scanout)
    {
@@ -300,7 +315,7 @@ index 3f4b8dc..1834a76 100644
        m_direct=status==CB1_MASTER_READY;
        if(!m_direct) Failure(status==CB1_MASTER_INVALID ? "master-reference-invalid-metadata" :
            status==CB1_MASTER_UNSUPPORTED ? "master-reference-unsupported-contract" :
-@@ -1825,6 +1923,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+@@ -1825,6 +1938,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
    layer.pts = static_cast<double>(enhancement->pts);
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -313,7 +328,7 @@ index 3f4b8dc..1834a76 100644
    for (int i = 0; i < 3; ++i)
      layer.planes[i] = imported.planes[i];
    bool result = Prepare(base, &layer, metadata, geometry, allowPacked);
-@@ -2020,6 +2124,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
+@@ -2020,6 +2139,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
    layer.lease = imported;
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -326,7 +341,7 @@ index 3f4b8dc..1834a76 100644
    if (imported->scaled)
    {
      layer.planes[0] = imported->scaled->plane;
-@@ -2128,7 +2238,18 @@ void CDVBridgeGLES::CountPresentation(bool committed)
+@@ -2128,7 +2253,18 @@ void CDVBridgeGLES::CountPresentation(bool committed)
  bool CDVBridgeGLES::Presented(bool success)
  {
    if (m_live) return Presented(success,m_submission);
@@ -346,7 +361,7 @@ index 3f4b8dc..1834a76 100644
    CountPresentation(committed);
    if (!committed && m_prepared) Failure("presentation");
    if (committed)
-@@ -2179,12 +2300,22 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+@@ -2179,12 +2315,22 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
        hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
        m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
        m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
@@ -372,7 +387,7 @@ index 3f4b8dc..1834a76 100644
    if (!committed)
    {
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
-index ade1f23..93458ca 100644
+index ade1f23..c891d5c 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
 @@ -6,6 +6,7 @@
@@ -401,16 +416,23 @@ index ade1f23..93458ca 100644
    };
    enum class FrameStatus { Failed, Pending, Busy, Ready, Reused, Unsupported };
  #ifdef CB1_HAS_HDR10_AI
-@@ -191,7 +196,7 @@ public:
+@@ -190,8 +195,14 @@ public:
+   DVBRIDGE::SourceBinding SelectionIdentity(DVBRIDGE::SourceBinding binding,
        const DVBRIDGE::OutputPreferences& preferences, dvbridge_mode mode) const;
    std::shared_ptr<Context> GetContext() const { return m_context; }
++  // A YBLOD engine's prepared picture presented from its own scanout buffer
++  // (nullptr: the surface, as CB1's), that buffer's write fence as a sync_file
++  // (-1 none), and a refused flip of it (later pictures are copied instead).
++  struct gbm_bo* YblodScanout() const;
++  int YblodFence() const;
++  void YblodDirectFailed();
  
 -  CDVBridgeGLES() = default;
 +  CDVBridgeGLES();
    ~CDVBridgeGLES();
    CDVBridgeGLES(const CDVBridgeGLES&) = delete;
    CDVBridgeGLES& operator=(const CDVBridgeGLES&) = delete;
-@@ -303,4 +308,18 @@ private:
+@@ -303,4 +314,18 @@ private:
    bool m_packed = false;
    unsigned m_pendingInfo = 0;
    unsigned int m_framebuffer = 0;
@@ -431,10 +453,10 @@ index ade1f23..93458ca 100644
  };
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
 new file mode 100644
-index 0000000..d4cdff4
+index 0000000..382e8d7
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,466 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#include "DVYblodEngine.h"
 +
@@ -451,6 +473,8 @@ index 0000000..d4cdff4
 +#include <dlfcn.h>
 +#include <drm_fourcc.h>
 +#include <gbm.h>
++#include <linux/dma-buf.h>
++#include <sys/ioctl.h>
 +#include <unistd.h>
 +
 +namespace
@@ -490,6 +514,11 @@ index 0000000..d4cdff4
 +    return false;
 +  m_device = gbm_create_device(drmFd);
 +  m_display = eglGetCurrentDisplay();
++  // Direct presentation for the Vulkan engine (its frames carry an implicit
++  // write fence); the OpenCL engine has two outputs and keeps the copy.
++  const char* direct = std::getenv("DV_YBLOD_DIRECT");
++  m_direct = backend == Backend::Vulkan && !(direct && direct[0] == '0');
++  m_slotCount = m_direct ? 3 : 2;
 +  if (!m_device || m_display == EGL_NO_DISPLAY || !InitializeSlots())
 +    return false;
 +  if (!(backend == Backend::Vulkan ? InitializeVulkan(drmFd, vaDisplay) : InitializeOpenCL(vaDisplay)))
@@ -512,11 +541,14 @@ index 0000000..d4cdff4
 +  glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 +  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
 +  bool complete = true;
-+  for (Slot& slot : m_slots)
++  for (unsigned index = 0; index < m_slotCount; ++index)
 +  {
-+    // The carrier as the engines write it: linear ARGB8888, top row first.
++    Slot& slot = m_slots[index];
++    // The carrier as the engines write it: linear ARGB8888, top row first,
++    // and scanout-capable for direct presentation.
 +    slot.bo = gbm_bo_create(m_device, CARRIER_WIDTH, CARRIER_HEIGHT, GBM_FORMAT_ARGB8888,
-+                            GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
++                            GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR |
++                                (m_direct ? GBM_BO_USE_SCANOUT : 0));
 +    slot.fd = slot.bo ? gbm_bo_get_fd(slot.bo) : -1;
 +    if (slot.fd < 0)
 +      return false;
@@ -571,7 +603,7 @@ index 0000000..d4cdff4
 +    CLog::Log(LOGERROR, "YBLOD Vulkan engine did not start (no Vulkan device for the display?)");
 +    return false;
 +  }
-+  for (unsigned index = 0; index < 2; ++index)
++  for (unsigned index = 0; index < m_slotCount; ++index)
 +  {
 +    // The engine imports its own duplicate of the buffer.
 +    if (m_setOutput(m_engine, index, m_slots[index].fd, m_slots[index].stride) != 0)
@@ -727,7 +759,7 @@ index 0000000..d4cdff4
 +  if (!vaDisplay || targetWidth != CARRIER_WIDTH || targetHeight != CARRIER_HEIGHT ||
 +      !Initialize(backend, vaDisplay))
 +    return false;
-+  const unsigned slot = m_slot ^ 1u;
++  const unsigned slot = (m_slot + 1) % m_slotCount;
 +  // The engine writes this carrier only once GL has finished copying it out.
 +  if (m_slots[slot].read)
 +  {
@@ -751,6 +783,14 @@ index 0000000..d4cdff4
 +      AddFrameMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 +    else if (m_lastGpuMs)
 +      AddFrameMs(m_lastGpuMs(m_engine));   // a frame or two back: timestamps are read on reuse
++  }
++  if (result == 0 && m_direct)
++  {
++    // Shown from its own buffer (Scanout()): no copy into the surface.
++    m_slot = slot;
++    m_renderedPts = pts;
++    m_rendered = true;
++    return true;
 +  }
 +  if (result != 0)
 +  {
@@ -792,6 +832,29 @@ index 0000000..d4cdff4
 +  m_renderedPts = pts;
 +  m_rendered = true;
 +  return true;
++}
++
++gbm_bo* CDVYblodEngine::Scanout() const
++{
++  return m_direct && m_rendered ? m_slots[m_slot].bo : nullptr;
++}
++
++int CDVYblodEngine::ExportFence() const
++{
++  if (!m_direct || !m_rendered || m_slots[m_slot].fd < 0)
++    return -1;
++  dma_buf_export_sync_file request{};
++  request.flags = DMA_BUF_SYNC_READ;   // what a reader (the display) must wait for
++  request.fd = -1;
++  return ioctl(m_slots[m_slot].fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &request) == 0 ? request.fd : -1;
++}
++
++void CDVYblodEngine::SetDirect(bool direct)
++{
++  if (m_direct && !direct)
++    CLog::Log(LOGWARNING, "YBLOD engine: its buffer was refused for scanout; pictures are copied instead");
++  // The slots stay as they are: three scanout buffers serve the copy as well.
++  m_direct = direct;
 +}
 +
 +void CDVYblodEngine::AddFrameMs(double ms)
@@ -862,10 +925,10 @@ index 0000000..d4cdff4
 +}
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
 new file mode 100644
-index 0000000..aa984bf
+index 0000000..6d73ca3
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,109 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#pragma once
 +#include <EGL/egl.h>
@@ -902,6 +965,13 @@ index 0000000..aa984bf
 +  /* Frame time, ms, smoothed (< 0 unknown): the Vulkan engine's GPU time, the
 +   * OpenCL engine's submit to finished. */
 +  double FrameMs() const { return m_frameMs; }
++  /* Direct presentation (Vulkan): the rendered carrier is put on screen from
++   * its own buffer, not copied into Kodi's surface. Scanout() is that buffer
++   * after a successful Render (nullptr when copied); ExportFence() its write
++   * fence as a sync_file (-1 none). SetDirect(false) after a refused flip. */
++  struct gbm_bo* Scanout() const;
++  int ExportFence() const;
++  void SetDirect(bool direct);
 +
 +private:
 +  bool Initialize(Backend backend, void* vaDisplay);
@@ -959,7 +1029,9 @@ index 0000000..aa984bf
 +    int fd{-1};
 +    uint32_t stride{0};
 +    GLsync read{nullptr};   // the blit that last read this carrier
-+  } m_slots[2];
++  } m_slots[3];   // direct presentation: one on screen, one queued, one written
++  unsigned m_slotCount{2};
++  bool m_direct{false};
 +  unsigned m_slot{0}, m_packetId{0}, m_reports{0};
 +  // CB1's metadata refresh (dvbridge_dv_metadata_output), over presented pictures.
 +  uint64_t m_shown{0};
@@ -1001,3 +1073,177 @@ index cb8ac6f..02a18c2 100644
      SetProperty("DV.Circuit", data.output.circuit);
      SetProperty("DV.Reconstruction", "");
      SetProperty("DV.AIL1", "");
+diff --git a/xbmc/windowing/gbm/GBMUtils.cpp b/xbmc/windowing/gbm/GBMUtils.cpp
+index 949d36b..473f95d 100644
+--- a/xbmc/windowing/gbm/GBMUtils.cpp
++++ b/xbmc/windowing/gbm/GBMUtils.cpp
+@@ -145,6 +145,13 @@ void CGBMUtils::CGBMDevice::CGBMSurface::CompleteTransactionalBuffer(bool presen
+     m_pendingBuffer.reset();
+ }
+ 
++void CGBMUtils::CGBMDevice::CGBMSurface::ReleaseScanoutForExternal()
++{
++  while (!m_buffers.empty())
++    m_buffers.pop();
++  m_scanoutBuffer.reset();
++}
++
+ void CGBMUtils::CGBMDevice::CGBMSurface::EndTransactionalMode()
+ {
+   // Transfer the restored scanout to the ordinary queue without unlocking it.
+diff --git a/xbmc/windowing/gbm/GBMUtils.h b/xbmc/windowing/gbm/GBMUtils.h
+index bff3f22..3b156a4 100644
+--- a/xbmc/windowing/gbm/GBMUtils.h
++++ b/xbmc/windowing/gbm/GBMUtils.h
+@@ -146,6 +146,9 @@ public:
+       gbm_bo* LockTransactionalBuffer();
+       void CompleteTransactionalBuffer(bool presented);
+       void EndTransactionalMode();
++      // A buffer from outside the surface (YBLOD's engine) is now on screen:
++      // the surface's scanout buffers go back to EGL.
++      void ReleaseScanoutForExternal();
+ 
+     private:
+       gbm_surface* m_surface{nullptr};
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 1bdc61a..39f8332 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -367,19 +367,25 @@ bool CWinSystemGbm::CompleteDVBridgePage(int timeoutMs)
+   auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+   if (!drm || !drm->HasPendingCB1Page()) return true;
+   if (!drm->CompleteCB1Page(timeoutMs)) return false;
+-  m_GBM->GetDevice().GetSurface().CompleteTransactionalBuffer(true);
++  auto& surface = m_GBM->GetDevice().GetSurface();
++  if (m_externalScanoutPending)
++    surface.ReleaseScanoutForExternal();
++  else
++    surface.CompleteTransactionalBuffer(true);
++  m_externalScanoutPending = false;
+   return true;
+ }
+ 
+ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore, bool async,
+-                                    bool retainSignal)
++                                    bool retainSignal, struct gbm_bo* external)
+ {
+   if (!CompleteDVBridgePage()) return false;
+   auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+   if (!drm || !m_GBM || !state.Captured())
+     return false;
+   auto& surface = m_GBM->GetDevice().GetSurface();
+-  auto* bo = surface.LockTransactionalBuffer();
++  if (external && restore) return false;
++  auto* bo = external ? external : surface.LockTransactionalBuffer();
+   bool valid = bo != nullptr;
+   if (valid && !restore)
+   {
+@@ -422,7 +428,15 @@ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore, bool a
+   }
+   if (!restarted)
+     accepted = drm->FlipPageTransactional(valid ? bo : nullptr, restore, async);
+-  if (!drm->HasPendingCB1Page()) surface.CompleteTransactionalBuffer(accepted);
++  if (external)
++  {
++    // The surface's buffer leaves the screen once the external page is shown.
++    if (drm->HasPendingCB1Page())
++      m_externalScanoutPending = accepted;
++    else if (accepted)
++      surface.ReleaseScanoutForExternal();
++  }
++  else if (!drm->HasPendingCB1Page()) surface.CompleteTransactionalBuffer(accepted);
+   if (accepted && restore)
+   {
+     surface.EndTransactionalMode();
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 6da5c8f..2901b31 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -52,8 +52,10 @@ public:
+ 
+   void FlipPage(bool rendered, bool videoLayer, bool async);
+ #ifdef HAVE_DVBRIDGE
++  // external: a picture's own scanout buffer (YBLOD's engines) instead of the
++  // EGL surface's; it is presented through the same transaction.
+   bool FlipDVBridgePage(CDVBridgeState& state, bool restore, bool async = false,
+-                        bool retainSignal = false);
++                        bool retainSignal = false, struct gbm_bo* external = nullptr);
+   bool CompleteDVBridgePage(int timeoutMs = 0);
+   bool SupportsNativeDVOutput(bool requireCurrentMode = true) const;
+   bool SupportsDVOutputMode(bool requireCurrentMode = true) const;
+@@ -105,6 +107,8 @@ protected:
+ 
+   std::shared_ptr<CDRMUtils> m_DRM;
+   std::unique_ptr<CGBMUtils> m_GBM;
++  // The pending asynchronous DV page is an external buffer (FlipDVBridgePage).
++  bool m_externalScanoutPending{false};
+   std::shared_ptr<CVideoLayerBridge> m_videoLayerBridge;
+ 
+   CCriticalSection m_resourceSection;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 6928bb3..14b9a13 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -506,10 +506,13 @@ void CWinSystemGbmGLESContext::PresentFrame(bool rendered, bool videoLayer)
+     {
+       submitted = m_dvBridge->CaptureSubmission();
+       submitted.sourceSideData = m_videoSourceSideData;
+-      const bool asynchronous = CreateCB1GPUFence(submitted);
+-      if (!asynchronous && !m_dvBridge->Advanced()) glFinish();
++      // A YBLOD engine picture is presented from its own buffer: no swap, no copy.
++      gbm_bo* external = m_dvBridge->YblodScanout();
++      const bool asynchronous = external ? CreateYblodFence(submitted, m_dvBridge->YblodFence()) :
++                                           CreateCB1GPUFence(submitted);
++      if (!asynchronous && !external && !m_dvBridge->Advanced()) glFinish();
+       auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+-      if (m_eglContext.TrySwapBuffers())
++      if (external || m_eglContext.TrySwapBuffers())
+       {
+         const bool link = !m_hdrDeepColorPrevious || (drm && drm->AddProperty(
+             drm->GetConnector(),"DVBRIDGE_HDR10_DEEP_COLOR",*m_hdrDeepColorPrevious));
+@@ -518,7 +521,9 @@ void CWinSystemGbmGLESContext::PresentFrame(bool rendered, bool videoLayer)
+           const bool plain = !asynchronous && !m_dvActivating && !drm->HasPendingRequest();
+           AnnounceCB1Mode(true);
+           const auto started = std::chrono::steady_clock::now();
+-          presented = FlipDVBridgePage(m_dvState, false, asynchronous);
++          presented = FlipDVBridgePage(m_dvState, false, asynchronous, false, external);
++          if (external && !presented)
++            m_dvBridge->YblodDirectFailed();   // later pictures are copied into the surface
+           CompleteCB1Mode(presented,true);
+           if (presented)
+           {
+@@ -2137,6 +2142,21 @@ bool CWinSystemGbmGLESContext::CreateCB1GPUFence(const CDVBridgeGLES::Submission
+   return false;
+ }
+ 
++bool CWinSystemGbmGLESContext::CreateYblodFence(const CDVBridgeGLES::Submission& submission, int fence)
++{
++  // As CreateCB1GPUFence, with the engine's fence: an explicit in-fence makes the
++  // kernel ignore the buffer's implicit one, so it must be the engine's own.
++  if (fence >= 0 && submission.asyncEligible && submission.sequence && CB1AsyncAvailable())
++  {
++    const int prior = m_DRM->TakeOutFenceFd();
++    if (prior >= 0) close(prior);
++    m_DRM->SetInFenceFd(fence);
++    return true;
++  }
++  if (fence >= 0) close(fence);
++  return false;   // a blocking commit waits for the implicit fence
++}
++
+ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+                                             std::shared_ptr<AVFrame> enhancement,
+                                             DVBRIDGE::SourceBinding enhancementBinding,
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 650ff68..0109cf1 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -200,6 +200,8 @@ private:
+   bool ComposeDVPQGUI();
+   bool CB1AsyncAvailable() const;
+   bool CreateCB1GPUFence(const CDVBridgeGLES::Submission& submission);
++  // A YBLOD engine picture: its scanout buffer's write fence as the commit's in-fence.
++  bool CreateYblodFence(const CDVBridgeGLES::Submission& submission, int fence);
+   DVBRIDGE::MasterSafety m_masterSafety;
+   uint64_t m_masterFramePeriodNs{};
+   bool m_continuousFrameEligible{};
