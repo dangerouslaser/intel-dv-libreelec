@@ -207,6 +207,39 @@ static const char *stats(double *t, int n)
     return text;
 }
 
+/* CB1's GL imports of decoded surfaces, kept per VA surface as Kodi keeps
+ * them (its VAAPI textures and raw EL cache): imported once, not per frame. */
+struct cb1_import {
+    VASurfaceID surface;
+    int layout_w, layout_h;
+    struct dvbridge_dmabuf dmabuf;
+    struct dvbridge_gl_frame frame;
+};
+static struct cb1_import cb1_imports[96];
+static int cb1_import_count;
+
+static struct dvbridge_gl_frame *cb1_import(pl_gpu gpu, const AVFrame *f, VASurfaceID surface, int w, int h)
+{
+    for (int i = 0; i < cb1_import_count; i++)
+        if (cb1_imports[i].surface == surface && cb1_imports[i].layout_w == w && cb1_imports[i].layout_h == h)
+            return &cb1_imports[i].frame;
+    if (cb1_import_count == (int)(sizeof(cb1_imports) / sizeof(cb1_imports[0])))
+        return NULL;
+    struct cb1_import *c = &cb1_imports[cb1_import_count];
+    memset(c, 0, sizeof(*c));
+    if (!dvbridge_dmabuf_import(&c->dmabuf, f))
+        return NULL;
+    if (!dvbridge_gl_frame_import(&c->frame, gpu, c->dmabuf.layout, w, h, c->dmabuf.planes)) {
+        dvbridge_dmabuf_release(&c->dmabuf);
+        return NULL;
+    }
+    c->surface = surface;
+    c->layout_w = w;
+    c->layout_h = h;
+    cb1_import_count++;
+    return &c->frame;
+}
+
 static const char *master_status(enum cb1_master_status s)
 {
     switch (s) {
@@ -400,19 +433,19 @@ int main(int argc, char **argv)
             vaSyncSurface(dec.display, p.el_surface);
 
         /* CB1 Master Reference, as CDVBridgeGLES::Prepare */
-        struct dvbridge_dmabuf bl_import = {0}, el_import = {0};
-        struct dvbridge_gl_frame bl = {0}, elf = {0};
+        struct dvbridge_gl_frame *blp = NULL, *elp = NULL;
         enum cb1_master_status cs = CB1_MASTER_FAILED;
         double t0 = now_ms();
-        if (run_cb1 && dvbridge_dmabuf_import(&bl_import, p.bl) &&
-            dvbridge_gl_frame_import(&bl, gl->gpu, bl_import.layout, (int)w, (int)h, bl_import.planes)) {
+        if (run_cb1 && (blp = cb1_import(gl->gpu, p.bl, p.bl_surface, (int)w, (int)h))) {
+            struct dvbridge_gl_frame bl = *blp;
             dvbridge_gl_frame_set_chroma(&bl, cb1_chroma(p.bl->chroma_location, dec.profile));
+            bl.frame.enhancement_layer = NULL;
             int el_ok = 1;
+            struct dvbridge_gl_frame elf = {0};
             if (el) {
-                el_ok = dvbridge_dmabuf_import(&el_import, el) &&
-                        dvbridge_gl_frame_import(&elf, gl->gpu, el_import.layout, el->width, el->height,
-                                                 el_import.planes);
+                el_ok = (elp = cb1_import(gl->gpu, el, p.el_surface, el->width, el->height)) != NULL;
                 if (el_ok) {
+                    elf = *elp;
                     /* CDVBridgeGLES::PrepareHardwareFrame: an unspecified EL is top-left */
                     dvbridge_gl_frame_set_chroma(&elf, cb1_chroma(el->chroma_location, 7));
                     bl.frame.enhancement_layer = &elf.frame;
@@ -433,12 +466,7 @@ int main(int argc, char **argv)
             cb1_t[timed_cb1++] = dt;
         if (cs == CB1_MASTER_READY)
             read_bo(&cb, a);
-        if (elf.gpu)
-            dvbridge_gl_frame_release(&elf);
-        if (bl.gpu)
-            dvbridge_gl_frame_release(&bl);
-        dvbridge_dmabuf_release(&el_import);
-        dvbridge_dmabuf_release(&bl_import);
+
 
         /* yblod's Vulkan engine, as Kodi's yblod adapter drives it */
         int top_left = contract ? cb1_chroma(p.bl->chroma_location, dec.profile) == PL_CHROMA_TOP_LEFT
@@ -570,6 +598,10 @@ int main(int argc, char **argv)
            total_px, meta_px, border_px, luma_px, luma_max, luma_hist[0], luma_hist[1], luma_hist[2], luma_hist[3],
            luma_hist[4], chroma_px, chroma_max, chroma_hist[0], chroma_hist[1], chroma_hist[2], chroma_hist[3],
            chroma_hist[4], n ? cb1_ms / n : 0, n ? vk_ms / n : 0);
+    for (int i = 0; i < cb1_import_count; i++) {
+        dvbridge_gl_frame_release(&cb1_imports[i].frame);
+        dvbridge_dmabuf_release(&cb1_imports[i].dmabuf);
+    }
     if (vke)
         vk.destroy(vke);
     if (ocl)
