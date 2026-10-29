@@ -13,6 +13,12 @@
  *     --flip            CB1's flip_y (default off: row 0 is the HDMI top row)
  *     --dump DIR        on a mismatch, both frames as DIR/{cb1,vk}-N.bgra
  *     --node PATH       render node (default /dev/dri/renderD128)
+ *     --only cb1|vk     time one engine alone (no comparison)
+ *     --warmup N        frames left out of the timing (default 12)
+ *
+ * Timing is per picture on the CPU clock, synchronous (each engine finishes
+ * before the next starts), from decoded surfaces (vaSyncSurface first), and
+ * includes each engine's per-picture imports and CPU preparation.
  *
  * Both engines get an unscaled picture (CB1 doesn't call resized Master
  * output bit-identical). The Vulkan engine runs with the Annex B EL scaler,
@@ -129,6 +135,25 @@ static enum pl_chroma_location cb1_chroma(enum AVChromaLocation loc, int profile
     return PL_CHROMA_LEFT;
 }
 
+static int by_value(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* "median M ms, p95 P, mean A (N pictures)" */
+static const char *stats(double *t, int n)
+{
+    static char text[128];
+    double sum = 0;
+    for (int i = 0; i < n; i++)
+        sum += t[i];
+    qsort(t, (size_t)n, sizeof(*t), by_value);
+    snprintf(text, sizeof(text), "median %.2f ms, p95 %.2f, mean %.2f (%d pictures)", t[n / 2],
+             t[(int)(n * 0.95)], sum / n, n);
+    return text;
+}
+
 static const char *master_status(enum cb1_master_status s)
 {
     switch (s) {
@@ -153,7 +178,8 @@ static void dump_frame(const char *dir, const char *name, int n, const uint8_t *
 
 int main(int argc, char **argv)
 {
-    int frames = 48, fel = 1, ipt = 0, contract = 1, flip = 0;
+    int frames = 48, fel = 1, ipt = 0, contract = 1, flip = 0, warmup = 12;
+    int run_cb1 = 1, run_vk = 1;
     double start = 0;
     const char *file = NULL, *dump = NULL, *node = "/dev/dri/renderD128";
     for (int i = 1; i < argc; i++) {
@@ -167,6 +193,12 @@ int main(int argc, char **argv)
             dump = argv[++i];
         else if (!strcmp(argv[i], "--node") && i + 1 < argc)
             node = argv[++i];
+        else if (!strcmp(argv[i], "--only") && i + 1 < argc) {
+            const char *e = argv[++i];
+            run_cb1 = !strcmp(e, "cb1");
+            run_vk = !strcmp(e, "vk");
+        } else if (!strcmp(argv[i], "--warmup") && i + 1 < argc)
+            warmup = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ipt"))
             ipt = 1;
         else if (!strcmp(argv[i], "--yblod"))
@@ -259,6 +291,8 @@ int main(int argc, char **argv)
     unsigned luma_max = 0, chroma_max = 0;
     size_t luma_hist[5] = {0}, chroma_hist[5] = {0};   /* |d| = 1, 2, 3-4, 5-16, more */
     double cb1_ms = 0, vk_ms = 0;
+    double *cb1_t = calloc((size_t)frames + 1, sizeof(double)), *vk_t = calloc((size_t)frames + 1, sizeof(double));
+    int timed_cb1 = 0, timed_vk = 0;
     struct dv_pair p;
     while (n < frames && dv_decoder_next(&dec, &p) == 1) {
         n++;
@@ -279,12 +313,17 @@ int main(int argc, char **argv)
         /* seconds, as Kodi gives CB1 (its 0.1 s discontinuity test) */
         double pts = p.bl->pts * av_q2d(dec.time_base);
 
+        /* Both engines start from finished decodes. */
+        vaSyncSurface(dec.display, p.bl_surface);
+        if (el)
+            vaSyncSurface(dec.display, p.el_surface);
+
         /* CB1 Master Reference, as CDVBridgeGLES::Prepare */
         struct dvbridge_dmabuf bl_import = {0}, el_import = {0};
         struct dvbridge_gl_frame bl = {0}, elf = {0};
         enum cb1_master_status cs = CB1_MASTER_FAILED;
         double t0 = now_ms();
-        if (dvbridge_dmabuf_import(&bl_import, p.bl) &&
+        if (run_cb1 && dvbridge_dmabuf_import(&bl_import, p.bl) &&
             dvbridge_gl_frame_import(&bl, gl->gpu, bl_import.layout, (int)w, (int)h, bl_import.planes)) {
             dvbridge_gl_frame_set_chroma(&bl, cb1_chroma(p.bl->chroma_location, dec.profile));
             int el_ok = 1;
@@ -307,7 +346,10 @@ int main(int argc, char **argv)
                 pl_gpu_finish(gl->gpu);
             }
         }
-        cb1_ms += now_ms() - t0;
+        double dt = now_ms() - t0;
+        cb1_ms += dt;
+        if (run_cb1 && n > warmup)
+            cb1_t[timed_cb1++] = dt;
         if (cs == CB1_MASTER_READY)
             read_bo(&cb, a);
         if (elf.gpu)
@@ -334,8 +376,22 @@ int main(int argc, char **argv)
         f.plan.refresh = (uint32_t)refresh;
         uint32_t flags = 0;
         t0 = now_ms();
-        int rv = vk.render_sync(vke, &f, &flags);
-        vk_ms += now_ms() - t0;
+        int rv = run_vk ? vk.render_sync(vke, &f, &flags) : -1;
+        dt = now_ms() - t0;
+        vk_ms += dt;
+        if (run_vk && n > warmup)
+            vk_t[timed_vk++] = dt;
+        if (!run_cb1 || !run_vk) {
+            if (!run_cb1 && !rv) {
+                packet_id = (packet_id + 1) & 15;
+                last_pts = pts;
+                shown++;
+            }
+            if (!run_vk && cs == CB1_MASTER_READY)
+                dvbridge_render_commit(cb1);
+            dv_pair_free(&p);
+            continue;
+        }
 
         if (cs != CB1_MASTER_READY || rv) {
             refused_cb1 += cs != CB1_MASTER_READY;
@@ -405,6 +461,10 @@ int main(int argc, char **argv)
         }
         dv_pair_free(&p);
     }
+    if (timed_cb1)
+        printf("timing cb1: %s\n", stats(cb1_t, timed_cb1));
+    if (timed_vk)
+        printf("timing vk:  %s\n", stats(vk_t, timed_vk));
     printf("{\"file\":\"%s\",\"profile\":%d,\"fel\":%d,\"ipt\":%d,\"cb1_contract\":%d,\"frames\":%d,\"compared\":%d,"
            "\"identical\":%d,\"mismatched\":%d,\"refused_cb1\":%d,\"refused_vk\":%d,"
            "\"differ_pixels\":%zu,\"metadata_row_pixels\":%zu,\"border_pixels\":%zu,"
