@@ -581,6 +581,12 @@ int main(int argc, char **argv)
         }
     }
     int visible_before = 0;
+    PFNGLGENQUERIESEXTPROC gen_queries = (void *)eglGetProcAddress("glGenQueriesEXT");
+    PFNGLBEGINQUERYEXTPROC begin_query = (void *)eglGetProcAddress("glBeginQueryEXT");
+    PFNGLENDQUERYEXTPROC end_query = (void *)eglGetProcAddress("glEndQueryEXT");
+    PFNGLGETQUERYOBJECTUI64VEXTPROC query_result = (void *)eglGetProcAddress("glGetQueryObjectui64vEXT");
+    GLuint query = 0;
+    int gpu_timing = gen_queries && begin_query && end_query && query_result;
 
     if (throughput > 0) {
         /* Decoded first, so the video decoder isn't what is measured. */
@@ -613,6 +619,12 @@ int main(int argc, char **argv)
             const char *name = engine == 0 ? "cb1" : opencl ? "yblod-opencl" : "yblod-vulkan";
             uint64_t tickets[3] = {0};
             unsigned pid = 0;
+            /* DVVK_CB1_FRAME_QUERY=1: CB1's GPU time per picture inside the run
+             * (a GL timer query around each, which may keep pictures apart) */
+            static GLuint frame_queries[4096];
+            int frame_query = engine == 0 && gpu_timing && getenv("DVVK_CB1_FRAME_QUERY"), queried = 0;
+            if (frame_query)
+                gen_queries(4096, frame_queries);
             long frames = 0, failed = 0;
             double t0 = now_ms(), c0 = cpu_ms(), end = t0 + throughput * 1e3;
             for (long i = 0; now_ms() < end; i++) {
@@ -642,10 +654,16 @@ int main(int argc, char **argv)
                         dvbridge_renderer_set_processing_optimizations(cb1, false);
                         dvbridge_renderer_set_fel_nearest(cb1, el != NULL);
                         dvbridge_renderer_set_overlay_visible(cb1, false);
+                        if (frame_query && queried < 4096)
+                            begin_query(GL_TIME_ELAPSED_EXT, frame_queries[queried]);
                         ok = (!el || elp) &&
                              (ipt ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference)(
                                  cb1, &bl.frame, meta, meta_size, pts, el ? pts : NAN, g, target, flip, NULL) ==
                                  CB1_MASTER_READY;
+                        if (frame_query && queried < 4096) {
+                            end_query(GL_TIME_ELAPSED_EXT);
+                            queried++;
+                        }
                         if (ok)
                             dvbridge_render_commit(cb1);
                         else
@@ -696,6 +714,16 @@ int main(int argc, char **argv)
                     if (tickets[k])
                         vk.wait(vke, tickets[k], UINT64_MAX);
             double elapsed = now_ms() - t0, cpu = cpu_ms() - c0;
+            if (queried) {
+                double *q = calloc((size_t)queried, sizeof(double));
+                for (int k = 0; k < queried; k++) {
+                    GLuint64 ns = 0;
+                    query_result(frame_queries[k], GL_QUERY_RESULT_EXT, &ns);
+                    q[k] = ns / 1e6;
+                }
+                printf("throughput cb1 gpu per picture: %s\n", stats(q, queried));
+                free(q);
+            }
             printf("throughput %-13s %7.1f fps  %6.2f ms/frame  cpu %5.2f ms/frame  (%ld pictures in %.1f s%s)\n",
                    name, frames * 1e3 / elapsed, elapsed / (frames ? frames : 1), cpu / (frames ? frames : 1),
                    frames, elapsed / 1e3, failed ? ", some refused" : "");
@@ -723,12 +751,6 @@ int main(int argc, char **argv)
      * GPU in Kodi, so the CPU-clock time above is the synchronous worst case. */
     double *cb1_gpu = calloc((size_t)frames + 1, sizeof(double));
     int timed_cb1_gpu = 0;
-    PFNGLGENQUERIESEXTPROC gen_queries = (void *)eglGetProcAddress("glGenQueriesEXT");
-    PFNGLBEGINQUERYEXTPROC begin_query = (void *)eglGetProcAddress("glBeginQueryEXT");
-    PFNGLENDQUERYEXTPROC end_query = (void *)eglGetProcAddress("glEndQueryEXT");
-    PFNGLGETQUERYOBJECTUI64VEXTPROC query_result = (void *)eglGetProcAddress("glGetQueryObjectui64vEXT");
-    GLuint query = 0;
-    int gpu_timing = gen_queries && begin_query && end_query && query_result;
     if (gpu_timing)
         gen_queries(1, &query);
     int timed_cb1 = 0, timed_vk = 0;
