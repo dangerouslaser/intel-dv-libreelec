@@ -48,15 +48,17 @@ index 2f57948..e80f447 100755
            <requirement>HAVE_DVBRIDGE</requirement><level>2</level><default>false</default>
            <dependencies><dependency type="visible" setting="dvbridge.outputmode" operator="is">4</dependency></dependencies>
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h
-index c124268..e86fe28 100644
+index c124268..b15283d 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVOutputSettings.h
-@@ -22,6 +22,13 @@ enum class HDR10SourceMode : int { Native = 0, ReferenceDV = 1, EnhancedDV = 2 }
+@@ -22,6 +22,15 @@ enum class HDR10SourceMode : int { Native = 0, ReferenceDV = 1, EnhancedDV = 2 }
  // Decoder ingress sees the last complete frame-boundary preference snapshot.
  inline std::atomic<OutputMode> playbackMode{OutputMode::Standard};
  inline std::atomic<HDR10SourceMode> hdr10PlaybackMode{HDR10SourceMode::Native};
 +// The engine that drew the last presented picture: 0 CB1, YBLOD's 1 Vulkan, 2 OpenCL.
 +inline std::atomic<int> presentedPipeline{0};
++// A YBLOD picture shown from the engine's own buffer (true) or copied into Kodi's surface.
++inline std::atomic<bool> presentedDirect{false};
 +// Its frame time (ms, smoothed over about a second): GPU time for CB1 and the
 +// Vulkan engine, submit to finished for the OpenCL engine; < 0 unknown.
 +inline std::atomic<double> presentedFrameMs{-1.0};
@@ -65,7 +67,7 @@ index c124268..e86fe28 100644
  
  #ifdef HAVE_DVBRIDGE
  inline int PolicyCode(const dvbridge_policy& policy)
-@@ -41,6 +48,7 @@ struct OutputPreferences
+@@ -41,6 +50,7 @@ struct OutputPreferences
    bool masterIPT{false}, allowMasterFallback{false};
    bool disableL2Trims{false};
    int felUpscaling{0};
@@ -73,7 +75,7 @@ index c124268..e86fe28 100644
    bool processingOptimizations{false};
    uint64_t revision{1};
  
-@@ -56,7 +64,7 @@ struct OutputPreferences
+@@ -56,7 +66,7 @@ struct OutputPreferences
          panel == other.panel && gamut == other.gamut && optimizedDV == other.optimizedDV &&
          masterIPT == other.masterIPT && allowMasterFallback == other.allowMasterFallback &&
          disableL2Trims == other.disableL2Trims &&
@@ -82,7 +84,7 @@ index c124268..e86fe28 100644
          processingOptimizations == other.processingOptimizations &&
          std::bit_cast<uint64_t>(peak) == std::bit_cast<uint64_t>(other.peak);
    }
-@@ -143,6 +151,8 @@ inline OutputPreferences FrameOutputSettings()
+@@ -143,6 +153,8 @@ inline OutputPreferences FrameOutputSettings()
      next.gamut = settings->GetInt("dvbridge.tvgamut");
      next.felUpscaling = settings->GetInt("dvbridge.felupscaling");
      next.masterIPT = settings->GetInt("dvbridge.masteroutput")==1;
@@ -92,7 +94,7 @@ index c124268..e86fe28 100644
      next.disableL2Trims = settings->GetBool("dvbridge.disablel2");
    }
 diff --git a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
-index 42954cd..b712df0 100644
+index 42954cd..74e2a50 100644
 --- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
 @@ -9,6 +9,7 @@
@@ -111,7 +113,7 @@ index 42954cd..b712df0 100644
  #include <iomanip>
  #include <cmath>
  #include <iterator>
-@@ -998,6 +1000,19 @@ CVideoPlayerVideo::EOutputState CVideoPlayerVideo::OutputPicture(const VideoPict
+@@ -998,6 +1000,21 @@ CVideoPlayerVideo::EOutputState CVideoPlayerVideo::OutputPicture(const VideoPict
        const int skipped = m_renderManager.GetSkippedFrames();
        const bool reset = m_iDroppedFrames < m_diagnosticDropped || skipped < m_diagnosticSkipped;
        // Native counters are aggregated, not a decoder-versus-renderer attribution.
@@ -125,8 +127,10 @@ index 42954cd..b712df0 100644
 +        lastFrames[i] = total;
 +      }
 +      static const char* const pipelines[]{"cb1-gles", "yblod-vulkan", "yblod-opencl"};
-+      CLog::Log(LOGINFO, "DVBridge playback engine: pipeline={} frame_ms={:.2f} presented_cb1={} presented_vulkan={} presented_opencl={}",
-+          pipelines[std::clamp(DVBRIDGE::presentedPipeline.load(), 0, 2)], DVBRIDGE::presentedFrameMs.load(),
++      const int pipeline = std::clamp(DVBRIDGE::presentedPipeline.load(), 0, 2);
++      CLog::Log(LOGINFO, "DVBridge playback engine: pipeline={}{} frame_ms={:.2f} presented_cb1={} presented_vulkan={} presented_opencl={}",
++          pipelines[pipeline], pipeline ? (DVBRIDGE::presentedDirect.load() ? "-direct" : "-copy") : "",
++          DVBRIDGE::presentedFrameMs.load(),
 +          frames[0], frames[1], frames[2]);
        CLog::Log(LOGINFO, "DVBridge playback health: interval_ms={} output_attempts={} source_fps={:.3f} speed={} stalled={} pts_s={:.3f} drop_total={} skip_total={} drop_delta={} skip_delta={} counters_reset={} video_queue_pct={} video_queue_s={:.3f} bitrate_mbps={:.2f} render_avg_pct={} transitions={} pts_valid={} (speed 1000=normal; attempts are not display flips)",
            elapsed, m_diagnosticPictures, m_fFrameRate, m_speed, m_stalled.load(),
@@ -147,7 +151,7 @@ index ba0fb42..43984a6 100644
      list(APPEND SOURCES HDR10AISource.cpp)
      list(APPEND HEADERS HDR10AISource.h)
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
-index 3f4b8dc..684cefd 100644
+index 3f4b8dc..cc98123 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 @@ -1,5 +1,6 @@
@@ -341,7 +345,7 @@ index 3f4b8dc..684cefd 100644
    if (imported->scaled)
    {
      layer.planes[0] = imported->scaled->plane;
-@@ -2128,7 +2253,18 @@ void CDVBridgeGLES::CountPresentation(bool committed)
+@@ -2128,7 +2253,19 @@ void CDVBridgeGLES::CountPresentation(bool committed)
  bool CDVBridgeGLES::Presented(bool success)
  {
    if (m_live) return Presented(success,m_submission);
@@ -354,6 +358,7 @@ index 3f4b8dc..684cefd 100644
 +  if (committed)
 +  {
 +    DVBRIDGE::presentedPipeline.store(yblod ? (m_requested.masterEngine == 2 ? 2 : 1) : 0);
++    DVBRIDGE::presentedDirect.store(yblod && m_yblod && m_yblod->Direct());
 +    ++DVBRIDGE::presentedFrames[yblod ? (m_requested.masterEngine == 2 ? 2 : 1) : 0];
 +    DVBRIDGE::presentedFrameMs.store(yblod && m_yblod ? m_yblod->FrameMs() :
 +        m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE ? m_cb1FrameMs : -1.0);
@@ -361,7 +366,7 @@ index 3f4b8dc..684cefd 100644
    CountPresentation(committed);
    if (!committed && m_prepared) Failure("presentation");
    if (committed)
-@@ -2179,12 +2315,22 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+@@ -2179,12 +2316,23 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
        hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
        m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
        m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
@@ -379,6 +384,7 @@ index 3f4b8dc..684cefd 100644
 +  if (committed)
 +  {
 +    DVBRIDGE::presentedPipeline.store(yblod ? (m_requested.masterEngine == 2 ? 2 : 1) : 0);
++    DVBRIDGE::presentedDirect.store(yblod && m_yblod && m_yblod->Direct());
 +    ++DVBRIDGE::presentedFrames[yblod ? (m_requested.masterEngine == 2 ? 2 : 1) : 0];
 +    DVBRIDGE::presentedFrameMs.store(yblod && m_yblod ? m_yblod->FrameMs() :
 +        m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE ? m_cb1FrameMs : -1.0);
@@ -925,10 +931,10 @@ index 0000000..382e8d7
 +}
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
 new file mode 100644
-index 0000000..6d73ca3
+index 0000000..6f29b0c
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,110 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#pragma once
 +#include <EGL/egl.h>
@@ -972,6 +978,7 @@ index 0000000..6d73ca3
 +  struct gbm_bo* Scanout() const;
 +  int ExportFence() const;
 +  void SetDirect(bool direct);
++  bool Direct() const { return m_direct; }
 +
 +private:
 +  bool Initialize(Backend backend, void* vaDisplay);
@@ -1055,10 +1062,18 @@ index da284ac..4e03846 100644
    {
      layer.fullRange = source.color_range != 0;
 diff --git a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp b/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
-index cb8ac6f..02a18c2 100644
+index cb8ac6f..abd2912 100644
 --- a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
 +++ b/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
-@@ -143,6 +143,14 @@ void CGUIDialogPlayerProcessInfo::RefreshInfo()
+@@ -28,6 +28,7 @@
+ #include "windowing/WinSystem.h"
+ #include "windowing/GraphicContext.h"
+ #include <algorithm>
++#include <cstring>
+ #include <cmath>
+ #endif
+ 
+@@ -143,6 +144,16 @@ void CGUIDialogPlayerProcessInfo::RefreshInfo()
          (data.output.felUpscaling == 2 ? "Reference GPU" : data.output.felUpscaling == 0 ? "VAAPI" : data.output.felUpscaling == 1 ? "Nearest neighbour (GPU)" : "") : "");
      SetProperty("DV.Mode", active ? VideoProcessingInfoGUI::Mode(data) : "Kodi default");
      SetProperty("DV.Engine", data.output.engine);
@@ -1066,7 +1081,9 @@ index cb8ac6f..02a18c2 100644
 +    const int pipeline = std::clamp(DVBRIDGE::presentedPipeline.load(), 0, 2);
 +    // Shown while CB1 outputs Dolby Vision (as the Mode row), whatever the engine version label.
 +    const bool dvActive = active & CDVPlaybackInfo::HDMI;
-+    SetProperty("DV.Pipeline", dvActive ? pipelines[pipeline] : "");
++    SetProperty("DV.Pipeline", !dvActive ? "" : pipeline == 0 ? std::string(pipelines[0]) :
++        StringUtils::Format("{}{}", std::string(pipelines[pipeline]).substr(0, std::strlen(pipelines[pipeline]) - 1),
++                            DVBRIDGE::presentedDirect.load() ? ", direct)" : ", copy)"));
 +    const double frameMs = DVBRIDGE::presentedFrameMs.load();
 +    SetProperty("DV.FrameTime", !dvActive || frameMs < 0 ? "" :
 +        StringUtils::Format("{:.2f} ms{}", frameMs, pipeline == 2 ? " (submit to finished)" : " GPU"));
