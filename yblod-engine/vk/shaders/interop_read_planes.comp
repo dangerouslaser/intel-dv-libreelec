@@ -1,0 +1,28 @@
+// Phase 1a interop check: the exact sample codes of an imported decoded
+// surface (luma + interleaved chroma planes), as yblod's kernels recover them
+// from UNORM reads (x65535 or x255, round to nearest even).
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(constant_id = 0) const uint TEN_BIT = 1;
+layout(binding = 0) uniform sampler2D luma;
+layout(binding = 1) uniform sampler2D chroma;
+layout(binding = 2, std430) writeonly buffer Out { uint16_t codes[]; };
+layout(push_constant) uniform Push { uint width, height; };
+
+uint code(float v) { return uint(roundEven(v * (TEN_BIT != 0 ? 65535.0 : 255.0))); }
+
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= width || p.y >= height)
+        return;
+    codes[p.y * width + p.x] = uint16_t(code(texelFetch(luma, ivec2(p), 0).r));
+    if (p.x < width / 2 && p.y < height / 2) {
+        vec2 c = texelFetch(chroma, ivec2(p), 0).rg;
+        uint base = width * height + 2 * (p.y * (width / 2) + p.x);
+        codes[base] = uint16_t(code(c.r));
+        codes[base + 1] = uint16_t(code(c.g));
+    }
+}

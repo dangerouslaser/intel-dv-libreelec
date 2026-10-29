@@ -1,0 +1,36 @@
+// single_polynomial_p010 (opencl_kernels.cl): one invocation per 2x2 luma
+// block; 10-bit codes -> 12-bit through one table per component.
+#version 460
+#include "dv_common.glsl"
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D luma;
+layout(binding = 1) uniform sampler2D chroma;
+layout(binding = 2, std430) readonly buffer Table { uint16_t table[]; };   // [3][1024]
+layout(binding = 3, std430) writeonly buffer OutY { uint16_t dy[]; };
+layout(binding = 4, std430) writeonly buffer OutU { uint16_t du[]; };
+layout(binding = 5, std430) writeonly buffer OutV { uint16_t dv[]; };
+layout(binding = 6, std430) buffer Error { uint error; };
+layout(push_constant) uniform Push { uint w, h, row_offset; };
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x, cy = gl_GlobalInvocationID.y + row_offset;
+    if (x >= w / 2 || cy >= h / 2)
+        return;
+    ivec2 p = ivec2(2 * x, 2 * cy);
+    uvec4 q = uvec4(unorm16(texelFetch(luma, p, 0).r), unorm16(texelFetch(luma, p + ivec2(1, 0), 0).r),
+                    unorm16(texelFetch(luma, p + ivec2(0, 1), 0).r), unorm16(texelFetch(luma, p + ivec2(1, 1), 0).r));
+    vec2 cf = texelFetch(chroma, ivec2(x, cy), 0).rg;
+    uvec2 c = uvec2(unorm16(cf.r), unorm16(cf.g));
+    if (((q.x | q.y | q.z | q.w | c.x | c.y) & 63u) != 0u)
+        atomicOr(error, 1u);
+    q >>= 6;
+    c >>= 6;
+    uint i = cy * 2 * w + x * 2, j = cy * (w / 2) + x;
+    dy[i] = table[q.x];
+    dy[i + 1] = table[q.y];
+    dy[i + w] = table[q.z];
+    dy[i + w + 1] = table[q.w];
+    du[j] = table[1024 + c.x];
+    dv[j] = table[2048 + c.y];
+}

@@ -123,6 +123,10 @@ else
   PKG_MESON_OPTS_TARGET+=" -Dgles1=disabled -Dgles2=disabled"
 fi
 
+# YBLOD: ANV and RADV only, for the Vulkan Dolby Vision engine (RADV links with
+# mesa-002's -lgcc: addrlib needs libgcc's __cpu_model).
+[ "${PROJECT}" = "Generic" ] && VULKAN_DRIVERS_MESA="$(for d in intel amd; do listcontains "${VULKAN_DRIVERS_MESA}" "${d}" && echo ${d}; done | xargs)"
+
 if [ "${VULKAN_SUPPORT}" = "yes" ]; then
   PKG_DEPENDS_TARGET+=" ${VULKAN} vulkan-tools ply:host"
   PKG_MESON_OPTS_TARGET+=" -Dvulkan-drivers=${VULKAN_DRIVERS_MESA// /,}"

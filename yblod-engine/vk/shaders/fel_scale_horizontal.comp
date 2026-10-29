@@ -1,0 +1,22 @@
+// scale_horizontal: the EL chroma upsampled horizontally (8-tap / nearest)
+// into a full chroma-resolution plane; samples over 1023 flag the frame.
+#version 460
+#define ERROR_OR(v) atomicOr(error, v)
+layout(binding = 2, std430) buffer Error { uint error; };
+#include "dv_common.glsl"
+layout(local_size_x = 64, local_size_y = 1) in;
+layout(binding = 0, std430) readonly buffer Src { uint16_t src[]; };
+layout(binding = 1, std430) writeonly buffer Dst { uint16_t dst[]; };
+layout(push_constant) uniform Push { uint w, h, nearest, row_offset; };
+HORIZONTAL(horizontal, src)
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y + row_offset;
+    if (x >= w || y >= h)
+        return;
+    uint v = horizontal(w / 2, x, y, nearest);
+    dst[y * w + x] = uint16_t(v);
+    if (v > 1023u)
+        atomicOr(error, 1u);
+}

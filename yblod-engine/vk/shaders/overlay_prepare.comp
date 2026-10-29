@@ -1,0 +1,109 @@
+// The overlay's preparation in one pass, one 16x16 workgroup per tile of the
+// region to redo: the pixel's RGBA (composited from mpv's subtitle parts and
+// the shell's OSD layer as overlay_compose did, or read from the test RGBA
+// buffer), its exact source-domain colour only if that RGBA changed (the key
+// cache, as the OpenCL engine's inline pixel cache), and the tile's word:
+// bit 0 any covered pixel, bit 1 one in its first column, bit 2 in its last
+// (the pack's chroma blend reads a block's neighbours x0-1 and x0+4).
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(constant_id = 0) const uint FROM_SOURCES = 1;   // 0: read `rgba_in` (tests)
+struct Part { int x, y; uint w, h, dw, dh, stride, offset, format, color, pad0, pad1; };
+layout(binding = 0, std430) readonly buffer RgbaIn { uint rgba_in[]; };
+layout(binding = 1, std430) readonly buffer Atlas { uint atlas[]; };
+layout(binding = 2, std430) readonly buffer Parts { Part parts[]; };
+layout(binding = 3, std430) readonly buffer Lists { uint lists[]; };
+layout(binding = 4) uniform sampler2D shell;
+layout(binding = 5, std430) buffer Keys { uint keys[]; };
+layout(binding = 6, std430) writeonly buffer Colours { vec4 colours[]; };
+layout(binding = 7, std430) writeonly buffer Tiles { uint tiles[]; };
+layout(binding = 8, std430) readonly buffer Coeff { float coeff[]; };
+layout(binding = 9, std430) buffer GuiError { uint gui_error; };
+layout(push_constant) uniform Push { uint w, h, has_shell, has_subs, tiles_x, tile_size; uvec2 origin; uint invalidate, flip; };
+#include "overlay_colour.glsl"
+
+uint atlas_byte(uint i) { return (atlas[i >> 2] >> (8u * (i & 3u))) & 255u; }
+
+vec4 bgra_at(Part p, uint x, uint y)
+{
+    uint i = p.offset + y * p.stride + 4u * x;
+    return vec4(atlas_byte(i + 2u), atlas_byte(i + 1u), atlas_byte(i), atlas_byte(i + 3u)) / 255.0;
+}
+
+vec4 part_sample(Part p, uint px, uint py)
+{
+    int lx = int(px) - p.x, ly = int(py) - p.y;
+    if (lx < 0 || ly < 0 || lx >= int(p.dw) || ly >= int(p.dh))
+        return vec4(0.0);
+    if (p.format == 1u) {   // libass: A8 coverage, colour 0xRRGGBBAA (AA = transparency)
+        float m = float(atlas_byte(p.offset + uint(ly) * p.stride + uint(lx))) / 255.0;
+        float a = m * float(255u - (p.color & 255u)) / 255.0;
+        vec3 c = vec3((p.color >> 24) & 255u, (p.color >> 16) & 255u, (p.color >> 8) & 255u) / 255.0;
+        return vec4(c * a, a);
+    }
+    // BGRA, premultiplied, scaled from w x h to dw x dh: bilinear
+    if (p.w == p.dw && p.h == p.dh)
+        return bgra_at(p, uint(lx), uint(ly));
+    vec2 s = (vec2(lx, ly) + 0.5) * vec2(p.w, p.h) / vec2(p.dw, p.dh) - 0.5;
+    vec2 f = fract(s);
+    ivec2 i0 = ivec2(floor(s)), hi = ivec2(p.w, p.h) - 1;
+    uvec2 a = uvec2(clamp(i0, ivec2(0), hi)), b = uvec2(clamp(i0 + 1, ivec2(0), hi));
+    vec4 top = mix(bgra_at(p, a.x, a.y), bgra_at(p, b.x, a.y), f.x);
+    vec4 bot = mix(bgra_at(p, a.x, b.y), bgra_at(p, b.x, b.y), f.x);
+    return mix(top, bot, f.y);
+}
+
+
+uint composed(uvec2 q)
+{
+    if (FROM_SOURCES == 0u)
+        return rgba_in[q.y * w + q.x];
+    vec4 dst = vec4(0.0);
+    if (has_subs != 0u) {
+        uint tile = (q.y / tile_size) * tiles_x + q.x / tile_size;
+        for (uint k = lists[tile]; k < lists[tile + 1u]; k++) {
+            vec4 src = part_sample(parts[lists[k]], q.x, q.y);
+            dst = src + dst * (1.0 - src.a);
+        }
+    }
+    if (has_shell != 0u) {
+        // flip: a GL framebuffer's texture, rows bottom first
+        vec2 at = vec2(q.x, flip != 0u ? h - 1u - q.y : q.y) + 0.5;
+        vec4 src = textureLod(shell, at / vec2(w, h), 0.0);
+        dst = src + dst * (1.0 - src.a);
+    }
+    uvec4 b = uvec4(round(clamp(dst, 0.0, 1.0) * 255.0));
+    b.rgb = min(b.rgb, uvec3(b.a));
+    return b.r | (b.g << 8) | (b.b << 16) | (b.a << 24);
+}
+
+shared uint tile_bits;
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u)
+        tile_bits = 0u;
+    barrier();
+    uvec2 q = gl_GlobalInvocationID.xy + origin;
+    bool inside = q.x < w && q.y < h;
+    if (inside) {
+        uint i = q.y * w + q.x, v = composed(q);
+        if (invalidate != 0u || keys[i] != v) {
+            vec4 c = vec4(0.0);
+            if ((v >> 24) != 0u &&
+                !overlay_source_colour(uvec4(v & 255u, (v >> 8) & 255u, (v >> 16) & 255u, v >> 24), c)) {
+                atomicOr(gui_error, 1u);
+                c = vec4(0.0);
+            }
+            colours[i] = c;
+            keys[i] = v;
+        }
+        if ((v >> 24) != 0u) {
+            uint lx = gl_LocalInvocationID.x;
+            atomicOr(tile_bits, 1u | (lx == 0u ? 2u : 0u) | (lx == 15u ? 4u : 0u));
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && inside)
+        tiles[(q.y / 16u) * ((w + 15u) / 16u) + q.x / 16u] = tile_bits;
+}

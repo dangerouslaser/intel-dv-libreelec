@@ -1,0 +1,197 @@
+// single_reshape.cl, as opencl_backend.c builds it: DV_RESHAPE_NARROW,
+// DV_RESHAPE_LUMA_TABLE, P010 or NV12 (DEPTH), ENTRY 0 the CCM centre-left
+// 4:2:0 kernel, 1 the full-height 4:2:2 candidate (DV_RESHAPE_422_EXPERIMENT,
+// LAZY_FEATURES), ORDER2 its DV_RESHAPE_ORDER2_CHROMA build.
+#version 460
+#define ERROR_OR(v) atomicOr(error, v)
+layout(binding = 7, std430) buffer Error { uint error; };
+#include "dv_common.glsl"
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(constant_id = 0) const uint ENTRY = 1;
+layout(constant_id = 1) const uint DEPTH = 10;
+layout(constant_id = 2) const uint ORDER2 = 0;
+layout(constant_id = 3) const uint LAZY = 1;     // DV_RESHAPE_LAZY_FEATURES (422 and NV12 builds)
+
+struct Piece { uint method, order; int64_t bias; int64_t coefficient[21]; };
+struct Curve { uint pivot_count; uint pivots[9]; Piece piece[8]; };
+layout(binding = 0) uniform sampler2D ytex;
+layout(binding = 1) uniform sampler2D uvtex;
+layout(binding = 2, std430) readonly buffer Mapping { uint base_depth, denominator; Curve curve[3]; };
+layout(binding = 3, std430) writeonly buffer OutY { uint16_t out_y[]; };
+layout(binding = 4, std430) writeonly buffer OutU { uint16_t out_cb[]; };
+layout(binding = 5, std430) writeonly buffer OutV { uint16_t out_cr[]; };
+layout(binding = 6, std430) readonly buffer LumaTable { uint16_t luma_table[]; };
+layout(push_constant) uniform Push { uvec4 narrow_mask; uint w, h, policy, row_offset; };
+
+const uint SHIFT = DEPTH == 8u ? 0u : 6u, PADDING = DEPTH == 8u ? 0u : 63u;
+uint fetch(float v) { return DEPTH == 8u ? unorm8(v) : unorm16(v); }
+
+uvec4 reshape_add(uvec4 a, uvec4 b)
+{
+    uvec4 value; uint carry = 0u;
+    for (uint i = 0; i < 4; ++i) {
+        uint t = a[i] + b[i], u = t + carry;
+        carry = uint(t < a[i]) | uint(u < t);
+        value[i] = u;
+    }
+    return value;
+}
+uvec4 reshape_product(int64_t coefficient, uint feature)
+{
+    uint64_t bits = uint64_t(coefficient), lo = uint64_t(uint(bits)) * uint64_t(feature);
+    uint64_t hi = (bits >> 32) * uint64_t(feature) + (lo >> 32);
+    uint top = uint(hi >> 32) - (coefficient < 0 ? feature : 0u);
+    return uvec4(uint(lo), uint(hi), top, (top & 0x80000000u) != 0u ? 0xffffffffu : 0u);
+}
+
+uvec3 reshape_tuple(uvec3 input_, uint components)
+{
+    uint bits = base_depth, q = 2u * bits, s[3] = uint[3](input_.x, input_.y, input_.z), piece[3];
+    for (uint c = 0; c < 3; ++c) {
+        if (s[c] >= (1u << bits)) {
+            atomicOr(error, 1u);
+            return uvec3(0);
+        }
+        piece[c] = curve[c].pivot_count - 2u;
+        for (uint pp = 0; pp + 1u < curve[c].pivot_count; ++pp)
+            if (s[c] < curve[c].pivots[pp + 1u]) { piece[c] = pp; break; }
+        s[c] = clamp(s[c], curve[c].pivots[0], curve[c].pivots[curve[c].pivot_count - 1u]);
+    }
+    uint feature[3][7];
+    uint required_order = 3u;
+    if (LAZY != 0u) {
+        required_order = 0u;
+        for (uint c = 0; c < 3; ++c)
+            if ((components & (1u << c)) != 0u && curve[c].piece[piece[c]].method != 0u)
+                required_order = max(required_order, curve[c].piece[piece[c]].order);
+    }
+    for (uint c = 0; c < 3; ++c) feature[0][c] = s[c] << bits;
+    feature[0][3] = s[0] * s[1]; feature[0][4] = s[0] * s[2]; feature[0][5] = s[1] * s[2];
+    feature[0][6] = uint((uint64_t(feature[0][3]) * uint64_t(feature[0][2])) >> q);
+    if (required_order >= 2u) {
+        for (uint c = 0; c < 3; ++c) feature[1][c] = s[c] * s[c];
+        for (uint k = 3; k < 7; ++k) feature[1][k] = uint((uint64_t(feature[0][k]) * uint64_t(feature[0][k])) >> q);
+    }
+    if (required_order >= 3u)
+        for (uint k = 0; k < 7; ++k) feature[2][k] = uint((uint64_t(feature[0][k]) * uint64_t(feature[1][k])) >> q);
+    uvec3 result = uvec3(0);
+    for (uint c = 0; c < 3; ++c) {
+        if ((components & (1u << c)) == 0u)
+            continue;
+        uint pc = piece[c];
+        uint method = curve[c].piece[pc].method, order = curve[c].piece[pc].order;
+        if ((narrow_mask[c] & (1u << pc)) != 0u) {
+            int64_t value = curve[c].piece[pc].bias * int64_t(1u << q);
+            if (method == 0u) {
+                value += curve[c].piece[pc].coefficient[0] * int64_t(s[c] << bits);
+                if (order == 2u) value += curve[c].piece[pc].coefficient[1] * int64_t(s[c] * s[c]);
+            } else
+                for (uint o = 0; o < order; ++o)
+                    for (uint k = 0; k < 7; ++k)
+                        value += curve[c].piece[pc].coefficient[o * 7u + k] * int64_t(feature[o][k]);
+            uint mapped = value < 0 ? 0u : uint(min(uint64_t(value) >> (denominator + q - 16u), uint64_t(65535)));
+            result[c] = min((mapped + 8u) >> 4, 4095u);
+            continue;
+        }
+        uvec4 value = reshape_product(curve[c].piece[pc].bias, 1u << q);
+        if (method == 0u) {
+            value = reshape_add(value, reshape_product(curve[c].piece[pc].coefficient[0], s[c] << bits));
+            if (order == 2u) value = reshape_add(value, reshape_product(curve[c].piece[pc].coefficient[1], s[c] * s[c]));
+        } else
+            for (uint o = 0; o < order; ++o)
+                for (uint k = 0; k < 7; ++k)
+                    value = reshape_add(value, reshape_product(curve[c].piece[pc].coefficient[o * 7u + k], feature[o][k]));
+        uint mapped = 0u;
+        if ((value.w & 0x80000000u) == 0u)
+            mapped = value.w != 0u || value.z != 0u ? 65535u
+                   : uint(min(((uint64_t(value.y) << 32) | uint64_t(value.x)) >> (denominator + q - 16u), uint64_t(65535)));
+        result[c] = min((mapped + 8u) >> 4, 4095u);
+    }
+    return result;
+}
+
+uvec3 reshape_order2_chroma(uvec3 input_)
+{
+    if (any(greaterThan(input_, uvec3(1023u)))) {
+        atomicOr(error, 1u);
+        return uvec3(0);
+    }
+    uint s[3];
+    for (uint c = 0; c < 3; ++c)
+        s[c] = clamp(input_[c], curve[c].pivots[0], curve[c].pivots[curve[c].pivot_count - 1u]);
+    uint f[2][7];
+    for (uint c = 0; c < 3; ++c) { f[0][c] = s[c] << 10; f[1][c] = s[c] * s[c]; }
+    f[0][3] = s[0] * s[1]; f[0][4] = s[0] * s[2]; f[0][5] = s[1] * s[2];
+    f[0][6] = uint((uint64_t(f[0][3]) * uint64_t(f[0][2])) >> 20);
+    for (uint k = 3; k < 7; ++k) f[1][k] = uint((uint64_t(f[0][k]) * uint64_t(f[0][k])) >> 20);
+    uvec3 result = uvec3(0);
+    for (uint c = 1; c < 3; ++c) {
+        int64_t value = curve[c].piece[0].bias * int64_t(1048576);
+        for (uint o = 0; o < 2; ++o)
+            for (uint k = 0; k < 7; ++k)
+                value += curve[c].piece[0].coefficient[o * 7u + k] * int64_t(f[o][k]);
+        uint mapped = value < 0 ? 0u : uint(min(uint64_t(value) >> (denominator + 4u), uint64_t(65535)));
+        result[c] = min((mapped + 8u) >> 4, 4095u);
+    }
+    return result;
+}
+
+uint reshape_y(ivec2 pos)
+{
+    uint raw = fetch(texelFetch(ytex, pos, 0).r);
+    if ((raw & PADDING) != 0u) atomicOr(error, 1u);
+    return raw >> SHIFT;
+}
+uvec2 fetch_uv(ivec2 pos)
+{
+    vec2 v = texelFetch(uvtex, pos, 0).rg;
+    return uvec2(fetch(v.r), fetch(v.g));
+}
+
+void main()
+{
+    if (base_depth != DEPTH) { atomicOr(error, 2u); return; }
+    uint cx = gl_GlobalInvocationID.x;
+    if (ENTRY == 0u) {
+        uint cy = gl_GlobalInvocationID.y + row_offset;
+        if (cx >= w / 2 || cy >= h / 2) return;
+        uint x = 2 * cx, row = 2 * cy;
+        uvec2 raw = fetch_uv(ivec2(cx, cy));
+        if (((raw.x | raw.y) & PADDING) != 0u) atomicOr(error, 1u);
+        uvec2 chroma = raw >> SHIFT;
+        uint guide_rows[2];
+        for (uint dy = 0; dy < 2; ++dy) {
+            uint a = reshape_y(ivec2(x, row + dy)), b = reshape_y(ivec2(x + 1, row + dy));
+            uint left = reshape_y(ivec2(x != 0u ? x - 1 : 0u, row + dy));
+            guide_rows[dy] = (left + 2u * a + b + 2u) >> 2;
+            uint i = (row + dy) * w + x;
+            out_y[i] = luma_table[a];
+            out_y[i + 1] = luma_table[b];
+        }
+        uint guide = (guide_rows[0] + guide_rows[1] + 1u) >> 1;
+        uvec3 result = reshape_tuple(uvec3(guide, chroma), 6u);
+        uint i = cy * (w / 2) + cx;
+        out_cb[i] = uint16_t(result.y);
+        out_cr[i] = uint16_t(result.z);
+    } else {
+        uint row = gl_GlobalInvocationID.y + row_offset;
+        if (cx >= w / 2 || row >= h) return;
+        if (policy > 1u) { atomicOr(error, 2u); return; }
+        uint cy = row / 2, top, bottom, weight;
+        if (policy == 1u) { top = cy; bottom = min(cy + 1, h / 2 - 1); weight = (row & 1u) != 0u ? 2u : 4u; }
+        else if ((row & 1u) != 0u) { top = cy; bottom = min(cy + 1, h / 2 - 1); weight = 3u; }
+        else { top = cy != 0u ? cy - 1 : 0u; bottom = cy; weight = 1u; }
+        uvec2 first = fetch_uv(ivec2(cx, top)), second = fetch_uv(ivec2(cx, bottom));
+        if (((first.x | first.y | second.x | second.y) & PADDING) != 0u) atomicOr(error, 1u);
+        uvec2 chroma = (weight * (first >> SHIFT) + (4u - weight) * (second >> SHIFT) + 2u) >> 2;
+        uint x = 2 * cx, a = reshape_y(ivec2(x, row)), b = reshape_y(ivec2(x + 1, row));
+        uint left = reshape_y(ivec2(x != 0u ? x - 1 : 0u, row));
+        uint guide = (left + 2u * a + b + 2u) >> 2, i = row * w + x;
+        out_y[i] = luma_table[a];
+        out_y[i + 1] = luma_table[b];
+        uvec3 result = ORDER2 != 0u ? reshape_order2_chroma(uvec3(guide, chroma)) : reshape_tuple(uvec3(guide, chroma), 6u);
+        i = row * (w / 2) + cx;
+        out_cb[i] = uint16_t(result.y);
+        out_cr[i] = uint16_t(result.z);
+    }
+}

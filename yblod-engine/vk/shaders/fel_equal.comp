@@ -1,0 +1,71 @@
+// Full-size EL (el_spatial_resampling_flag 0), DV_INPUT_P010, by STAGE:
+// 0 luma_equal (BL + EL luma), 1 phase (one EL chroma channel), 2 phase_guide
+// (BL chroma phase + guide).
+#version 460
+#define ERROR_OR(v) atomicOr(error, v)
+layout(binding = 7, std430) buffer Error { uint error; };
+#include "dv_common.glsl"
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(constant_id = 0) const uint STAGE = 0;
+layout(binding = 0) uniform sampler2D img0;    // 0: BL luma; 1: EL chroma; 2: BL luma
+layout(binding = 1) uniform sampler2D img1;    // 0: EL luma; 2: BL chroma
+layout(binding = 2, std430) readonly buffer Mt { uint16_t mt[]; };
+layout(binding = 3, std430) readonly buffer Rt { int rt[]; };
+layout(binding = 4, std430) writeonly buffer O0 { uint16_t out0[]; };  // 0: Y; 1: ES; 2: BP (Cb then Cr)
+layout(binding = 5, std430) writeonly buffer O1 { uint16_t out1[]; };  // 2: guide
+layout(binding = 6, std430) readonly buffer Unused { uint unused_word; };
+layout(push_constant) uniform Push { uint w, h, method, channel, row_offset; };
+
+uint phase_at(uint x, uint y)
+{
+    int v = 0;
+    if (method == 0u)
+        v = 3 * int(input_sample(img0, x, y, channel)) + int(input_sample(img0, x, uint(edge(int(y) + 1, h)), channel));
+    else {
+        const int c[4] = int[4](-9, 111, 29, -3);
+        for (int k = 0; k < 4; k++)
+            v += c[k] * int(input_sample(img0, x, uint(edge(int(y) + k - 1, h)), channel));
+    }
+    return min(rounded(v, method != 0u ? 128 : 4), 1023u);
+}
+
+uint guide_sample(uint gx, uint gy)
+{
+    uint x = gx * 2, y = gy * 2, a[2];
+    for (uint r = 0; r < 2; r++)
+        a[r] = (input_sample(img0, uint(edge(int(x) - 1, w)), y + r, 0u) + 2u * input_sample(img0, x, y + r, 0u) +
+                input_sample(img0, uint(edge(int(x) + 1, w)), y + r, 0u) + 2u) / 4u;
+    return (a[0] + a[1] + 1u) / 2u;
+}
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y + row_offset;
+    if (STAGE == 0u) {
+        if (x >= w || y >= h)
+            return;
+        uint base = input_sample(img0, x, y, 0u), enh = input_sample(img1, x, y, 0u);
+        if ((base | enh) > 1023u) {
+            atomicOr(error, 1u);
+            return;
+        }
+        int64_t total = int64_t(uint(mt[base])) + int64_t(rt[enh]);
+        if (overflows32(total)) {
+            atomicOr(error, 2u);
+            return;
+        }
+        out0[y * w + x] = uint16_t(recon12(total));
+    } else if (STAGE == 1u) {
+        if (x >= w || y >= h)
+            return;
+        out0[y * w + x] = uint16_t(phase_at(x, y));
+    } else {
+        if (x >= w / 2 || y >= h / 2)
+            return;
+        uint i = y * (w / 2) + x;
+        uvec2 v = phase_uv_sample(img1, x, int(y), h / 2, method);
+        out0[i] = uint16_t(v.x);
+        out0[(w / 2) * (h / 2) + i] = uint16_t(v.y);
+        out1[i] = uint16_t(guide_sample(x, y));
+    }
+}

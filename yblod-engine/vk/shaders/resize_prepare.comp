@@ -1,0 +1,24 @@
+// source_resize_prepare (source_tunnel.cl, SOURCE_RESIZE_MAPS): per
+// destination row, the luma and chroma source rows and float weight.
+#version 460
+layout(local_size_x = 64) in;
+layout(binding = 0, std430) writeonly buffer YMap { uvec4 ymap[]; };
+layout(push_constant) uniform Push { uvec2 source, dest; uint top_left; };
+
+uvec4 axis_map(int numerator, uint denominator, uint count)
+{
+    uint p = uint(clamp(numerator, 0, int((count - 1) * denominator)));
+    uint lo = p / denominator;
+    precise float weight = float(p % denominator) / float(denominator);
+    return uvec4(lo, min(lo + 1, count - 1), floatBitsToUint(weight), 0);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < dest.y) {
+        int numerator = int((2 * i + 1) * source.y) - int(dest.y);
+        ymap[2 * i] = axis_map(numerator, 2 * dest.y, source.y);
+        ymap[2 * i + 1] = axis_map(numerator - (top_left != 0u ? 0 : int(dest.y)), 4 * dest.y, source.y / 2);
+    }
+}

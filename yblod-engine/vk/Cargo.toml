@@ -1,0 +1,23 @@
+[package]
+name = "dv-engine-vk"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "yblod's Dolby Vision source-tunnel engine on Vulkan compute"
+publish = false
+
+[lib]
+name = "dv_engine_vk"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 2
+debug = 1
+panic = "abort"

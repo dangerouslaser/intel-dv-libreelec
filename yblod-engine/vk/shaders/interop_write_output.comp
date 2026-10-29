@@ -1,0 +1,15 @@
+// Phase 1a interop check: a known XRGB8888 pattern into a linear scanout BO
+// imported as a storage buffer (row stride in words).
+#version 460
+layout(local_size_x = 64, local_size_y = 4) in;
+layout(binding = 0, std430) writeonly buffer Out { uint pixels[]; };
+layout(push_constant) uniform Push { uint width, height, stride_words, seed; };
+
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= width || p.y >= height)
+        return;
+    uint v = (p.x * 2654435761u) ^ (p.y * 2246822519u) ^ seed;
+    pixels[p.y * stride_words + p.x] = (v & 0x00ffffffu) | 0xff000000u;
+}

@@ -9,7 +9,8 @@
     OPENGLES="mesa"
 
   # Vulkan implementation to use (vulkan-loader / no)
-    VULKAN="no"
+  # YBLOD: ANV and RADV for yblod-engine-vk, the Vulkan Dolby Vision engine
+    VULKAN="vulkan-loader"
 
   # Displayserver to use (weston / x11 / no)
     DISPLAYSERVER="no"

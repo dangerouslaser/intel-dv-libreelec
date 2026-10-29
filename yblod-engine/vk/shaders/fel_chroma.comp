@@ -1,0 +1,207 @@
+// Fused FEL pass A: one invocation per 4:2:0 chroma sample of a half-size-EL
+// frame, everything the staged chain computes for it in registers: the MMR
+// guide and BL chroma phase (luma_phase_guide), the EL chroma phase +
+// vertical (phase_vertical_uv) and horizontal (mmr64_lut_dual_horizontal /
+// scale_horizontal) upsampling, then the dual 64-bit MMR or, per channel,
+// the polynomial table add / mmr64_lut / mmr96 / mmr (128). Writes the 12-bit
+// Cb, Cr planes pass B packs.
+#version 460
+#define ERROR_OR(v) atomicOr(error, v)
+layout(binding = 10, std430) buffer Error { uint error; };
+#include "dv_common.glsl"
+layout(local_size_x = 64, local_size_y = 1) in;
+layout(binding = 0) uniform sampler2D bl_luma;
+layout(binding = 1) uniform sampler2D bl_uv;
+layout(binding = 2) uniform sampler2D el_uv;
+layout(binding = 3, std430) readonly buffer P { uint p[]; };              // [2][96]
+layout(binding = 4, std430) readonly buffer R { int rt[]; };              // [3][1024]
+layout(binding = 5, std430) readonly buffer L { int64_t table[]; };       // [2][3][1024]
+layout(binding = 6, std430) readonly buffer Cm { uint16_t cmap[]; };      // [2][1024] polynomial chroma
+layout(binding = 7, std430) writeonly buffer O0 { uint16_t out0[]; };
+layout(binding = 8, std430) writeonly buffer O1 { uint16_t out1[]; };
+layout(binding = 9, std430) readonly buffer Unused { uint unused_word; };
+layout(push_constant) uniform Push { uint w, h, method, nearest, dual, kind0, kind1, row_offset; };
+
+// --- the EL chroma at chroma resolution -------------------------------------
+uvec2 el_vertical(uint xe, uint cy)
+{
+    uint ch4 = h / 4, r = cy / 2;
+    if (nearest != 0u)
+        return input_uv(el_uv, xe, r);
+    uvec2 b = phase_uv_sample(el_uv, xe, int(r), ch4, method);
+    if ((cy & 1u) == 0u) {
+        uvec2 a = phase_uv_sample(el_uv, xe, int(r) - 1, ch4, method);
+        return (64u * a + 192u * b + 128u) / 256u;
+    }
+    uvec2 c = phase_uv_sample(el_uv, xe, int(r) + 1, ch4, method);
+    return (192u * b + 64u * c + 128u) / 256u;
+}
+
+// Annex B (not nearest): the workgroup's EL chroma, upsampled vertically,
+// once per column it needs (its 32 + the 8-tap halo), as el_vertical computes it.
+shared uvec2 el_tile[39];
+int el_tile_base;   // the EL chroma column of el_tile[0]
+
+uvec2 el_chroma_tiled(uint cx)
+{
+    int j = int(cx / 2) - el_tile_base;
+    if ((cx & 1u) == 0u)
+        return el_tile[j];
+    const int taps[8] = int[8](22, 94, -524, 2456, 2456, -524, 94, 22);
+    ivec2 v = ivec2(0);
+    for (int k = 0; k < 8; k++)
+        v += taps[k] * ivec2(el_tile[j + k - 3]);
+    return uvec2(rounded(v.x, 4096), rounded(v.y, 4096));
+}
+
+uvec2 el_chroma(uint cx, uint cy)
+{
+    uint ix = cx / 2, ew = w / 4;
+    if ((cx & 1u) == 0u || nearest != 0u)
+        return el_vertical(ix, cy);
+    const int taps[8] = int[8](22, 94, -524, 2456, 2456, -524, 94, 22);
+    ivec2 v = ivec2(0);
+    for (int k = 0; k < 8; k++)
+        v += taps[k] * ivec2(el_vertical(uint(edge(int(ix) + k - 3, ew)), cy));
+    return uvec2(rounded(v.x, 4096), rounded(v.y, 4096));
+}
+
+// --- MMR (opencl_kernels.cl) ---------------------------------------------------
+uvec2 multiply(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); return uvec2(lo, hi); }
+uint feature_product(uint a, uint b) { uvec2 q = multiply(a, b); return (q.x >> 20) | (q.y << 12); }
+uvec4 add128(uvec4 a, uvec4 b)
+{
+    uvec4 o; uint carry = 0u;
+    for (uint k = 0; k < 4; k++) { uint s = a[k] + b[k], c = uint(s < a[k]), v = s + carry; carry = c | uint(v < s); o[k] = v; }
+    return o;
+}
+uvec4 product128(uvec4 a, uint b)
+{
+    uvec4 o; uint carry = 0u;
+    for (uint k = 0; k < 4; k++) { uvec2 q = multiply(a[k], b); uint v = q.x + carry; carry = q.y + uint(v < q.x); o[k] = v; }
+    return o;
+}
+uvec4 load4(uint i) { return uvec4(p[i], p[i + 1], p[i + 2], p[i + 3]); }
+uvec3 add96(uvec3 a, uvec3 b)
+{
+    uint x = a.x + b.x, c = uint(x < a.x), t = a.y + b.y, y = t + c;
+    return uvec3(x, y, a.z + b.z + (uint(t < a.y) | uint(y < t)));
+}
+uvec3 product96(uint offset, uint b)
+{
+    uint a0 = p[offset], a1 = p[offset + 1];
+    uvec2 lo = multiply(a0, b), hi = multiply(a1, b);
+    uint middle = lo.y + hi.x;
+    return uvec3(lo.x, middle, hi.y + uint(middle < lo.y) - ((a1 & 0x80000000u) != 0u ? b : 0u));
+}
+uint feature(uint k, uvec3 s, uint xy)
+{
+    return k == 0u ? s.x << 10 : k == 1u ? s.y << 10 : k == 2u ? s.z << 10 :
+           k == 3u ? xy : k == 4u ? s.x * s.z : k == 5u ? s.y * s.z : feature_product(xy, s.z << 10);
+}
+// signed 32 x feature: the 64-bit route's eligibility proof bounds every
+// feature below 2^20, so a 32x32->64 signed multiply is exact.
+int64_t term(uint coefficient, uint f)
+{
+    int hi, lo;
+    imulExtended(int(coefficient), int(f), hi, lo);
+    return packInt2x32(ivec2(lo, hi));
+}
+
+// One channel's Q16 mapping, kind 3 (64-bit LUT), 2 (96-bit) or 1 (128-bit).
+uint mmr_mapped(uint P0, uint T0, uint kind, uvec3 s)
+{
+    s.x = clamp(s.x, p[P0 + 2], p[P0 + 3]);
+    s.y = clamp(s.y, p[P0 + 4], p[P0 + 5]);
+    s.z = clamp(s.z, p[P0 + 6], p[P0 + 7]);
+    uint xy = s.x * s.y, shift = p[P0 + 1] + 4u;
+    if (kind == 3u) {
+        int64_t v = int64_t((uint64_t(p[P0 + 9]) << 32) | uint64_t(p[P0 + 8]));
+        v += table[T0 + s.x]; v += table[T0 + 1024u + s.y]; v += table[T0 + 2048u + s.z];
+        for (uint k = 3; k < 7; k++) {
+            uint a = feature(k, s, xy);
+            v += term(p[P0 + 12 + 4 * k], a);
+            if (p[P0] > 1u) {
+                uint b = feature_product(a, a);
+                v += term(p[P0 + 40 + 4 * k], b);
+                if (p[P0] > 2u) v += term(p[P0 + 68 + 4 * k], feature_product(a, b));
+            }
+        }
+        return v < 0 ? 0u : uint(min(uint64_t(v) >> shift, uint64_t(65535)));
+    }
+    uvec4 v;
+    if (kind == 2u) {
+        uvec3 a3 = uvec3(p[P0 + 8], p[P0 + 9], p[P0 + 10]);
+        for (uint k = 0; k < 7; k++) {
+            uint a = feature(k, s, xy);
+            a3 = add96(a3, product96(P0 + 12 + 4 * k, a));
+            if (p[P0] > 1u) {
+                uint b = feature_product(a, a);
+                a3 = add96(a3, product96(P0 + 40 + 4 * k, b));
+                if (p[P0] > 2u) a3 = add96(a3, product96(P0 + 68 + 4 * k, feature_product(a, b)));
+            }
+        }
+        v = uvec4(a3, (a3.z & 0x80000000u) != 0u ? 0xffffffffu : 0u);
+    } else {
+        v = load4(P0 + 8);
+        for (uint k = 0; k < 7; k++) {
+            uint a = feature(k, s, xy);
+            if (p[P0] > 0u) v = add128(v, product128(load4(P0 + 12 + 4 * k), a));
+            if (p[P0] > 1u) {
+                uint b = feature_product(a, a);
+                v = add128(v, product128(load4(P0 + 40 + 4 * k), b));
+                if (p[P0] > 2u) v = add128(v, product128(load4(P0 + 68 + 4 * k), feature_product(a, b)));
+            }
+        }
+    }
+    if ((v.w & 0x80000000u) != 0u) return 0u;
+    if (v.w != 0u || v.z != 0u || v.y >= (1u << (shift - 16u))) return 65535u;
+    return shift < 32u ? ((v.x >> shift) | (v.y << (32u - shift))) : (shift == 32u ? v.y : (v.y >> (shift - 32u)));
+}
+
+void main()
+{
+    uint cx = gl_GlobalInvocationID.x, cy = gl_GlobalInvocationID.y + row_offset;
+    uint cw = w / 2, chh = h / 2;
+    if (nearest == 0u) {
+        // Before any return: the barrier needs the whole workgroup.
+        el_tile_base = int(gl_WorkGroupID.x * 32u) - 3;
+        for (uint j = gl_LocalInvocationID.x; j < 39u; j += 64u)
+            el_tile[j] = cy < chh ? el_vertical(uint(edge(el_tile_base + int(j), w / 4)), cy) : uvec2(0);
+        barrier();
+    }
+    if (cx >= cw || cy >= chh)
+        return;
+    uint i = cy * cw + cx;
+    // luma_phase_guide's BL half
+    uvec2 phase = phase_uv_sample(bl_uv, cx, int(cy), chh, method);
+    uint x0 = cx * 2, left = uint(edge(int(x0) - 1, w)), a[2];
+    for (uint r = 0; r < 2; ++r) {
+        uint y = cy * 2 + r;
+        a[r] = (input_sample(bl_luma, left, y, 0u) + 2u * input_sample(bl_luma, x0, y, 0u) +
+                input_sample(bl_luma, x0 + 1, y, 0u) + 2u) / 4u;
+    }
+    uint guide = (a[0] + a[1] + 1u) / 2u;
+    uvec2 el = nearest == 0u ? el_chroma_tiled(cx) : el_chroma(cx, cy);
+    uvec3 s = uvec3(guide, phase.x, phase.y);
+    uint kinds[2] = uint[2](kind0, kind1);
+    for (uint channel = 0; channel < 2; ++channel) {
+        uint e = el[channel];
+        if (e > 1023u) {                // reported, clamped
+            atomicOr(error, 1u);
+            e = 1023u;
+        }
+        uint m;
+        if (kinds[channel] == 0u) {     // polynomial chroma: luma_equal's table add
+            m = uint(cmap[channel * 1024u + phase[channel]]);
+        } else
+            m = mmr_mapped(channel * 96u, channel * 3072u, dual != 0u ? 3u : kinds[channel], s);
+        int64_t total = int64_t(m) + int64_t(rt[(1u + channel) * 1024u + e]);
+        if (overflows32(total)) {
+            atomicOr(error, 2u);
+            continue;
+        }
+        uint16_t value = uint16_t(recon12(total));
+        if (channel != 0u) out1[i] = value; else out0[i] = value;
+    }
+}

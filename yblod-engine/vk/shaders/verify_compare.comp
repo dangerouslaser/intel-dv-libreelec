@@ -1,0 +1,21 @@
+// DVVK_VERIFY: the frame's output against the reference (staged
+// reconstruction, overlay_prepare's cache made afresh) word by word: how many
+// pixels differ, and the first (y * w + x).
+#version 460
+layout(local_size_x = 64, local_size_y = 1) in;
+layout(binding = 0, std430) readonly buffer Output { uint shown[]; };
+layout(binding = 1, std430) readonly buffer Reference { uint reference[]; };
+layout(binding = 2, std430) buffer Result { uint differing; uint first; };
+layout(push_constant) uniform Push { uint stride_words, w, h; };
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+    if (x >= w || y >= h)
+        return;
+    uint i = y * stride_words + x;
+    if (shown[i] != reference[i]) {
+        atomicAdd(differing, 1u);
+        atomicMin(first, y * w + x);
+    }
+}

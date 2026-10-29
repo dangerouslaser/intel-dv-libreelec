@@ -1,0 +1,42 @@
+// fel_vertical_pair with 32-bit stores: two adjacent EL columns per
+// invocation, so each output row is one dword store instead of two 16-bit
+// ones (Mesa's Intel backend issues 16-bit SSBO accesses as byte-scattered
+// messages), and one error atomic per invocation instead of one per sample.
+// Same arithmetic as fel_vertical_pair; w (the EL luma width) is even.
+#version 460
+uint err_bits = 0u;
+#define ERROR_OR(v) err_bits |= (v)
+#include "dv_common.glsl"
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, std430) writeonly buffer Dst { uint dst[]; };   // pairs of 16-bit samples
+layout(binding = 2, std430) buffer Error { uint error; };
+layout(push_constant) uniform Push { uint w, h, channel, nearest, row_offset; };
+
+uvec2 rows(uint x, uint y)
+{
+    if (nearest != 0u) {
+        uint v = input_sample(src, x, y, channel);
+        return uvec2(v);
+    }
+    int s0 = int(input_sample(src, x, uint(edge(int(y) - 2, h)), channel));
+    int s1 = int(input_sample(src, x, uint(edge(int(y) - 1, h)), channel));
+    int s2 = int(input_sample(src, x, y, channel));
+    int s3 = int(input_sample(src, x, uint(edge(int(y) + 1, h)), channel));
+    int s4 = int(input_sample(src, x, uint(edge(int(y) + 2, h)), channel));
+    return uvec2(rounded(-3 * s0 + 29 * s1 + 111 * s2 - 9 * s3, 128),
+                 rounded(-9 * s1 + 111 * s2 + 29 * s3 - 3 * s4, 128));
+}
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x * 2u, y = gl_GlobalInvocationID.y + row_offset;
+    if (x >= w || y >= h)
+        return;
+    uvec2 a = rows(x, y), b = rows(x + 1u, y);
+    // rounded() saturates to 16 bits, as the 16-bit stores did
+    dst[(y * 2u * w + x) / 2u] = (a.x & 0xffffu) | (b.x << 16);
+    dst[((y * 2u + 1u) * w + x) / 2u] = (a.y & 0xffffu) | (b.y << 16);
+    if (err_bits != 0u)
+        atomicOr(error, err_bits);
+}

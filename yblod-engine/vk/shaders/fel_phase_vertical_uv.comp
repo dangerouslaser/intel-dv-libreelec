@@ -1,0 +1,35 @@
+// phase_vertical_uv (DV_INPUT_P010): the EL chroma (RG, w x h) chroma-phase
+// filtered, then upsampled vertically 64/192 (or repeated, nearest): Cb -> V,
+// Cr -> VP, each w x 2h.
+#version 460
+#define ERROR_OR(v) atomicOr(error, v)
+layout(binding = 3, std430) buffer Error { uint error; };
+#include "dv_common.glsl"
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, std430) writeonly buffer Cb { uint16_t cb[]; };
+layout(binding = 2, std430) writeonly buffer Cr { uint16_t cr[]; };
+layout(push_constant) uniform Push { uint w, h, method, nearest, row_offset; };
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y + row_offset;
+    if (x >= w || y >= h)
+        return;
+    if (nearest != 0u) {
+        uvec2 v = input_uv(src, x, y);
+        cb[y * 2 * w + x] = uint16_t(v.x);
+        cb[(y * 2 + 1) * w + x] = uint16_t(v.x);
+        cr[y * 2 * w + x] = uint16_t(v.y);
+        cr[(y * 2 + 1) * w + x] = uint16_t(v.y);
+        return;
+    }
+    uvec2 a = phase_uv_sample(src, x, int(y) - 1, h, method);
+    uvec2 b = phase_uv_sample(src, x, int(y), h, method);
+    uvec2 c = phase_uv_sample(src, x, int(y) + 1, h, method);
+    uvec2 even = (64u * a + 192u * b + 128u) / 256u, odd = (192u * b + 64u * c + 128u) / 256u;
+    cb[y * 2 * w + x] = uint16_t(even.x);
+    cr[y * 2 * w + x] = uint16_t(even.y);
+    cb[(y * 2 + 1) * w + x] = uint16_t(odd.x);
+    cr[(y * 2 + 1) * w + x] = uint16_t(odd.y);
+}

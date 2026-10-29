@@ -1,0 +1,91 @@
+// mmr64_lut_dual_horizontal: both chroma MMRs (exact signed 64-bit, univariate
+// LUTs for the first-order single-channel terms), the EL chroma upsampled
+// horizontally on the fly, residuals added -> 12-bit Cb, Cr. One invocation
+// per even/odd pair of a chroma row (`width` wide).
+#version 460
+#define ERROR_OR(v) atomicOr(error, v)
+layout(binding = 11, std430) buffer Error { uint error; };
+#include "dv_common.glsl"
+layout(local_size_x = 64, local_size_y = 1) in;
+layout(constant_id = 0) const uint HORIZONTAL_FUSED = 1;   // 0: mmr64_lut_dual (EL planes already scaled)
+layout(binding = 0, std430) readonly buffer Y { uint16_t yg[]; };      // guide
+layout(binding = 1, std430) readonly buffer B { uint16_t bphase[]; };  // BL Cb then Cr phase
+layout(binding = 2, std430) readonly buffer E0 { uint16_t el0[]; };
+layout(binding = 3, std430) readonly buffer E1 { uint16_t el1[]; };
+layout(binding = 4, std430) readonly buffer P { uint p[]; };           // [2][96]
+layout(binding = 5, std430) readonly buffer R { int rt[]; };           // [3][1024]
+layout(binding = 6, std430) writeonly buffer O0 { uint16_t out0[]; };
+layout(binding = 7, std430) writeonly buffer O1 { uint16_t out1[]; };
+layout(binding = 8, std430) readonly buffer L { int64_t table[]; };    // [2][3][1024]
+layout(push_constant) uniform Push { uint width, rows, nearest, row_offset; };
+HORIZONTAL(horizontal0, el0)
+HORIZONTAL(horizontal1, el1)
+
+uint feature_product(uint a, uint b)
+{
+    uint hi, lo;
+    umulExtended(a, b, hi, lo);
+    return (lo >> 20) | (hi << 12);
+}
+int64_t constant64(uint base) { return int64_t((uint64_t(p[base + 9]) << 32) | uint64_t(p[base + 8])); }
+int64_t term(uint coefficient, uint feature) { return int64_t(int(coefficient)) * int64_t(uint64_t(feature)); }
+
+void mmr64_dual_pixel(uint i, uvec2 enhancement)
+{
+    const uint P0 = 0u, P1 = 96u;
+    uvec3 s = uvec3(yg[i], bphase[i], bphase[width * rows + i]);
+    s.x = clamp(s.x, p[P0 + 2], p[P0 + 3]);
+    s.y = clamp(s.y, p[P0 + 4], p[P0 + 5]);
+    s.z = clamp(s.z, p[P0 + 6], p[P0 + 7]);
+    int64_t v0 = constant64(P0), v1 = constant64(P1);
+    v0 += table[s.x]; v0 += table[1024u + s.y]; v0 += table[2048u + s.z];
+    v1 += table[3072u + s.x]; v1 += table[4096u + s.y]; v1 += table[5120u + s.z];
+    uint xy = s.x * s.y;
+    for (uint k = 3; k < 7; k++) {
+        uint a = k == 3u ? xy : k == 4u ? s.x * s.z : k == 5u ? s.y * s.z : feature_product(xy, s.z << 10);
+        v0 += term(p[P0 + 12 + 4 * k], a);
+        v1 += term(p[P1 + 12 + 4 * k], a);
+        if (p[P0] > 1u || p[P1] > 1u) {
+            uint b = feature_product(a, a);
+            if (p[P0] > 1u) v0 += term(p[P0 + 40 + 4 * k], b);
+            if (p[P1] > 1u) v1 += term(p[P1 + 40 + 4 * k], b);
+            if (p[P0] > 2u || p[P1] > 2u) {
+                uint c = feature_product(a, b);
+                if (p[P0] > 2u) v0 += term(p[P0 + 68 + 4 * k], c);
+                if (p[P1] > 2u) v1 += term(p[P1 + 68 + 4 * k], c);
+            }
+        }
+    }
+    for (uint channel = 0; channel < 2; ++channel) {
+        uint el = enhancement[channel];
+        if (el > 1023u) {               // reported, clamped
+            atomicOr(error, 1u);
+            el = 1023u;
+        }
+        int64_t v = channel != 0u ? v1 : v0;
+        uint shift = (channel != 0u ? p[P1 + 1] : p[P0 + 1]) + 4u;
+        uint m = v < 0 ? 0u : uint(min(uint64_t(v) >> shift, uint64_t(65535)));
+        int r = rt[(1u + channel) * 1024u + el];
+        int64_t total = int64_t(m) + int64_t(r);
+        if (overflows32(total)) {
+            atomicOr(error, 2u);
+            continue;
+        }
+        uint16_t value = uint16_t(recon12(total));
+        if (channel != 0u) out1[i] = value; else out0[i] = value;
+    }
+}
+
+void main()
+{
+    uint pair = gl_GlobalInvocationID.x, row = gl_GlobalInvocationID.y + row_offset;
+    if (pair * 2u >= width || row >= rows)
+        return;
+    uint x = pair * 2u, first = row * width + x;
+    for (uint lane = 0; lane < 2; ++lane) {
+        uvec2 e = HORIZONTAL_FUSED != 0u
+            ? uvec2(horizontal0(width / 2, x + lane, row, nearest), horizontal1(width / 2, x + lane, row, nearest))
+            : uvec2(uint(el0[first + lane]), uint(el1[first + lane]));
+        mmr64_dual_pixel(first + lane, e);
+    }
+}

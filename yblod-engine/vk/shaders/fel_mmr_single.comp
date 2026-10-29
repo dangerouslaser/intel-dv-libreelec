@@ -1,0 +1,131 @@
+// One chroma channel's MMR (opencl_kernels.cl): KIND 0 mmr64_lut, 1 mmr96,
+// 2 mmr (128-bit, DV_MMR_STREAM's accumulate_stream). Inputs: guide (Y),
+// the BL chroma phase planes (Cb, Cr), this channel's scaled EL plane.
+#version 460
+#define ERROR_OR(v) atomicOr(error, v)
+layout(binding = 7, std430) buffer Error { uint error; };
+#include "dv_common.glsl"
+layout(local_size_x = 64, local_size_y = 1) in;
+layout(constant_id = 0) const uint KIND = 0;
+layout(binding = 0, std430) readonly buffer Y { uint16_t yg[]; };
+layout(binding = 1, std430) readonly buffer B { uint16_t bphase[]; };   // Cb plane then Cr plane
+layout(binding = 2, std430) readonly buffer E { uint16_t el[]; };
+layout(binding = 3, std430) readonly buffer P { uint p[]; };            // this channel's 96 words
+layout(binding = 4, std430) readonly buffer R { int rt[]; };            // this channel's 1024
+layout(binding = 5, std430) writeonly buffer O { uint16_t outp[]; };
+layout(binding = 6, std430) readonly buffer L { int64_t table[]; };     // this channel's [3][1024]
+layout(push_constant) uniform Push { uint width, rows, row_offset; };
+
+uvec2 multiply(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); return uvec2(lo, hi); }
+uint feature_product(uint a, uint b) { uvec2 q = multiply(a, b); return (q.x >> 20) | (q.y << 12); }
+uvec4 add128(uvec4 a, uvec4 b)
+{
+    uvec4 o; uint carry = 0u;
+    for (uint k = 0; k < 4; k++) {
+        uint s = a[k] + b[k], c = uint(s < a[k]), v = s + carry;
+        carry = c | uint(v < s);
+        o[k] = v;
+    }
+    return o;
+}
+uvec4 product128(uvec4 a, uint b)
+{
+    uvec4 o; uint carry = 0u;
+    for (uint k = 0; k < 4; k++) {
+        uvec2 q = multiply(a[k], b);
+        uint v = q.x + carry;
+        carry = q.y + uint(v < q.x);
+        o[k] = v;
+    }
+    return o;
+}
+uvec4 load4(uint i) { return uvec4(p[i], p[i + 1], p[i + 2], p[i + 3]); }
+uvec3 add96(uvec3 a, uvec3 b)
+{
+    uint x = a.x + b.x, c = uint(x < a.x), t = a.y + b.y, y = t + c;
+    uint carry = uint(t < a.y) | uint(y < t);
+    return uvec3(x, y, a.z + b.z + carry);
+}
+uvec3 product96(uint offset, uint b)
+{
+    uint a0 = p[offset], a1 = p[offset + 1];
+    uvec2 lo = multiply(a0, b), hi = multiply(a1, b);
+    uint middle = lo.y + hi.x;
+    uint top = hi.y + uint(middle < lo.y) - ((a1 & 0x80000000u) != 0u ? b : 0u);
+    return uvec3(lo.x, middle, top);
+}
+uint feature(uint k, uvec3 s, uint xy)
+{
+    return k == 0u ? s.x << 10 : k == 1u ? s.y << 10 : k == 2u ? s.z << 10 :
+           k == 3u ? xy : k == 4u ? s.x * s.z : k == 5u ? s.y * s.z : feature_product(xy, s.z << 10);
+}
+
+uint mapped(uvec3 s)
+{
+    s.x = clamp(s.x, p[2], p[3]);
+    s.y = clamp(s.y, p[4], p[5]);
+    s.z = clamp(s.z, p[6], p[7]);
+    uint xy = s.x * s.y, shift = p[1] + 4u;
+    if (KIND == 0u) {
+        int64_t v = int64_t((uint64_t(p[9]) << 32) | uint64_t(p[8]));
+        v += table[s.x]; v += table[1024u + s.y]; v += table[2048u + s.z];
+        for (uint k = 3; k < 7; k++) {
+            uint a = feature(k, s, xy);
+            v += int64_t(int(p[12 + 4 * k])) * int64_t(uint64_t(a));
+            if (p[0] > 1u) {
+                uint b = feature_product(a, a);
+                v += int64_t(int(p[40 + 4 * k])) * int64_t(uint64_t(b));
+                if (p[0] > 2u) v += int64_t(int(p[68 + 4 * k])) * int64_t(uint64_t(feature_product(a, b)));
+            }
+        }
+        return v < 0 ? 0u : uint(min(uint64_t(v) >> shift, uint64_t(65535)));
+    }
+    uvec4 v;
+    if (KIND == 1u) {
+        uvec3 a3 = uvec3(p[8], p[9], p[10]);
+        for (uint k = 0; k < 7; k++) {
+            uint a = feature(k, s, xy);
+            a3 = add96(a3, product96(12 + 4 * k, a));
+            if (p[0] > 1u) {
+                uint b = feature_product(a, a);
+                a3 = add96(a3, product96(40 + 4 * k, b));
+                if (p[0] > 2u) a3 = add96(a3, product96(68 + 4 * k, feature_product(a, b)));
+            }
+        }
+        v = uvec4(a3, (a3.z & 0x80000000u) != 0u ? 0xffffffffu : 0u);
+    } else {
+        v = load4(8);
+        for (uint k = 0; k < 7; k++) {
+            uint a = feature(k, s, xy);
+            if (p[0] > 0u) v = add128(v, product128(load4(12 + 4 * k), a));
+            if (p[0] > 1u) {
+                uint b = feature_product(a, a);
+                v = add128(v, product128(load4(40 + 4 * k), b));
+                if (p[0] > 2u) v = add128(v, product128(load4(68 + 4 * k), feature_product(a, b)));
+            }
+        }
+    }
+    if ((v.w & 0x80000000u) != 0u) return 0u;
+    if (v.w != 0u || v.z != 0u || v.y >= (1u << (shift - 16u))) return 65535u;
+    return shift < 32u ? ((v.x >> shift) | (v.y << (32u - shift))) : (shift == 32u ? v.y : (v.y >> (shift - 32u)));
+}
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x, row = gl_GlobalInvocationID.y + row_offset;
+    if (x >= width || row >= rows)
+        return;
+    uint i = row * width + x;
+    uint e = uint(el[i]);
+    if (e > 1023u) {            // reported, clamped
+        atomicOr(error, 1u);
+        e = 1023u;
+    }
+    uint m = mapped(uvec3(yg[i], bphase[i], bphase[width * rows + i]));
+    int64_t total = int64_t(m) + int64_t(rt[e]);
+    if (overflows32(total)) {
+        atomicOr(error, 2u);
+        return;
+    }
+    outp[i] = uint16_t(recon12(total));
+}

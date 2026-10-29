@@ -1,0 +1,30 @@
+// vertical_pair (DV_INPUT_P010): the EL luma (w x h, half size) upsampled
+// vertically, 4-tap {-3,29,111,-9}/128 (or rows repeated, nearest) -> w x 2h.
+#version 460
+#define ERROR_OR(v) atomicOr(error, v)
+layout(binding = 2, std430) buffer Error { uint error; };
+#include "dv_common.glsl"
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, std430) writeonly buffer Dst { uint16_t dst[]; };
+layout(push_constant) uniform Push { uint w, h, channel, nearest, row_offset; };
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y + row_offset;
+    if (x >= w || y >= h)
+        return;
+    if (nearest != 0u) {
+        uint16_t v = uint16_t(input_sample(src, x, y, channel));
+        dst[y * 2 * w + x] = v;
+        dst[(y * 2 + 1) * w + x] = v;
+        return;
+    }
+    int s0 = int(input_sample(src, x, uint(edge(int(y) - 2, h)), channel));
+    int s1 = int(input_sample(src, x, uint(edge(int(y) - 1, h)), channel));
+    int s2 = int(input_sample(src, x, y, channel));
+    int s3 = int(input_sample(src, x, uint(edge(int(y) + 1, h)), channel));
+    int s4 = int(input_sample(src, x, uint(edge(int(y) + 2, h)), channel));
+    dst[y * 2 * w + x] = uint16_t(rounded(-3 * s0 + 29 * s1 + 111 * s2 - 9 * s3, 128));
+    dst[(y * 2 + 1) * w + x] = uint16_t(rounded(-9 * s1 + 111 * s2 + 29 * s3 - 3 * s4, 128));
+}

@@ -1,0 +1,32 @@
+// luma_equal (planar), as reconstruct_impl reuses it for polynomial chroma:
+// Q16 mapping of the BL sample + residual of the EL sample -> 12-bit.
+#version 460
+#define ERROR_OR(v) atomicOr(error, v)
+layout(binding = 5, std430) buffer Error { uint error; };
+#include "dv_common.glsl"
+layout(local_size_x = 64, local_size_y = 1) in;
+layout(binding = 0, std430) readonly buffer Bl { uint16_t bl[]; };
+layout(binding = 1, std430) readonly buffer El { uint16_t el[]; };
+layout(binding = 2, std430) readonly buffer Mt { uint16_t mt[]; };
+layout(binding = 3, std430) readonly buffer Rt { int rt[]; };
+layout(binding = 4, std430) writeonly buffer Out { uint16_t outp[]; };
+layout(push_constant) uniform Push { uint w, h, row_offset; };
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y + row_offset, i = y * w + x;
+    if (x >= w || y >= h)
+        return;
+    uint base = uint(bl[i]), enh = uint(el[i]);
+    if ((base | enh) > 1023u) {         // reported, clamped
+        atomicOr(error, 1u);
+        base = min(base, 1023u);
+        enh = min(enh, 1023u);
+    }
+    int64_t total = int64_t(uint(mt[base])) + int64_t(rt[enh]);
+    if (overflows32(total)) {
+        atomicOr(error, 2u);
+        return;
+    }
+    outp[i] = uint16_t(recon12(total));
+}
