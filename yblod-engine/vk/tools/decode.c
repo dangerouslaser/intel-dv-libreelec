@@ -1,5 +1,6 @@
 /* See decode.h. */
 #include "decode.h"
+#include <stdlib.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/opt.h>
 #include <stdio.h>
@@ -27,7 +28,10 @@ static AVCodecContext *open_decoder(struct dv_decoder *d, const AVCodecParameter
         return NULL;
     c->hw_device_ctx = av_buffer_ref(d->device);
     c->get_format = pick_vaapi;
-    c->extra_hw_frames = 24;
+    /* Frames the caller may hold at once beyond the decoder's own (more for
+     * dvvk-mr-compare --throughput's preloaded batch). */
+    const char *extra = getenv("DV_EXTRA_HW_FRAMES");
+    c->extra_hw_frames = extra ? atoi(extra) : 24;
     c->pkt_timebase = d->time_base;
     if (avcodec_open2(c, codec, NULL) < 0)
         return NULL;

@@ -17,6 +17,13 @@
  *                       its production settings, /usr/lib/kodi/native-dv.env)
  *     --only cb1|vk     time one engine alone (no comparison; vk = YBLOD's)
  *     --warmup N        frames left out of the timing (default 12)
+ *     --throughput S    no comparison: decode --preload frames first, then run
+ *                       each engine (CB1, then YBLOD's) flat out over them for S
+ *                       seconds, pipelined as in playback (Vulkan: three frames
+ *                       in flight; CB1: GL queued, finished at the end; OpenCL:
+ *                       drained per picture, as Kodi drives it). Reports frames
+ *                       per second and CPU time per frame.
+ *     --preload N       frames decoded for --throughput (default 48)
  *     --overlay         a GUI layer as Kodi gives CB1 its native overlay (a test
  *                       pattern, Kodi's transfer LUTs): off for frames 1-6, the
  *                       whole raster for 7-30, a subtitle area for 31-42, then
@@ -68,6 +75,8 @@ static struct {
     int (*create)(int, void *, dvvk_engine **);
     int (*set_output)(dvvk_engine *, uint32_t, int, uint32_t);
     int (*render_sync)(dvvk_engine *, const dvvk_frame *, uint32_t *);
+    int (*submit)(dvvk_engine *, const dvvk_frame *, uint64_t *);
+    int (*wait)(dvvk_engine *, uint64_t, uint64_t);
     int (*set_overlay_ex)(dvvk_engine *, const dvvk_dmabuf *, uint64_t, uint32_t);
     int (*set_cb1_overlay)(dvvk_engine *, const dvvk_cb1_overlay *);
     void (*reset)(dvvk_engine *);
@@ -134,6 +143,8 @@ static int load_engine(void)
     vk.create = dlsym(lib, "dvvk_create");
     vk.set_output = dlsym(lib, "dvvk_set_output");
     vk.render_sync = dlsym(lib, "dvvk_render_sync");
+    vk.submit = dlsym(lib, "dvvk_submit");
+    vk.wait = dlsym(lib, "dvvk_wait");
     vk.set_overlay_ex = dlsym(lib, "dvvk_set_overlay_ex");
     vk.set_cb1_overlay = dlsym(lib, "dvvk_set_cb1_overlay");
     vk.reset = dlsym(lib, "dvvk_reset");
@@ -331,6 +342,13 @@ static void gui_pattern(uint8_t *rgba, int frame)
         }
 }
 
+static double cpu_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
 static const char *master_status(enum cb1_master_status s)
 {
     switch (s) {
@@ -356,7 +374,8 @@ static void dump_frame(const char *dir, const char *name, int n, const uint8_t *
 int main(int argc, char **argv)
 {
     int frames = 48, fel = 1, ipt = 0, contract = 1, flip = 0, warmup = 12;
-    int run_cb1 = 1, run_vk = 1, opencl = 0, overlay = 0;
+    int run_cb1 = 1, run_vk = 1, opencl = 0, overlay = 0, preload = 48;
+    double throughput = 0;
     double start = 0;
     const char *file = NULL, *dump = NULL, *node = "/dev/dri/renderD128";
     for (int i = 1; i < argc; i++) {
@@ -386,6 +405,10 @@ int main(int argc, char **argv)
             flip = 1;
         else if (!strcmp(argv[i], "--overlay"))
             overlay = 1;
+        else if (!strcmp(argv[i], "--throughput") && i + 1 < argc)
+            throughput = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--preload") && i + 1 < argc)
+            preload = atoi(argv[++i]);
         else
             file = argv[i];
     }
@@ -403,6 +426,12 @@ int main(int argc, char **argv)
     } else if (load_engine())
         return 1;
 
+    if (throughput > 0) {
+        /* the preloaded batch, beyond the decoder's own surfaces */
+        char extra[16];
+        snprintf(extra, sizeof(extra), "%d", preload + 8);
+        setenv("DV_EXTRA_HW_FRAMES", extra, 1);
+    }
     struct dv_decoder dec;
     if (dv_decoder_open(&dec, file, node, start) < 0) {
         fprintf(stderr, "decode: can't open %s\n", file);
@@ -487,6 +516,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "Vulkan engine didn't start\n");
         return 1;
     }
+    if (vke && throughput > 0) {
+        /* --throughput keeps a frame in flight on each of three outputs */
+        static struct bo more[2];
+        if (!vk.submit || !vk.wait || make_bo(gbm, &more[0]) || make_bo(gbm, &more[1]) ||
+            vk.set_output(vke, 1, more[0].fd, more[0].stride) || vk.set_output(vke, 2, more[1].fd, more[1].stride)) {
+            fprintf(stderr, "throughput: Vulkan outputs failed\n");
+            return 1;
+        }
+    }
 
     /* --overlay: the GUI layer both engines read (a GL texture on a linear bo,
      * as Kodi's GUI framebuffer is for CB1; its dmabuf for the Vulkan engine,
@@ -543,6 +581,131 @@ int main(int argc, char **argv)
         }
     }
     int visible_before = 0;
+
+    if (throughput > 0) {
+        /* Decoded first, so the video decoder isn't what is measured. */
+        struct dv_pair *batch = calloc((size_t)preload, sizeof(*batch));
+        int count = 0;
+        while (count < preload && dv_decoder_next(&dec, &batch[count]) == 1) {
+            struct dv_pair *q = &batch[count];
+            if (!q->dovi || q->bl->width > W || q->bl->height > H) {
+                dv_pair_free(q);
+                continue;
+            }
+            vaSyncSurface(dec.display, q->bl_surface);
+            if (fel && q->el)
+                vaSyncSurface(dec.display, q->el_surface);
+            count++;
+        }
+        if (!count) {
+            fprintf(stderr, "throughput: no Dolby Vision pictures decoded\n");
+            return 1;
+        }
+        /* Synthetic presentation times, steadily advancing (no refresh from a step back). */
+        AVRational rate = dec.fmt->streams[dec.stream]->avg_frame_rate;
+        double period = rate.num > 0 ? (double)rate.den / rate.num : 1.0 / 24;
+        printf("throughput: %d pictures preloaded (%dx%d, profile %d%s), %.0f s per engine\n", count,
+               batch[0].bl->width, batch[0].bl->height, dec.profile, fel && batch[0].el ? ", with EL" : "", throughput);
+        int status = 0;
+        for (int engine = 0; engine < 2; engine++) {
+            if ((engine == 0 && !run_cb1) || (engine == 1 && !run_vk))
+                continue;
+            const char *name = engine == 0 ? "cb1" : opencl ? "yblod-opencl" : "yblod-vulkan";
+            uint64_t tickets[3] = {0};
+            unsigned pid = 0;
+            long frames = 0, failed = 0;
+            double t0 = now_ms(), c0 = cpu_ms(), end = t0 + throughput * 1e3;
+            for (long i = 0; now_ms() < end; i++) {
+                struct dv_pair *q = &batch[i % count];
+                AVFrame *el = fel ? q->el : NULL;
+                unsigned w = (unsigned)q->bl->width, h = (unsigned)q->bl->height;
+                unsigned x = ((W - w) / 2) & ~1u, y = ((H - h) / 2) & ~1u;
+                const void *meta = q->dovi->data;
+                size_t meta_size = q->dovi->size;
+                double pts = i * period;
+                int ok = 0;
+                if (engine == 0) {
+                    struct dvbridge_gl_frame *blp = cb1_import(gl->gpu, q->bl, q->bl_surface, (int)w, (int)h), *elp = NULL;
+                    if (blp) {
+                        struct dvbridge_gl_frame bl = *blp, elf = {0};
+                        dvbridge_gl_frame_set_chroma(&bl, cb1_chroma(q->bl->chroma_location, dec.profile));
+                        bl.frame.enhancement_layer = NULL;
+                        if (el && (elp = cb1_import(gl->gpu, el, q->el_surface, el->width, el->height))) {
+                            elf = *elp;
+                            dvbridge_gl_frame_set_chroma(&elf, cb1_chroma(el->chroma_location, 7));
+                            bl.frame.enhancement_layer = &elf.frame;
+                        }
+                        struct dvbridge_geometry g = {.source_width = (int)w, .source_height = (int)h, .x = (int)x,
+                                                      .y = (int)y, .width = (int)w, .height = (int)h,
+                                                      .target_width = W, .target_height = H};
+                        dvbridge_renderer_set_optimized_dv(cb1, true);
+                        dvbridge_renderer_set_processing_optimizations(cb1, false);
+                        dvbridge_renderer_set_fel_nearest(cb1, el != NULL);
+                        dvbridge_renderer_set_overlay_visible(cb1, false);
+                        ok = (!el || elp) &&
+                             (ipt ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference)(
+                                 cb1, &bl.frame, meta, meta_size, pts, el ? pts : NAN, g, target, flip, NULL) ==
+                                 CB1_MASTER_READY;
+                        if (ok)
+                            dvbridge_render_commit(cb1);
+                        else
+                            dvbridge_renderer_reset(cb1);
+                    }
+                } else if (opencl) {
+                    int top_left = cb1_chroma(q->bl->chroma_location, dec.profile) == PL_CHROMA_TOP_LEFT;
+                    dv_source_geometry g = {.width = w, .height = h, .canvas_width = W, .canvas_height = H, .x = x, .y = y,
+                                            .chroma_siting = top_left ? DV_SOURCE_CHROMA_TOP_LEFT : DV_SOURCE_CHROMA_CENTER_LEFT,
+                                            .destination_width = w, .destination_height = h};
+                    dv_source_input in = {sizeof(in), DV_SOURCE_INPUT_P010, 10u};
+                    int64_t ticks = (int64_t)(pts * 1e6);
+                    int rv = cl.submit(ocl, q->bl_surface, el ? q->el_surface : 0xffffffffu, w, h, meta, meta_size,
+                                       (uint64_t)i + 1, ticks, &g, &in);
+                    if (!rv)
+                        rv = cl.present(ocl, (uint64_t)i + 1, ticks, pid, i == 0);
+                    ok = !cl.drain(ocl) && !rv;
+                } else {
+                    /* three outputs, a frame in flight on each, as Kodi's direct presentation */
+                    unsigned slot = (unsigned)(i % 3);
+                    if (tickets[slot] && vk.wait(vke, tickets[slot], UINT64_MAX) != 1)
+                        failed++;
+                    tickets[slot] = 0;
+                    int top_left = cb1_chroma(q->bl->chroma_location, dec.profile) == PL_CHROMA_TOP_LEFT;
+                    dvvk_frame f = {.plan = {.width = w, .height = h, .x = x, .y = y, .dw = w, .dh = h,
+                                             .chroma_top_left = (uint32_t)top_left, .has_el = el != NULL,
+                                             .el_scaler = 1, .fel = (uint32_t)fel, .packet_id = pid,
+                                             .refresh = i == 0, .pts = (int64_t)(pts * 1e6), .white_nits = 203.0,
+                                             .cb1_contract = (uint32_t)contract},
+                                    .bl_surface = q->bl_surface, .el_surface = el ? q->el_surface : 0xffffffffu,
+                                    .metadata = meta, .metadata_size = meta_size, .output = slot};
+                    ok = vk.submit(vke, &f, &tickets[slot]) == 0;
+                }
+                if (ok) {
+                    frames++;
+                    pid = (pid + 1) & 15;
+                } else if (++failed > 8) {
+                    fprintf(stderr, "throughput %s: pictures refused\n", name);
+                    status = 1;
+                    break;
+                }
+            }
+            /* everything submitted, finished */
+            if (engine == 0)
+                pl_gpu_finish(gl->gpu);
+            else if (!opencl)
+                for (int k = 0; k < 3; k++)
+                    if (tickets[k])
+                        vk.wait(vke, tickets[k], UINT64_MAX);
+            double elapsed = now_ms() - t0, cpu = cpu_ms() - c0;
+            printf("throughput %-13s %7.1f fps  %6.2f ms/frame  cpu %5.2f ms/frame  (%ld pictures in %.1f s%s)\n",
+                   name, frames * 1e3 / elapsed, elapsed / (frames ? frames : 1), cpu / (frames ? frames : 1),
+                   frames, elapsed / 1e3, failed ? ", some refused" : "");
+        }
+        for (int k = 0; k < count; k++)
+            dv_pair_free(&batch[k]);
+        free(batch);
+        dv_decoder_close(&dec);
+        return status;
+    }
 
     uint8_t *a = malloc((size_t)W * H * 4), *b = malloc((size_t)W * H * 4);
     unsigned packet_id = 0;
