@@ -1067,6 +1067,68 @@ index da284ac..4e03846 100644
    if (hdr10)
    {
      layer.fullRange = source.color_range != 0;
+diff --git a/xbmc/dialogs/DVPlaybackModes.cpp b/xbmc/dialogs/DVPlaybackModes.cpp
+index 1512193..1b48796 100644
+--- a/xbmc/dialogs/DVPlaybackModes.cpp
++++ b/xbmc/dialogs/DVPlaybackModes.cpp
+@@ -129,6 +129,12 @@ bool CDVPlaybackModes::ShowMenu()
+     dialog->SetProperty("CB1.PlaybackModes",true);
+     dialog->Open();
+     dialog->SetProperty("CB1.PlaybackModes", CVariant{});
++    if (dialog->GetProperty("CB1.NextEngines").asBoolean())
++    {
++      // A third O: the Master Reference engines (Dolby Vision sources).
++      dialog->SetProperty("CB1.NextEngines", CVariant{});
++      return hdr10Source || ShowEngineMenu();
++    }
+     if (!dialog->IsConfirmed()) return true;
+     const int selected=dialog->GetSelectedItem();
+     if (selected<0 || selected>=count) return true;
+@@ -160,6 +166,32 @@ bool CDVPlaybackModes::ShowMenu()
+   }
+ }
+ 
++bool CDVPlaybackModes::ShowEngineMenu()
++{
++  auto* dialog=CServiceBroker::GetGUI()->GetWindowManager().GetWindow<CGUIDialogSelect>(WINDOW_DIALOG_SELECT);
++  const auto component=CServiceBroker::GetSettingsComponent();
++  const auto settings=component ? component->GetSettings() : nullptr;
++  if (!dialog || !settings) return false;
++  const auto& strings=CServiceBroker::GetResourcesComponent().GetLocalizeStrings();
++  dialog->Reset();
++  dialog->SetHeading(40960);
++  for (int id : {40962,40963,40964}) dialog->Add(strings.Get(id));
++  const int current=settings->GetInt("dvbridge.masterengine");
++  dialog->SetSelected(current>=0 && current<=2 ? current : 0);
++  dialog->SetProperty("CB1.Engines",true);
++  dialog->Open();
++  dialog->SetProperty("CB1.Engines", CVariant{});
++  if (!dialog->IsConfirmed()) return true;
++  const int selected=dialog->GetSelectedItem();
++  if (selected<0 || selected>2 || selected==current) return true;
++  {
++    std::lock_guard lock(DVBRIDGE::OutputSettingsMutex());
++    if (!settings->SetInt("dvbridge.masterengine",selected)) return true;
++  }
++  settings->Save();
++  return true;
++}
++
+ void CDVPlaybackModes::OnSettingAction(const std::shared_ptr<const CSetting>& setting)
+ {
+   if (setting && setting->GetId()=="dvbridge.configureprofile") ConfigureProfile();
+diff --git a/xbmc/dialogs/DVPlaybackModes.h b/xbmc/dialogs/DVPlaybackModes.h
+index 658cd79..120539b 100644
+--- a/xbmc/dialogs/DVPlaybackModes.h
++++ b/xbmc/dialogs/DVPlaybackModes.h
+@@ -9,6 +9,7 @@ public:
+   static CDVPlaybackModes& GetInstance();
+   static bool MenuEnabled();
+   static bool ShowMenu();
++  static bool ShowEngineMenu();
+   static bool ConfigureProfile();
+   void OnSettingAction(const std::shared_ptr<const CSetting>& setting) override;
+ };
 diff --git a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp b/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
 index cb8ac6f..abd2912 100644
 --- a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
@@ -1096,6 +1158,23 @@ index cb8ac6f..abd2912 100644
      SetProperty("DV.Circuit", data.output.circuit);
      SetProperty("DV.Reconstruction", "");
      SetProperty("DV.AIL1", "");
+diff --git a/xbmc/dialogs/GUIDialogSelect.cpp b/xbmc/dialogs/GUIDialogSelect.cpp
+index 1cd17e2..35130b4 100644
+--- a/xbmc/dialogs/GUIDialogSelect.cpp
++++ b/xbmc/dialogs/GUIDialogSelect.cpp
+@@ -55,8 +55,11 @@ bool CGUIDialogSelect::OnAction(const CAction& action)
+ #ifdef HAVE_DVBRIDGE
+   if (action.GetID() == ACTION_PLAYER_PROCESS_INFO)
+   {
+-    if (GetProperty("CB1.PlaybackModes").asBoolean())
++    // O in the output modes moves on to the Master Reference engines; in those it closes.
++    if (GetProperty("CB1.PlaybackModes").asBoolean() || GetProperty("CB1.Engines").asBoolean())
+     {
++      if (GetProperty("CB1.PlaybackModes").asBoolean())
++        SetProperty("CB1.NextEngines", true);
+       m_bConfirmed = false;
+       Close(true);
+     }
 diff --git a/xbmc/windowing/gbm/GBMUtils.cpp b/xbmc/windowing/gbm/GBMUtils.cpp
 index 949d36b..473f95d 100644
 --- a/xbmc/windowing/gbm/GBMUtils.cpp
