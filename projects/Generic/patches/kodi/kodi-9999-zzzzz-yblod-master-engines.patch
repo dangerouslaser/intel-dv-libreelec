@@ -939,18 +939,20 @@ index da284ac..4e03846 100644
    {
      layer.fullRange = source.color_range != 0;
 diff --git a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp b/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
-index cb8ac6f..b9b7d15 100644
+index cb8ac6f..02a18c2 100644
 --- a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
 +++ b/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
-@@ -143,6 +143,12 @@ void CGUIDialogPlayerProcessInfo::RefreshInfo()
+@@ -143,6 +143,14 @@ void CGUIDialogPlayerProcessInfo::RefreshInfo()
          (data.output.felUpscaling == 2 ? "Reference GPU" : data.output.felUpscaling == 0 ? "VAAPI" : data.output.felUpscaling == 1 ? "Nearest neighbour (GPU)" : "") : "");
      SetProperty("DV.Mode", active ? VideoProcessingInfoGUI::Mode(data) : "Kodi default");
      SetProperty("DV.Engine", data.output.engine);
 +    static const char* const pipelines[]{"CB1 (OpenGL ES)", "YBLOD (Vulkan)", "YBLOD (OpenCL)"};
 +    const int pipeline = std::clamp(DVBRIDGE::presentedPipeline.load(), 0, 2);
-+    SetProperty("DV.Pipeline", data.output.engine.empty() ? "" : pipelines[pipeline]);
++    // Shown while CB1 outputs Dolby Vision (as the Mode row), whatever the engine version label.
++    const bool dvActive = active & CDVPlaybackInfo::HDMI;
++    SetProperty("DV.Pipeline", dvActive ? pipelines[pipeline] : "");
 +    const double frameMs = DVBRIDGE::presentedFrameMs.load();
-+    SetProperty("DV.FrameTime", data.output.engine.empty() || frameMs < 0 ? "" :
++    SetProperty("DV.FrameTime", !dvActive || frameMs < 0 ? "" :
 +        StringUtils::Format("{:.2f} ms{}", frameMs, pipeline == 2 ? " (submit to finished)" : " GPU"));
      SetProperty("DV.Circuit", data.output.circuit);
      SetProperty("DV.Reconstruction", "");
