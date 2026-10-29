@@ -88,7 +88,7 @@ index ba0fb42..5a175d4 100644
      list(APPEND SOURCES HDR10AISource.cpp)
      list(APPEND HEADERS HDR10AISource.h)
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
-index 3f4b8dc..dfb4b9b 100644
+index 3f4b8dc..dfa93a2 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 @@ -1,5 +1,6 @@
@@ -115,15 +115,19 @@ index 3f4b8dc..dfb4b9b 100644
  #include <deque>
  #include <filesystem>
  #include <GLES3/gl3.h>
-@@ -1039,6 +1043,7 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::TakeFELPrefetch(const std::shared_ptr<
+@@ -1037,8 +1041,11 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::TakeFELPrefetch(const std::shared_ptr<
+   return FrameStatus::Ready;
+ }
  
++CDVBridgeGLES::CDVBridgeGLES() = default;
++
  CDVBridgeGLES::~CDVBridgeGLES()
  {
 +  m_yblod.reset();
    cb1_hdr10plus_analysis_destroy(&m_hdr10plusAnalysis);
    ClearFELPrefetch();
    Summary("closed");
-@@ -1206,6 +1211,30 @@ void CDVBridgeGLES::Reset()
+@@ -1206,6 +1213,30 @@ void CDVBridgeGLES::Reset()
  #endif
    m_pendingHDR10Fallback = 0;
    dvbridge_renderer_reset(m_renderer);
@@ -154,7 +158,7 @@ index 3f4b8dc..dfb4b9b 100644
  }
  
  bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
-@@ -1255,7 +1284,10 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+@@ -1255,7 +1286,10 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
    if (!m_hdr10 && allowPacked && (m_directUsable || m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE) &&
        m_scanout)
    {
@@ -166,7 +170,7 @@ index 3f4b8dc..dfb4b9b 100644
      {
        auto renderMaster=m_requested.masterIPT ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference;
        const auto status=renderMaster(m_renderer,&bl.frame,metadata.Data(),metadata.Size(),
-@@ -1825,6 +1857,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+@@ -1825,6 +1859,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
    layer.pts = static_cast<double>(enhancement->pts);
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -179,7 +183,7 @@ index 3f4b8dc..dfb4b9b 100644
    for (int i = 0; i < 3; ++i)
      layer.planes[i] = imported.planes[i];
    bool result = Prepare(base, &layer, metadata, geometry, allowPacked);
-@@ -2020,6 +2058,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
+@@ -2020,6 +2060,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
    layer.lease = imported;
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -192,7 +196,7 @@ index 3f4b8dc..dfb4b9b 100644
    if (imported->scaled)
    {
      layer.planes[0] = imported->scaled->plane;
-@@ -2128,6 +2172,8 @@ void CDVBridgeGLES::CountPresentation(bool committed)
+@@ -2128,6 +2174,8 @@ void CDVBridgeGLES::CountPresentation(bool committed)
  bool CDVBridgeGLES::Presented(bool success)
  {
    if (m_live) return Presented(success,m_submission);
@@ -201,7 +205,7 @@ index 3f4b8dc..dfb4b9b 100644
    const bool committed = success && m_prepared && m_packed && dvbridge_render_commit(m_renderer);
    CountPresentation(committed);
    if (!committed && m_prepared) Failure("presentation");
-@@ -2179,6 +2225,8 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+@@ -2179,6 +2227,8 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
        hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
        m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
        m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
@@ -211,7 +215,7 @@ index 3f4b8dc..dfb4b9b 100644
        (m_advanced ? (m_dvPolicyActive ?
            dvbridge_render_dv_policy_commit(m_renderer,&submission.identity,
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
-index ade1f23..91d6e07 100644
+index ade1f23..e84ac9f 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
 @@ -6,6 +6,7 @@
@@ -240,6 +244,15 @@ index ade1f23..91d6e07 100644
    };
    enum class FrameStatus { Failed, Pending, Busy, Ready, Reused, Unsupported };
  #ifdef CB1_HAS_HDR10_AI
+@@ -191,7 +196,7 @@ public:
+       const DVBRIDGE::OutputPreferences& preferences, dvbridge_mode mode) const;
+   std::shared_ptr<Context> GetContext() const { return m_context; }
+ 
+-  CDVBridgeGLES() = default;
++  CDVBridgeGLES();
+   ~CDVBridgeGLES();
+   CDVBridgeGLES(const CDVBridgeGLES&) = delete;
+   CDVBridgeGLES& operator=(const CDVBridgeGLES&) = delete;
 @@ -303,4 +308,9 @@ private:
    bool m_packed = false;
    unsigned m_pendingInfo = 0;
