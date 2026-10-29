@@ -215,7 +215,7 @@ struct cb1_import {
     struct dvbridge_dmabuf dmabuf;
     struct dvbridge_gl_frame frame;
 };
-static struct cb1_import cb1_imports[96];
+static struct cb1_import cb1_imports[512];
 static int cb1_import_count;
 
 static struct dvbridge_gl_frame *cb1_import(pl_gpu gpu, const AVFrame *f, VASurfaceID surface, int w, int h)
@@ -223,8 +223,10 @@ static struct dvbridge_gl_frame *cb1_import(pl_gpu gpu, const AVFrame *f, VASurf
     for (int i = 0; i < cb1_import_count; i++)
         if (cb1_imports[i].surface == surface && cb1_imports[i].layout_w == w && cb1_imports[i].layout_h == h)
             return &cb1_imports[i].frame;
-    if (cb1_import_count == (int)(sizeof(cb1_imports) / sizeof(cb1_imports[0])))
+    if (cb1_import_count == (int)(sizeof(cb1_imports) / sizeof(cb1_imports[0]))) {
+        fprintf(stderr, "CB1 import cache full (%d surfaces)\n", cb1_import_count);
         return NULL;
+    }
     struct cb1_import *c = &cb1_imports[cb1_import_count];
     memset(c, 0, sizeof(*c));
     if (!dvbridge_dmabuf_import(&c->dmabuf, f))
