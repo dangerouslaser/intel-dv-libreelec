@@ -4,7 +4,7 @@
 // output is the linear XRGB8888 scanout buffer itself (BGRA bytes).
 #version 460
 #include "dv_common.glsl"
-layout(local_size_x = 32, local_size_y = 2) in;
+layout(local_size_x = 32, local_size_y_id = 6) in;   // y: 2, or 8 with ANNEXB
 layout(constant_id = 0) const uint PACK = 0;     // 0 sited, 1 422, 2 resized
 layout(constant_id = 1) const uint FMA = 1;      // resize lerps: 1 fused as IGC contracts them (OpenCL FP_CONTRACT ON), 0 separate
 layout(binding = 0, std430) readonly buffer InY { uint16_t yplane[]; };
@@ -33,6 +33,11 @@ layout(binding = 17, std430) readonly buffer Coeff { float coeff[]; };
 // luma upsampled on the fly (vertical_pair then horizontal, as the staged
 // kernels), chroma from pass A's planes.
 layout(constant_id = 4) const uint SOURCE = 0;
+// ANNEXB (PACK 0, no overlay, SOURCE 0 or 1; workgroup 32x8): CB1's Annex B
+// 4:2:2 filter from a shared tile of the workgroup's chroma rows k0-3 .. k0+11,
+// each fetched (and, fused, reshaped) once instead of eight times per row.
+layout(constant_id = 5) const uint ANNEXB = 0;
+shared uvec2 ctile[15][64];
 layout(binding = 9) uniform sampler2D bl_luma;
 layout(binding = 10) uniform sampler2D bl_uv;
 layout(binding = 11) uniform sampler2D el_luma;
@@ -420,6 +425,25 @@ void main()
         }
         barrier();
     }
+    if (ANNEXB != 0u) {
+        // The workgroup: 128 pixels (64 chroma columns) by 16 rows (8 chroma
+        // rows, k0 .. k0+7); placement x and y are even. Workgroups wholly in
+        // the bars or outside the active rows load nothing (all black there).
+        uint gx = gl_WorkGroupID.x * 128u, gy = gl_WorkGroupID.y * 16u;
+        int k0 = (int(gy) - int(placement.y)) / 2, c0 = (int(gx) - int(placement.x)) / 2;
+        int cw = int(placement.z / 2u), last = int(placement.w / 2u) - 1;
+        bool used = gx + 128u > placement.x && gx < placement.x + placement.z && gy + 16u > placement.y &&
+                    gy < placement.y + placement.w && (SOURCE == 0u || (gy + 16u > active_area.y && gy < active_area.w));
+        if (used)
+            for (uint e = gl_LocalInvocationIndex; e < 15u * 64u; e += 256u) {
+                uint tr = e / 64u, tc = e % 64u;
+                int c = c0 + int(tc);
+                uint r = uint(clamp(k0 - 3 + int(tr), 0, last));
+                ctile[tr][tc] = c >= 0 && c < cw ? uvec2(src_c(false, uint(c), r, uint(cw)), src_c(true, uint(c), r, uint(cw)))
+                                                 : uvec2(0);
+            }
+        barrier();
+    }
     if (x0 >= w || y0 >= h)
         return;
     // Chroma rows for the sited pack, per chroma column of the block (the
@@ -434,7 +458,13 @@ void main()
         bool any_inside = x0 + 3u >= placement.x && y0 + 1u >= placement.y && x0 < placement.x + placement.z &&
                           y0 < placement.y + placement.w;
         bool any_shown = x0 + 3u >= active_area.x && x0 < active_area.z && y0 + 1u >= active_area.y && y0 < active_area.w;
-        if (any_inside && (SOURCE == 0u || any_shown))
+        if (ANNEXB != 0u && any_inside && (SOURCE == 0u || any_shown))
+            // tile row of chroma row k (= ly0 / 2) is k - k0 + 0 .. 7 = local y + i;
+            // column of the pair at x0 + 2j is its offset in the workgroup
+            for (uint j = 0; j < 2; j++)
+                for (uint i = 0; i < 8; i++)
+                    rows[j][i] = ctile[ly + i][lx * 2u + j];
+        else if (any_inside && (SOURCE == 0u || any_shown))
             for (uint j = 0; j < 2; j++) {
                 uint xj = x0 + 2u * j;   // the pair's first pixel; placement.x is even
                 if (xj >= placement.x && (xj - placement.x) / 2u < placement.z / 2u)

@@ -219,6 +219,7 @@ pub struct Engine {
     fel: FelPipelines,
     fel_buffers: [DeviceBuffer; 5],
     pack: Vec<Pipeline>,      // [(source * 2 + overlay) * 3 + PACK]
+    pack_annexb: Vec<Pipeline>,   // [source]: workgroups of 32x8 with the chroma tile
     fel_chroma: Pipeline,
     staged: bool,
     annexb_fused: bool,
@@ -293,9 +294,15 @@ impl Engine {
             for overlay in 0..3u32 {
                 for kind in 0..3u32 {
                     pack.push(Pipeline::new(&d, "pack", &pack_bindings, pack_push,
-                        &[(0, kind), (1, fma), (2, overlay), (3, blend_fma), (4, source)])?);
+                        &[(0, kind), (1, fma), (2, overlay), (3, blend_fma), (4, source), (6, 2)])?);
                 }
             }
+        }
+        // CB1 contract: the sited pack, no overlay, staged (0) or fused single-layer (1) sources.
+        let mut pack_annexb = Vec::new();
+        for source in 0..2u32 {
+            pack_annexb.push(Pipeline::new(&d, "pack", &pack_bindings, pack_push,
+                &[(0, 0), (1, fma), (2, 0), (3, blend_fma), (4, source), (5, 1), (6, 8)])?);
         }
         let fel_chroma = Pipeline::new(&d, "fel_chroma",
             &[sampled, sampled, sampled, storage, storage, storage, storage, storage, storage, storage, storage], 32, &[])?;
@@ -445,6 +452,7 @@ impl Engine {
             fel,
             fel_buffers,
             pack,
+            pack_annexb,
             fel_chroma,
             staged,
             annexb_fused,
@@ -1088,7 +1096,8 @@ impl Engine {
             }
             _ => bl.luma.view,   // unused: a valid view to bind
         };
-        let pack = &self.pack[((source * 3 + overlay_kind) * 3 + p.pack) as usize];
+        let annexb = p.chroma_filter != 0 && overlay_kind == 0 && p.pack == plan::PACK_SITED && source < 2;
+        let pack = if annexb { &self.pack_annexb[source as usize] } else { &self.pack[((source * 3 + overlay_kind) * 3 + p.pack) as usize] };
         let fused_tables = if source == 1 { Bind::Range(self.tables.buffer, T_SINGLE, 6144) } else { Bind::Range(self.tables.buffer, T_MAPPING, 2048) };
         unsafe { d.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pack.pipeline) };
         self.push.bind(
@@ -1131,7 +1140,8 @@ impl Engine {
             chroma_filter: p.chroma_filter,
         };
         gpu::push_constants(d, cmd, pack, &push);
-        unsafe { d.device.cmd_dispatch(cmd, (CANVAS_W / 4).div_ceil(32), (CANVAS_H / 2).div_ceil(2), 1) };
+        let rows_per_group = if annexb { 8 } else { 2 };
+        unsafe { d.device.cmd_dispatch(cmd, (CANVAS_W / 4).div_ceil(32), (CANVAS_H / 2).div_ceil(rows_per_group), 1) };
         stamp(3);
         if check {
             gpu::compute_barrier(d, cmd);
@@ -1488,7 +1498,7 @@ impl Drop for Engine {
             p.destroy(d);
         }
         self.resize_prepare.destroy(d);
-        for p in &self.pack {
+        for p in self.pack.iter().chain(self.pack_annexb.iter()) {
             p.destroy(d);
         }
         self.single.destroy(d);
