@@ -93,7 +93,7 @@ index ba0fb42..43984a6 100644
      list(APPEND SOURCES HDR10AISource.cpp)
      list(APPEND HEADERS HDR10AISource.h)
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
-index 3f4b8dc..0424377 100644
+index 3f4b8dc..edb38c1 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 @@ -1,5 +1,6 @@
@@ -132,7 +132,7 @@ index 3f4b8dc..0424377 100644
    cb1_hdr10plus_analysis_destroy(&m_hdr10plusAnalysis);
    ClearFELPrefetch();
    Summary("closed");
-@@ -1206,6 +1213,32 @@ void CDVBridgeGLES::Reset()
+@@ -1206,6 +1213,45 @@ void CDVBridgeGLES::Reset()
  #endif
    m_pendingHDR10Fallback = 0;
    dvbridge_renderer_reset(m_renderer);
@@ -144,11 +144,24 @@ index 3f4b8dc..0424377 100644
 +                                 const CDVMetadataBuffer& metadata, const dvbridge_geometry& geometry)
 +{
 +  // Unscaled pictures without menus or subtitles; everything else is CB1's.
++  // Kodi gives the whole source as the crop and the integer destination as the
++  // placement (all zero keeps both too); the engines place at even x, y.
++  const float crop[4]{0, 0, float(base.width), float(base.height)};
++  const float placed[4]{float(geometry.x), float(geometry.y), float(geometry.x + geometry.width),
++                        float(geometry.y + geometry.height)};
++  const auto zero = [](const float* v) { return !v[0] && !v[1] && !v[2] && !v[3]; };
 +  const bool unscaled = geometry.width == base.width && geometry.height == base.height &&
 +      geometry.source_width == base.width && geometry.source_height == base.height &&
-+      std::all_of(std::begin(geometry.crop), std::end(geometry.crop), [](float v) { return v == 0; }) &&
-+      std::all_of(std::begin(geometry.placement), std::end(geometry.placement), [](float v) { return v == 0; });
-+  if (m_requested.masterEngine < 1 || m_requested.masterIPT || m_nativeOverlayEnabled || !unscaled ||
++      !(geometry.x & 1) && !(geometry.y & 1) &&
++      (zero(geometry.crop) || std::equal(std::begin(crop), std::end(crop), std::begin(geometry.crop))) &&
++      (zero(geometry.placement) || std::equal(std::begin(placed), std::end(placed), std::begin(geometry.placement)));
++  // CB1 keeps its overlay shader primed with an empty rectangle: nothing is drawn.
++  const bool overlay = m_nativeOverlayEnabled && !zero(m_nativeOverlay.rect);
++  static unsigned declined = 0;
++  if (m_requested.masterEngine >= 1 && (!unscaled || overlay) && declined++ < 4)
++    CLog::Log(LOGINFO, "YBLOD engine: CB1 renders this picture (unscaled={} overlay={} {}x{} at {},{})",
++              unscaled, overlay, geometry.width, geometry.height, geometry.x, geometry.y);
++  if (m_requested.masterEngine < 1 || m_requested.masterIPT || overlay || !unscaled ||
 +      !base.vaDisplay || base.vaSurface == 0xffffffff || (enhancement && enhancement->vaSurface == 0xffffffff) ||
 +      m_scanoutFramebuffer != 0)
 +    return false;
@@ -165,7 +178,7 @@ index 3f4b8dc..0424377 100644
  }
  
  bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
-@@ -1255,7 +1288,10 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+@@ -1255,7 +1301,10 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
    if (!m_hdr10 && allowPacked && (m_directUsable || m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE) &&
        m_scanout)
    {
@@ -177,7 +190,7 @@ index 3f4b8dc..0424377 100644
      {
        auto renderMaster=m_requested.masterIPT ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference;
        const auto status=renderMaster(m_renderer,&bl.frame,metadata.Data(),metadata.Size(),
-@@ -1825,6 +1861,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+@@ -1825,6 +1874,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
    layer.pts = static_cast<double>(enhancement->pts);
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -190,7 +203,7 @@ index 3f4b8dc..0424377 100644
    for (int i = 0; i < 3; ++i)
      layer.planes[i] = imported.planes[i];
    bool result = Prepare(base, &layer, metadata, geometry, allowPacked);
-@@ -2020,6 +2062,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
+@@ -2020,6 +2075,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
    layer.lease = imported;
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -203,7 +216,7 @@ index 3f4b8dc..0424377 100644
    if (imported->scaled)
    {
      layer.planes[0] = imported->scaled->plane;
-@@ -2128,6 +2176,8 @@ void CDVBridgeGLES::CountPresentation(bool committed)
+@@ -2128,6 +2189,8 @@ void CDVBridgeGLES::CountPresentation(bool committed)
  bool CDVBridgeGLES::Presented(bool success)
  {
    if (m_live) return Presented(success,m_submission);
@@ -212,7 +225,7 @@ index 3f4b8dc..0424377 100644
    const bool committed = success && m_prepared && m_packed && dvbridge_render_commit(m_renderer);
    CountPresentation(committed);
    if (!committed && m_prepared) Failure("presentation");
-@@ -2179,6 +2229,8 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+@@ -2179,6 +2242,8 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
        hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
        m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
        m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
