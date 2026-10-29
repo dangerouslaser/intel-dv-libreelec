@@ -48,3 +48,7 @@ projects/**/*.old
 /packages/addons/addon-depends/multimedia-tools-depends/libplacebo/patches/libplacebo-99*.patch
 __pycache__/
 *.pyc
+
+# yblod-engine/dev: build logs and the compare runner's data
+/build-*.log
+/mr/

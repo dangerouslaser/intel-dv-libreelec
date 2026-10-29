@@ -1,0 +1,25 @@
+#!/bin/sh
+# dvwatch [SECONDS]: live Dolby Vision playback health without the info panel.
+# From kodi.log (CB1 logs both lines every 10 s while playing):
+#   "DVBridge playback health": position, drops, skips (totals for this file)
+#   "DVBridge playback engine": the engine of the last presented picture, its
+#   frame time (ms, ~1 s average) and pictures presented per engine in the interval.
+# Falls back to the Vulkan engine's journal profile (DVVK_PROFILE=1) for the time.
+I=${1:-5}; L=/storage/.kodi/temp/kodi.log
+printf "%-8s %-9s %-6s %-6s %-13s %-9s %-24s %s\n" time position drops skips pipeline frame_ms "frames cb1/vk/cl (10 s)" setting
+while :; do
+  H=$(grep "DVBridge playback health" $L | tail -1)
+  E=$(grep "DVBridge playback engine" $L | tail -1)
+  v() { echo "$2" | sed -n "s/.*$1=\([^ ]*\).*/\1/p"; }
+  ms=$(v frame_ms "$E")
+  if [ -z "$ms" ]; then
+    ms=$(journalctl -u kodi --since "-20s" --no-pager -q 2>/dev/null | grep "dvvk profile: gpu" | tail -1 | sed -n 's/.*gpu \([0-9.]*\) ms.*/\1(vk)/p')
+  fi
+  case "$ms" in -*) ms=-;; esac
+  f="$(v presented_cb1 "$E")/$(v presented_vulkan "$E")/$(v presented_opencl "$E")"
+  e=$(sed -n 's/.*<setting id="dvbridge.masterengine"[^>]*>\([0-9]\)<.*/\1/p' /storage/.kodi/userdata/guisettings.xml)
+  case "$e" in 1) e=vulkan;; 2) e=opencl;; *) e=cb1;; esac
+  printf "%-8s %-9s %-6s %-6s %-13s %-9s %-24s %s\n" "$(date +%T)" "$(v pts_s "$H")" "$(v drop_total "$H")" "$(v skip_total "$H")" \
+    "$(v pipeline "$E")" "${ms:--}" "$f" "$e"
+  sleep $I
+done
