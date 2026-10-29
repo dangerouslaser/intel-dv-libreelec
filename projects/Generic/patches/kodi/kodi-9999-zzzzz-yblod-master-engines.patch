@@ -298,10 +298,10 @@ index ade1f23..c87e680 100644
  };
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
 new file mode 100644
-index 0000000..b02a276
+index 0000000..04573f5
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,407 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#include "DVYblodEngine.h"
 +
@@ -424,6 +424,9 @@ index 0000000..b02a276
 +  LOAD(m_create, dvvk_create);
 +  LOAD(m_setOutput, dvvk_set_output);
 +  LOAD(m_renderSync, dvvk_render_sync);
++  LOAD(m_submit, dvvk_submit);
++  LOAD(m_poll, dvvk_poll);
++  LOAD(m_implicitFailed, dvvk_implicit_failed);
 +  LOAD(m_reset, dvvk_reset);
 +  LOAD(m_destroy, dvvk_destroy);
 +  // The engine logs its reasons on stderr (the journal).
@@ -500,10 +503,52 @@ index 0000000..b02a276
 +  frame.metadata = metadata;
 +  frame.metadata_size = size;
 +  frame.output = slot;
-+  uint32_t flags = 0;
-+  const int result = m_renderSync(m_engine, &frame, &flags);
-+  // An out-of-range sample is shown clamped by the engine; Master rejects instead.
-+  return result != 0 ? result : (flags & 3u) ? -4 : 0;
++  // Without implicit fences (an older kernel) GL could read the carrier early: wait.
++  if (m_implicitFailed(m_engine))
++  {
++    uint32_t flags = 0;
++    const int result = m_renderSync(m_engine, &frame, &flags);
++    // An out-of-range sample is shown clamped by the engine; Master rejects instead.
++    return result != 0 ? result : (flags & 3u) ? -4 : 0;
++  }
++  uint64_t ticket = 0;
++  const int result = m_submit(m_engine, &frame, &ticket);
++  if (result == 0)
++  {
++    if (m_ticketCount == 4)
++      Collect();
++    if (m_ticketCount < 4)
++    {
++      m_tickets[m_ticketCount] = ticket;
++      m_ticketPts[m_ticketCount++] = pts;
++    }
++  }
++  return result;
++}
++
++void CDVYblodEngine::Collect()
++{
++  // Finished frames' error flags; a range error was already shown (clamped).
++  unsigned kept = 0;
++  for (unsigned i = 0; i < m_ticketCount; ++i)
++  {
++    int done = 0;
++    uint32_t flags = 0;
++    if (m_poll(m_engine, m_tickets[i], &done, &flags) == 0 && !done)
++    {
++      m_tickets[kept] = m_tickets[i];
++      m_ticketPts[kept++] = m_ticketPts[i];
++    }
++    else if ((flags & 3u) && m_reports < 16)
++    {
++      ++m_reports;
++      CLog::Log(LOGWARNING, "YBLOD Vulkan engine: range check failed pts={} flags={:#x} (shown clamped)",
++                m_ticketPts[i], flags);
++    }
++  }
++  if (kept == m_ticketCount && kept == 4)
++    kept = 3;   // never block: forget the oldest
++  m_ticketCount = kept;
 +}
 +
 +int CDVYblodEngine::RenderOpenCL(unsigned slot, unsigned blSurface, unsigned elSurface, int width,
@@ -619,6 +664,7 @@ index 0000000..b02a276
 +
 +void CDVYblodEngine::Reset()
 +{
++  m_ticketCount = 0;
 +  if (m_engine)
 +    m_reset(m_engine);
 +  if (m_renderer)
@@ -665,10 +711,10 @@ index 0000000..b02a276
 +}
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
 new file mode 100644
-index 0000000..a6d41ec
+index 0000000..209ca97
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,94 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#pragma once
 +#include <EGL/egl.h>
@@ -720,6 +766,15 @@ index 0000000..a6d41ec
 +  decltype(&dvvk_create) m_create{nullptr};
 +  decltype(&dvvk_set_output) m_setOutput{nullptr};
 +  decltype(&dvvk_render_sync) m_renderSync{nullptr};
++  decltype(&dvvk_submit) m_submit{nullptr};
++  decltype(&dvvk_poll) m_poll{nullptr};
++  decltype(&dvvk_implicit_failed) m_implicitFailed{nullptr};
++  // Submitted without waiting: the frame's fence is on the carrier (implicit
++  // sync), so the GL copy waits on the GPU. Tickets still to report errors.
++  uint64_t m_tickets[4]{};
++  double m_ticketPts[4]{};
++  unsigned m_ticketCount{0};
++  void Collect();
 +  decltype(&dvvk_reset) m_reset{nullptr};
 +  decltype(&dvvk_destroy) m_destroy{nullptr};
 +  // OpenCL
