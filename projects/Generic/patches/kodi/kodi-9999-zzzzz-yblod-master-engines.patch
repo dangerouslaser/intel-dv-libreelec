@@ -459,10 +459,10 @@ index ade1f23..c891d5c 100644
  };
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
 new file mode 100644
-index 0000000..382e8d7
+index 0000000..156214d
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodEngine.cpp
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,472 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#include "DVYblodEngine.h"
 +
@@ -551,10 +551,16 @@ index 0000000..382e8d7
 +  {
 +    Slot& slot = m_slots[index];
 +    // The carrier as the engines write it: linear ARGB8888, top row first,
-+    // and scanout-capable for direct presentation.
-+    slot.bo = gbm_bo_create(m_device, CARRIER_WIDTH, CARRIER_HEIGHT, GBM_FORMAT_ARGB8888,
-+                            GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR |
-+                                (m_direct ? GBM_BO_USE_SCANOUT : 0));
++    // and scanout-capable for direct presentation. The linear modifier is
++    // explicit: a bo without one reports DRM_FORMAT_MOD_INVALID, which the
++    // kernel refuses for the opaque framebuffer CB1's DV page flip makes.
++    const uint64_t linear = DRM_FORMAT_MOD_LINEAR;
++    const uint32_t usage = GBM_BO_USE_RENDERING | (m_direct ? GBM_BO_USE_SCANOUT : 0);
++    slot.bo = gbm_bo_create_with_modifiers2(m_device, CARRIER_WIDTH, CARRIER_HEIGHT,
++                                            GBM_FORMAT_ARGB8888, &linear, 1, usage);
++    if (!slot.bo)
++      slot.bo = gbm_bo_create(m_device, CARRIER_WIDTH, CARRIER_HEIGHT, GBM_FORMAT_ARGB8888,
++                              usage | GBM_BO_USE_LINEAR);
 +    slot.fd = slot.bo ? gbm_bo_get_fd(slot.bo) : -1;
 +    if (slot.fd < 0)
 +      return false;
