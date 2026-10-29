@@ -8,8 +8,8 @@
  *     --start S         seek to S seconds first
  *     --fel 0|1         give both engines the EL (default 1)
  *     --ipt             CB1's Master Reference IPT output instead of YCC
- *     --cb1-siting      give the Vulkan engine CB1's chroma siting (Profile 7
- *                       with unspecified siting is top-left there)
+ *     --yblod           the Vulkan engine as YBLOD runs it (its own siting and
+ *                       chroma filters), not CB1's spatial contract
  *     --flip            CB1's flip_y (default off: row 0 is the HDMI top row)
  *     --dump DIR        on a mismatch, both frames as DIR/{cb1,vk}-N.bgra
  *     --node PATH       render node (default /dev/dri/renderD128)
@@ -153,7 +153,7 @@ static void dump_frame(const char *dir, const char *name, int n, const uint8_t *
 
 int main(int argc, char **argv)
 {
-    int frames = 48, fel = 1, ipt = 0, cb1_siting = 0, flip = 0;
+    int frames = 48, fel = 1, ipt = 0, contract = 1, flip = 0;
     double start = 0;
     const char *file = NULL, *dump = NULL, *node = "/dev/dri/renderD128";
     for (int i = 1; i < argc; i++) {
@@ -169,15 +169,15 @@ int main(int argc, char **argv)
             node = argv[++i];
         else if (!strcmp(argv[i], "--ipt"))
             ipt = 1;
-        else if (!strcmp(argv[i], "--cb1-siting"))
-            cb1_siting = 1;
+        else if (!strcmp(argv[i], "--yblod"))
+            contract = 0;
         else if (!strcmp(argv[i], "--flip"))
             flip = 1;
         else
             file = argv[i];
     }
     if (!file) {
-        fprintf(stderr, "usage: dvvk-mr-compare [--frames N] [--start S] [--fel 0|1] [--ipt] [--cb1-siting] "
+        fprintf(stderr, "usage: dvvk-mr-compare [--frames N] [--start S] [--fel 0|1] [--ipt] [--yblod] "
                         "[--flip] [--dump DIR] [--node PATH] FILE\n");
         return 2;
     }
@@ -314,12 +314,13 @@ int main(int argc, char **argv)
         dvbridge_dmabuf_release(&bl_import);
 
         /* yblod's Vulkan engine, as Kodi's yblod adapter drives it */
-        int top_left = cb1_siting ? cb1_chroma(p.bl->chroma_location, dec.profile) == PL_CHROMA_TOP_LEFT
-                                  : p.bl->chroma_location == AVCHROMA_LOC_TOPLEFT;
+        int top_left = contract ? cb1_chroma(p.bl->chroma_location, dec.profile) == PL_CHROMA_TOP_LEFT
+                                : p.bl->chroma_location == AVCHROMA_LOC_TOPLEFT;
         dvvk_frame f = {.plan = {.width = w, .height = h, .x = x, .y = y, .dw = w, .dh = h,
                                  .chroma_top_left = (uint32_t)top_left, .has_el = el != NULL, .nv12 = 0,
                                  .el_scaler = 1, .fel = (uint32_t)fel, .packet_id = packet_id,
-                                 .refresh = (uint32_t)refresh, .pts = p.bl->pts, .white_nits = 203.0},
+                                 .refresh = (uint32_t)refresh, .pts = p.bl->pts, .white_nits = 203.0,
+                                 .cb1_contract = (uint32_t)contract},
                         .bl_surface = p.bl_surface, .el_surface = el ? p.el_surface : 0xffffffffu,
                         .metadata = meta, .metadata_size = meta_size, .output = 0};
         uint32_t flags = 0;
@@ -394,13 +395,13 @@ int main(int argc, char **argv)
         }
         dv_pair_free(&p);
     }
-    printf("{\"file\":\"%s\",\"profile\":%d,\"fel\":%d,\"ipt\":%d,\"cb1_siting\":%d,\"frames\":%d,\"compared\":%d,"
+    printf("{\"file\":\"%s\",\"profile\":%d,\"fel\":%d,\"ipt\":%d,\"cb1_contract\":%d,\"frames\":%d,\"compared\":%d,"
            "\"identical\":%d,\"mismatched\":%d,\"refused_cb1\":%d,\"refused_vk\":%d,"
            "\"differ_pixels\":%zu,\"metadata_row_pixels\":%zu,\"border_pixels\":%zu,"
            "\"luma_pixels\":%zu,\"luma_max\":%u,\"luma_hist\":[%zu,%zu,%zu,%zu,%zu],"
            "\"chroma_pixels\":%zu,\"chroma_max\":%u,\"chroma_hist\":[%zu,%zu,%zu,%zu,%zu],"
            "\"cb1_ms\":%.2f,\"vulkan_ms\":%.2f}\n",
-           file, dec.profile, fel, ipt, cb1_siting, n, compared, identical, mismatched, refused_cb1, refused_vk,
+           file, dec.profile, fel, ipt, contract, n, compared, identical, mismatched, refused_cb1, refused_vk,
            total_px, meta_px, border_px, luma_px, luma_max, luma_hist[0], luma_hist[1], luma_hist[2], luma_hist[3],
            luma_hist[4], chroma_px, chroma_max, chroma_hist[0], chroma_hist[1], chroma_hist[2], chroma_hist[3],
            chroma_hist[4], n ? cb1_ms / n : 0, n ? vk_ms / n : 0);

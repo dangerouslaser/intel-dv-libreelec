@@ -88,7 +88,7 @@ index ba0fb42..5a175d4 100644
      list(APPEND SOURCES HDR10AISource.cpp)
      list(APPEND HEADERS HDR10AISource.h)
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
-index 3f4b8dc..dc7125c 100644
+index 3f4b8dc..dfb4b9b 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
 @@ -1,5 +1,6 @@
@@ -123,7 +123,7 @@ index 3f4b8dc..dc7125c 100644
    cb1_hdr10plus_analysis_destroy(&m_hdr10plusAnalysis);
    ClearFELPrefetch();
    Summary("closed");
-@@ -1206,6 +1211,33 @@ void CDVBridgeGLES::Reset()
+@@ -1206,6 +1211,30 @@ void CDVBridgeGLES::Reset()
  #endif
    m_pendingHDR10Fallback = 0;
    dvbridge_renderer_reset(m_renderer);
@@ -144,11 +144,8 @@ index 3f4b8dc..dc7125c 100644
 +      m_scanoutFramebuffer != 0)
 +    return false;
 +  if (!m_yblod) m_yblod = std::make_unique<CDVYblodVulkan>();
-+  // CB1's siting (Kodi's SourceChroma) unless DV_YBLOD_SITING=yblod.
-+  const char* siting = std::getenv("DV_YBLOD_SITING");
-+  const bool topLeft = siting && std::strcmp(siting, "yblod") == 0 ?
-+      base.chromaLocation == AVCHROMA_LOC_TOPLEFT && !enhancement :
-+      SourceChroma(base.chromaLocation, base.sourceInfo.profile) == PL_CHROMA_TOP_LEFT;
++  // CB1's siting (Kodi's SourceChroma).
++  const bool topLeft = SourceChroma(base.chromaLocation, base.sourceInfo.profile) == PL_CHROMA_TOP_LEFT;
 +  m_yblodFrame = m_yblod->Render(base.vaDisplay, base.vaSurface,
 +      enhancement ? enhancement->vaSurface : 0xffffffffu, base.width, base.height, geometry.x, geometry.y,
 +      topLeft, metadata.Data(), metadata.Size(), static_cast<int64_t>(base.pts * 1e6),
@@ -157,7 +154,7 @@ index 3f4b8dc..dc7125c 100644
  }
  
  bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
-@@ -1255,7 +1287,10 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+@@ -1255,7 +1284,10 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
    if (!m_hdr10 && allowPacked && (m_directUsable || m_effectiveMode == DVBRIDGE_MODE_MASTER_REFERENCE) &&
        m_scanout)
    {
@@ -169,7 +166,7 @@ index 3f4b8dc..dc7125c 100644
      {
        auto renderMaster=m_requested.masterIPT ? dvbridge_render_master_reference_ipt : dvbridge_render_master_reference;
        const auto status=renderMaster(m_renderer,&bl.frame,metadata.Data(),metadata.Size(),
-@@ -1825,6 +1860,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+@@ -1825,6 +1857,12 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
    layer.pts = static_cast<double>(enhancement->pts);
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -182,7 +179,7 @@ index 3f4b8dc..dc7125c 100644
    for (int i = 0; i < 3; ++i)
      layer.planes[i] = imported.planes[i];
    bool result = Prepare(base, &layer, metadata, geometry, allowPacked);
-@@ -2020,6 +2061,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
+@@ -2020,6 +2058,12 @@ CDVBridgeGLES::FrameStatus CDVBridgeGLES::PrepareHardwareFrame(const Layer& base
    layer.lease = imported;
    layer.chromaLocation = enhancement->chroma_location == AVCHROMA_LOC_UNSPECIFIED ?
        AVCHROMA_LOC_TOPLEFT : enhancement->chroma_location;
@@ -195,7 +192,7 @@ index 3f4b8dc..dc7125c 100644
    if (imported->scaled)
    {
      layer.planes[0] = imported->scaled->plane;
-@@ -2128,6 +2175,8 @@ void CDVBridgeGLES::CountPresentation(bool committed)
+@@ -2128,6 +2172,8 @@ void CDVBridgeGLES::CountPresentation(bool committed)
  bool CDVBridgeGLES::Presented(bool success)
  {
    if (m_live) return Presented(success,m_submission);
@@ -204,7 +201,7 @@ index 3f4b8dc..dc7125c 100644
    const bool committed = success && m_prepared && m_packed && dvbridge_render_commit(m_renderer);
    CountPresentation(committed);
    if (!committed && m_prepared) Failure("presentation");
-@@ -2179,6 +2228,8 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
+@@ -2179,6 +2225,8 @@ bool CDVBridgeGLES::Presented(bool success, const Submission& submission)
        hdrOutput ? hdrOutput->nominal_target.hdr.max_luma :
        m_advanced && m_effectiveMode == DVBRIDGE_MODE_ENHANCED_DV ? static_cast<float>(m_requested.peak) :
        m_hdr10 && m_hdr10Session ? m_hdr10Session->target.hdr.max_luma : 0.0f;
@@ -255,10 +252,10 @@ index ade1f23..91d6e07 100644
  };
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp
 new file mode 100644
-index 0000000..980202c
+index 0000000..5af54f8
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,230 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#include "DVYblodVulkan.h"
 +
@@ -396,6 +393,8 @@ index 0000000..980202c
 +  frame.plan.refresh = m_refresh;
 +  frame.plan.pts = pts;
 +  frame.plan.white_nits = 203.0;
++  // CB1's spatial contract: siting, 4:2:0 reshaping and the Annex B filters.
++  frame.plan.cb1_contract = 1;
 +  frame.bl_surface = blSurface;
 +  frame.el_surface = elSurface;
 +  frame.metadata = metadata;

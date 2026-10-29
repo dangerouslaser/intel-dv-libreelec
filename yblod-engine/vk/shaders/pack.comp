@@ -43,6 +43,7 @@ layout(push_constant) uniform Push {
     uvec4 active_area, black, placement;
     uint w, h, stride_words, packet_count, top_left, source_w, source_h, nearest;
     uint gui_flags;   // OVERLAY 2: bit 0 invalidate the cache, 1 the shell's rows bottom first, 2 count changed pixels
+    uint chroma_filter;   // PACK 0: 1 CB1 Master Reference's Annex B 4:2:2 filters
 };
 #include "overlay_colour.glsl"
 
@@ -290,9 +291,9 @@ uint blend_chroma(uint c, bool odd, vec4 l, vec4 m, vec4 r)
 }
 
 // One output pixel (x, y): the 12-bit sample pair before overlay/packets.
-// chroma_rows: for the sited 4:2:0 pack, this block's chroma rows k-1, k, k+1
+// chroma_rows: for the sited 4:2:0 pack, this block's chroma rows k-3 .. k+4
 // (k = ly / 2) for the pixel's chroma column (cb, cr), fetched once per block.
-uvec2 reconstruct(uint x, uint y, bool odd, uvec2 chroma_rows[3])
+uvec2 reconstruct(uint x, uint y, bool odd, uvec2 chroma_rows[8])
 {
     uint dw = placement.z, dh = placement.w, lx = x - placement.x, ly = y - placement.y;
     uint sw = dw, sh = dh;
@@ -321,12 +322,31 @@ uvec2 reconstruct(uint x, uint y, bool odd, uvec2 chroma_rows[3])
             c = src_c(odd, lx / 2, ly, sw / 2);
             yy = src_y(lx, ly, sw, sh);
         } else {
-            // rows k-1, k, k+1 of chroma_rows; sited weights as source_tunnel
-            uint lo, hi, a;
-            if ((ly & 1u) == 0u) { lo = 0u; hi = 1u; a = 1u; } else { lo = 1u; hi = 2u; a = 3u; }
-            if (top_left != 0u) { lo = 1u; hi = 2u; a = (ly & 1u) != 0u ? 2u : 4u; }
-            uint t = odd ? chroma_rows[lo].y : chroma_rows[lo].x, b = odd ? chroma_rows[hi].y : chroma_rows[hi].x;
-            c = (a * t + (4 - a) * b + 2) / 4;
+            int r[8];
+            for (uint i = 0; i < 8; i++)
+                r[i] = int(odd ? chroma_rows[i].y : chroma_rows[i].x);
+            if (chroma_filter != 0u) {
+                // CB1 (ETSI GS CCM 001 Annex B): left sited, the six-tap phases;
+                // top-left, aligned rows copied and the half-phase eight-tap
+                // between them. Clipped to the 12-bit code range.
+                int s;
+                if (top_left != 0u) {
+                    s = (ly & 1u) == 0u ? r[3] << 12 :
+                        22 * (r[0] + r[7]) + 94 * (r[1] + r[6]) - 524 * (r[2] + r[5]) + 2456 * (r[3] + r[4]);
+                    s = (s + 2048) >> 12;
+                } else {
+                    s = (ly & 1u) == 0u ? 2 * r[0] - 12 * r[1] + 65 * r[2] + 222 * r[3] - 25 * r[4] + 4 * r[5]
+                                        : 4 * r[1] - 25 * r[2] + 222 * r[3] + 65 * r[4] - 12 * r[5] + 2 * r[6];
+                    s = (s + 128) >> 8;
+                }
+                c = uint(clamp(s, 0, 4095));
+            } else {
+                // rows k-1, k, k+1 (r[2..4]); sited weights as source_tunnel
+                uint lo, hi, a;
+                if ((ly & 1u) == 0u) { lo = 2u; hi = 3u; a = 1u; } else { lo = 3u; hi = 4u; a = 3u; }
+                if (top_left != 0u) { lo = 3u; hi = 4u; a = (ly & 1u) != 0u ? 2u : 4u; }
+                c = (a * uint(r[lo]) + (4 - a) * uint(r[hi]) + 2) / 4;
+            }
             yy = src_y(lx, ly, sw, sh);
         }
     }
@@ -349,15 +369,21 @@ uint finish(uint x, uint y, uvec2 v)
     return b | (g << 8) | (r << 16) | 0xff000000u;
 }
 
-// The sited pack's chroma rows k-1, k, k+1 (clamped as source_tunnel's top /
-// bottom are) at chroma column cx, both channels.
-void chroma_rows_at(uint cx, uint k, uint sw, uint sh, out uvec2 rows[3])
+// The sited pack's chroma rows k-3 .. k+4 (clamped to the plane, as
+// source_tunnel's top / bottom are) at chroma column cx, both channels. The
+// 2-tap blend reads k-1 .. k+1 only.
+void chroma_rows_at(uint cx, uint k, uint sw, uint sh, out uvec2 rows[8])
 {
-    uint last = sh / 2 - 1, cw = sw / 2;
-    uint r0 = k != 0u ? k - 1 : 0u, r2 = min(k + 1, last);
-    rows[0] = uvec2(src_c(false, cx, r0, cw), src_c(true, cx, r0, cw));
-    rows[1] = uvec2(src_c(false, cx, k, cw), src_c(true, cx, k, cw));
-    rows[2] = uvec2(src_c(false, cx, r2, cw), src_c(true, cx, r2, cw));
+    int last = int(sh / 2) - 1;
+    uint cw = sw / 2;
+    for (int i = 0; i < 8; i++) {
+        if (chroma_filter == 0u && (i < 2 || i > 4)) {
+            rows[i] = uvec2(0);
+            continue;
+        }
+        uint row = uint(clamp(int(k) + i - 3, 0, last));
+        rows[i] = uvec2(src_c(false, cx, row, cw), src_c(true, cx, row, cw));
+    }
 }
 
 // One invocation: 4 pixels x 2 rows (x0 % 4 == 0, y0 even), stored 16 bytes a row.
@@ -399,9 +425,9 @@ void main()
     // Chroma rows for the sited pack, per chroma column of the block (the
     // placement is even, so the block's two rows share k and its 4 pixels two
     // columns).
-    uvec2 rows[2][3];
+    uvec2 rows[2][8];
     for (uint j = 0; j < 2; j++)
-        for (uint r = 0; r < 3; r++)
+        for (uint r = 0; r < 8; r++)
             rows[j][r] = uvec2(0);
     if (PACK == 0) {
         uint ly0 = y0 - placement.y;

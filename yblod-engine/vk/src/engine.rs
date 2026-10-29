@@ -53,6 +53,7 @@ struct PackPush {
     source_h: u32,
     nearest: u32,
     gui_flags: u32,   // the fused overlay: 1 invalidate the colour cache, 2 the shell flipped
+    chroma_filter: u32,   // sited pack: 1 CB1's Annex B 4:2:2 filters
 }
 
 #[repr(C)]
@@ -89,7 +90,7 @@ struct FelPipelines {
     mmr_dual: Pipeline,            // mmr64_lut_dual (EL planes already full chroma size)
     mmr_single: [Pipeline; 3],     // mmr64_lut, mmr96, mmr (128)
     equal: [Pipeline; 3],          // luma_equal, phase, phase_guide (full-size EL)
-    piecewise: [Pipeline; 3],      // 4:2:2 P010, 4:2:2 P010 order-2 chroma, 4:2:0 NV12
+    piecewise: [Pipeline; 4],      // 4:2:2 P010, 4:2:2 P010 order-2 chroma, 4:2:0 NV12, 4:2:0 P010 (CB1)
 }
 
 // Offsets in the tables buffer (256-aligned).
@@ -324,6 +325,7 @@ impl Engine {
                 Pipeline::new(&d, "piecewise", &[sampled, sampled, storage, storage, storage, storage, storage, storage], 32, &[(0, 1), (1, 10), (2, 0), (3, 1)])?,
                 Pipeline::new(&d, "piecewise", &[sampled, sampled, storage, storage, storage, storage, storage, storage], 32, &[(0, 1), (1, 10), (2, 1), (3, 1)])?,
                 Pipeline::new(&d, "piecewise", &[sampled, sampled, storage, storage, storage, storage, storage, storage], 32, &[(0, 0), (1, 8), (2, 0), (3, 1)])?,
+                Pipeline::new(&d, "piecewise", &[sampled, sampled, storage, storage, storage, storage, storage, storage], 32, &[(0, 0), (1, 10), (2, 0), (3, 1)])?,
             ],
         };
         let quarter = (MAX_W / 2 * MAX_H / 2 * 2) as u64;
@@ -1126,6 +1128,7 @@ impl Engine {
             source_h: p.source_h,
             nearest: p.nearest,
             gui_flags: fused_invalidate as u32 | (self.sources.shell_flip as u32) << 1 | (self.count_changes as u32) << 2,
+            chroma_filter: p.chroma_filter,
         };
         gpu::push_constants(d, cmd, pack, &push);
         unsafe { d.device.cmd_dispatch(cmd, (CANVAS_W / 4).div_ceil(32), (CANVAS_H / 2).div_ceil(2), 1) };
@@ -1272,7 +1275,7 @@ impl Engine {
             gpu::push_constants(d, cmd, &self.single, &[w, h, first / 2]);
             unsafe { d.device.cmd_dispatch(cmd, (w / 2).div_ceil(16), ((last - first) / 2).div_ceil(8), 1) };
         } else if route == plan::ROUTE_PIECEWISE {
-            let k = if p.depth == 8 { 2 } else if p.order2 != 0 { 1 } else { 0 };
+            let k = if p.depth == 8 { 2 } else if p.layout == 0 { 3 } else if p.order2 != 0 { 1 } else { 0 };
             let pipe = &self.fel.piecewise[k];
             let rows_per = if p.layout == 1 { 1 } else { 2 };
             #[repr(C)]

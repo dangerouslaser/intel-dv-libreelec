@@ -43,6 +43,8 @@ uvec2 input_uv(sampler2D src, uint x, uint y)
 uvec2 phase_uv_sample(sampler2D src, uint x, int row, uint h, uint method)
 {
     uint y = uint(edge(row, h));
+    if (method == 2u)   // none: the decoded chroma (CB1's Master Reference)
+        return min(input_uv(src, x, y), uvec2(1023u));
     ivec2 v = ivec2(0);
     if (method == 0u)
         v = 3 * ivec2(input_uv(src, x, y)) + ivec2(input_uv(src, x, uint(edge(int(y) + 1, h))));

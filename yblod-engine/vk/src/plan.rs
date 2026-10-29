@@ -32,6 +32,8 @@ pub struct PlanIn {
     pub pts: i64,
     pub rgb_to_lms: [f64; 9],
     pub white_nits: f64,
+    pub cb1_contract: u32,
+    pub reserved_in: u32,
 }
 
 #[repr(C)]
@@ -66,7 +68,8 @@ pub struct Plan {
     pub source_h: u32,
     pub packet_count: u32,
     pub overlay_visible: u32,
-    pub reserved: [u32; 7],
+    pub chroma_filter: u32,
+    pub reserved: [u32; 6],
     pub gui_coeff: [f32; 32],
     pub mapping: [u16; 1024],
     pub chroma_mapping: [[u16; 1024]; 2],

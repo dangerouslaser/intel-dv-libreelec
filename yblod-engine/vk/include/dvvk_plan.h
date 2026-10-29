@@ -24,6 +24,11 @@ typedef struct {
     int64_t pts;
     double rgb_to_lms[9];               /* overlay: linear GUI RGB -> the source's LMS */
     double white_nits;                  /* overlay white (mpv-yblod: 203) */
+    uint32_t cb1_contract;              /* CB1 Master Reference's spatial contract: the
+                                         * stream's siting (also with an EL), 4:2:0
+                                         * reshaping, no chroma phase pre-filter and the
+                                         * Annex B 4:2:2 output filters */
+    uint32_t reserved_in;
 } dvvk_plan_in;
 
 typedef struct {
@@ -38,7 +43,8 @@ typedef struct {
     uint32_t layout, sampling, depth, order2, narrow_mask[4];
     uint32_t pack, active[4], black[4], placement[4], top_left, source_w, source_h;
     uint32_t packet_count, overlay_visible;
-    uint32_t reserved[7];
+    uint32_t chroma_filter;             /* sited pack: 0 the 2-tap blend, 1 Annex B (CB1) */
+    uint32_t reserved[6];
     float gui_coeff[32];                /* overlay colour, as prepare_overlay() builds it */
     uint16_t mapping[1024];             /* luma mapping (Q16) */
     uint16_t chroma_mapping[2][1024];   /* polynomial chroma (Q16) */
