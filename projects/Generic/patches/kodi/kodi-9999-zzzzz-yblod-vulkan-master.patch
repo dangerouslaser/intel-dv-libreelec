@@ -265,10 +265,10 @@ index ade1f23..e84ac9f 100644
  };
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp
 new file mode 100644
-index 0000000..5af54f8
+index 0000000..7979c91
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVYblodVulkan.cpp
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,231 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +#include "DVYblodVulkan.h"
 +
@@ -277,6 +277,7 @@ index 0000000..5af54f8
 +#include "windowing/gbm/WinSystemGbm.h"
 +#include "windowing/gbm/drm/DRMUtils.h"
 +
++#include <GLES2/gl2ext.h>
 +#include <GLES3/gl3.h>
 +#include <dlfcn.h>
 +#include <drm_fourcc.h>
