@@ -1,0 +1,19 @@
+GUI revision reuse disabled by default
+
+On the tested device running YBLOD 0.2, playback controls visibly flickered.
+After changing only DV_PRIVATE_GUI_REVISION from 1 to 0 and restarting Kodi,
+the user reported no flickering while replaying 1917 near 01:01:20.
+DV_OVERLAY_PIXEL_CACHE=1 and DV_OVERLAY_SPARSE=1 remained enabled;
+DV_PRIVATE_ASYNC_OVERLAY=0 remained unchanged.
+
+This implicates revision-based reuse but does not establish the precise cause.
+No reverse A/B, new performance comparison or full profile sweep was performed.
+The byte-level cache tests did not exercise Kodi's live GUI revision tracking.
+Defaults now retain pixel comparison and transparent-pixel skipping while
+disabling the shortcut that trusts a GUI revision without inspecting pixels.
+The optional shortcut remains available for investigation, not enabled by default.
+
+Existing 0.2 release artifacts are unchanged. An installed system can use
+DV_PRIVATE_GUI_REVISION=0 in /storage/.config/native-dv.env and restart Kodi.
+Preserve other entries in that override file. This is a mitigation, not a claim
+that the underlying invalidation defect has been identified or repaired.

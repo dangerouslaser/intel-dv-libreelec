@@ -48,7 +48,7 @@ configure_package() {
 
   if [ "${TARGET_ARCH}" = "x86_64" ]; then
     PKG_DEPENDS_TARGET+=" pciutils"
-    [ "${PROJECT}" = "Generic" ] && PKG_DEPENDS_TARGET+=" yblod-engine-vk"
+    [ "${PROJECT}" = "Generic" ] && PKG_DEPENDS_TARGET+=" yblod-engine yblod-engine-vk"
   fi
 
   PKG_DEPENDS_TARGET+=" dbus"

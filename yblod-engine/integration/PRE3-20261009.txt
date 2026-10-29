@@ -1,0 +1,54 @@
+YBLOD 0.2-pre3: native movie -> DV menu target fix
+================================================
+
+Build source: 7559397e7d04688d5f1cdb761905db1151ae9721
+
+Reproduction on the Intel LibreELEC VM
+-------------------------------------
+Pre2, normal user profile, 1917 from 08:00:
+- DV menus OFF: user confirmed a normal menu after stopping.
+- DV menus ON: user confirmed repeated/distorted vertical menu copies.
+- Resetting the menu output restored a normal image.
+DRM signalling/timing checks passed even in the visibly broken case. Those
+checks alone were insufficient to qualify the rendered menu image.
+
+Fix and candidate check
+-----------------------
+Patch kodi-9999-yblod-06-menu-target.patch recreates the GUI framebuffer after
+resetting native playback at the handoff to a DV menu. It invalidates the old
+target dimensions, clean flag and raster-ready flag so the next GUI render
+allocates a fresh target instead of reusing the movie-shared image.
+It does not alter movie reconstruction, packing math, menu colour settings,
+or deliberately toggle the HDMI DV signal off/on.
+
+The incremental Kodi build passed; normal CMake installation removed its build
+RPATH. On the same VM, the candidate played 1917 from 08:00 and stopped with
+DV menus ON; the user confirmed the menu was normal. The log retained DV
+signalling while returning from 23.976 Hz movie timing to the 4K60 menu.
+A further menus-OFF play/stop check restored ordinary signalling and closed
+the native renderer without a reported transition error. No new movie-pixel
+accuracy or GPU execution-time suite was run for this target-lifetime change.
+
+Package
+-------
+SHA256:
+  update tar: 65faecea3ed43ee3ba709eb406082aae938c3cb826c7b45c9aa79543575fcfe3
+  USB img.gz: a97d573d45c5b4b0978b281b25d5498c4e2a36f1b0bc23617c8f65b10ca24b36
+  SYSTEM: fb7d5e06f9565b6a6ebcf4e8738b8bef8f199c8d0232864108d9d8af3cea4409
+  kodi.bin: a5126bfb9429792a4440dd315d8146bac20aeffdafa0dc9436e4d24eb518d56c
+  native library: c10a12bcd2bfffdb74872bc73655f48a9d70ea16929b861b1d6757a99acda73a
+
+The pre2 full image was repacked with the tested installed Kodi and release
+identification. Filesystem comparison found only kodi.bin, /etc/os-release and
+/etc/issue changed. Update MD5 checks passed; KERNEL and SYSTEM extracted from
+the USB image match the update tar byte-for-byte.
+The packaged update booted on the VM as yblod-0.2-pre3, with build ID 7559397e.
+Installed Kodi and native-library hashes match the values above. The temporary
+candidate executable bind mount was absent after reboot.
+
+Known scope
+-----------
+This is a targeted hotfix with visual confirmation of the previously failing
+VM transition, not all-media/display certification. Pre2 profile/reference
+results remain historical engine qualification. The N150 4K59.94 controls-open
+frame-drop limitation remains. Stable auto-update records are not changed.

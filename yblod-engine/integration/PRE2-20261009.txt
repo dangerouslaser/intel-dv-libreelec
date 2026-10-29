@@ -1,0 +1,68 @@
+YBLOD 0.2-pre2 packaged release checks
+====================================
+
+Exact build source: 1717d2be138d57bdd898057812d586bfd55dfc7b
+Platform: Generic x86-64, N150 / LG B4, packaged Kodi without executable override.
+
+The final patch removes dvbridge.qsvmode and dvbridge.matchhardware from Kodi
+settings and English strings, removes their reads, and makes both legacy
+runtime values immutable OFF. Old saved values cannot reactivate these paths.
+Hardware decoding, native reconstruction, QMS/VRR and DV menu controls remain.
+
+Build and package
+-----------------
+The changed Kodi dependency set compiled and linked successfully on the
+existing resynced full-image build. The binary was installed with CMake's
+normal kodi-bin component, including removal of the build-tree RPATH.
+The qualified image was repacked with this binary, matching settings/strings,
+and release identification. Filesystem comparison against the original native
+image found changes only in kodi.bin, settings.xml, English strings.po,
+/etc/os-release and /etc/issue. The kernel and native engine are unchanged.
+Both update MD5 payload checks passed. KERNEL and SYSTEM extracted from the
+USB image match the update tar byte-for-byte.
+
+SHA256
+  update tar: ffc45b66bf6471ecf39f083f79a18ae6c3a43ee95bc7ae06cfa13cb6358ed137
+  USB img.gz: 079e3e918f562f2a634d1d133aaa5f85257a11100420d003587e1f8ddc322549
+  SYSTEM: 2a5a8907b0243325c8372c6770ef67025c0f9cb02e012efe47b4b2aa2335df75
+  kodi.bin: 6134d247aa13516cb0801135f3187fccdee1617452336bcf079e88282347fe69
+  native library: c10a12bcd2bfffdb74872bc73655f48a9d70ea16929b861b1d6757a99acda73a
+
+Installed checks
+----------------
+The exact update booted on N150. Installed Kodi, engine, settings and English
+resources match the packaged hashes. Both obsolete settings are absent from
+Settings.GetSettings and Settings.GetSettingValue rejects both with -32602.
+Surviving output-mode and DV menu controls are present; QMS remains enabled.
+
+Three Saving Private Ryan starts at 08:00, with three seconds between stop
+and replay, used the same Kodi process. DV menus were off, passthrough on.
+Runs presented 153/152/153 unique frames, with zero failed commits, no omitted
+consecutive source frames and maximum PTS gaps of 42 ms in each run. These
+are presentation-cadence gaps, NOT reconstruction/render execution times.
+
+Selected P7 and P8.4 clean/controls/controls-closed windows all passed: each
+window presented 101 unique frames, zero failed/backwards commits and no
+missing consecutive source frames. P7 maximum PTS gaps were 42.000/42.000/
+42.001 ms; P8.4 was 41.667 ms in each window. Both clips passed stable pause,
+seek while paused, and resume. No native route exits or queue skips appeared.
+
+DV menu -> P7 movie -> DV menu passed with QMS-adjusted timings, 4K unscaled
+scanout, dithering disabled and RGB 8-bit DV signalling. The hardware timing
+changed from 594000 kHz / 4400x2250 to 594000 kHz / 4400x5630 and back, while
+the movie's requested timing was 296703 kHz / 5500x2250. Menu settings were
+restored afterward. Kodi was left idle on the installed pre2 image.
+
+Boundaries
+----------
+This settings-removal build does not introduce a new picture-processing path.
+Earlier pixel/reference and profile checks are documented in QUALIFICATION-
+20261009.txt; they were not all repeated for this final build. The 4K59.94
+controls-open limitation from STARTUP-HANDOFF-20261009.txt remains: the tested
+Gemini Man window omitted 32 source frames with controls open, while the
+clean and controls-closed windows had no omissions. This is not whole-movie,
+all-device, physical lip-sync, optical blackout or Dolby conformance testing.
+
+The release source bundle contains public source commit 1717d2be and pinned
+upstream playback archives. Later documentation commits do not change this
+image's code or hashes. Stable automatic update records are not modified.

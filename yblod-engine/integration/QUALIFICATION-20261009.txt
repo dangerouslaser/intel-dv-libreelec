@@ -1,0 +1,123 @@
+YBLOD native-engine packaged-image qualification — 2026-10-09
+
+Historical baseline: the later startup fix and 59.94 Hz stress-test results
+are recorded in STARTUP-HANDOFF-20261009.txt. The data below remain tied to
+the original image, not the later fixed build.
+
+Status: in progress, not a release qualification or Dolby conformance claim.
+Tested source: 6ae5040a019c9b8f4e1de60f22a9f690f4cf803d
+Image: LibreELEC-Generic.x86_64-13.0-yblod-native-integration-20261009
+Device: Intel N150, Linux 7.2.9, 3840x2160 output and full-resolution GUI.
+The installed Kodi process loads the packaged native renderer, Intel OpenCL
+runtime and iHD VAAPI driver from /usr, not development-library overrides.
+
+GPU timestamps, first baseline
+Same source-PTS window per clip, separate controls-closed/open playbacks.
+P8.4 uses Sol Levante; P7 FEL uses Saving Private Ryan at 482–484.5 seconds.
+Matched asynchronous queue timestamps; synchronous profiling was disabled.
+
+                           Frames   Median ms   P95 ms   Maximum ms
+P8.4, controls closed          60       18.07     22.92        23.93
+P8.4, controls open            60       21.48     23.27        23.56
+P7 FEL, controls closed        60       23.00     27.24        27.51
+P7 FEL, controls open          59       29.01     32.02        32.11
+
+These are per-frame sums of reconstruction and packing GPU kernel durations,
+including fused movie-overlay composition. They exclude decode, GL skin
+drawing, interop waits and scanout. They are NOT full playback latency and
+must not be derived from, or directly compared with, GPU busy percentages.
+24 fps allows 41.67 ms per frame, but excluded work also needs time.
+This is one short sample per condition, not a distribution across whole movies.
+
+Presentation and controls, profiling disabled
+Selected P5, P8.1, P8.4, genuine P10.1 and P7 FEL scenes pass clean, controls-
+open and controls-closed windows. Each window contains 101 unique successful
+display commits, with no backwards PTS and maximum adjacent PTS gaps of
+41.667 ms (P5/P8.4), 42.000 ms (P8.1), or 42.001 ms (P10.1/P7).
+Pause, seek while paused, and resume pass on each selected scene.
+P5/P8.1/P10.1 also ran sequentially in one process to exercise profile changes.
+These warm-window checks do not establish cold-start behavior or every frame
+of each supported profile. Missing genuine profile fixtures remain a limit.
+
+Open issue: early P7 presentation
+Short startup/seek-to-scene runs show occasional 83–84 ms adjacent committed
+PTS gaps, with profiling both on and off and with controls both closed/open.
+The missing frames were decoded and were pending for reconstruction/presentation
+before a later frame was selected. A debug run logs a one-frame audio-clock
+correction shortly before a skip. A short same-scene audio isolation test found
+zero gaps over 50 ms with decoded PCM audio (maximum 42 ms), then two 83–84 ms
+gaps after restoring passthrough. This implicates audio-clock synchronization
+in the startup behavior, but does not yet establish the underlying timing error
+or a fix. Passthrough remains enabled; disabling it is not an accepted solution.
+Do not dismiss the gaps as profiler overhead or certify cold startup from the
+passing later windows. Queue-skip counters alone do not capture every omission.
+
+Packed-output reference checks
+P8.4, P5 and P7 FEL each passed six 33,177,600-byte packed-frame comparisons
+against the renderer's packing oracle. Selected tails reached their expected
+final PTS and drained successfully with zero failed display commits. These
+checks validate the packing path, not independent Dolby colour conformance or
+every reconstructed sample. Readback perturbs cadence; these are not timing runs.
+The first P7 harness run lacked its required FEL route diagnostic and failed
+that assertion; rerunning with the route log enabled passed the unchanged gate.
+
+Additional lifecycle and startup isolation
+Selected Matrix MEL and synthetic equal-resolution FEL tails pass expected
+final decoded/displayed PTS, successful drain, zero failed display commits and
+the expected composition route. This is endpoint evidence, not every-tail-frame
+cadence qualification.
+The HDMI audio capability state temporarily disappears during the SDR-menu to
+DV-movie switch (~152 ms in one sampled run), causing an audio-sink reopen.
+With DV menus enabled and passthrough retained, two early P7 runs have no gaps
+over 50 ms (maximum 42 ms; 155/154 unique successful commits). The capability
+state still changes briefly, but before movie-clock release, rather than at
+the first movie-frame handoff. This supports a startup-ordering investigation,
+not a claim that DV-menu-off startup is fixed or that audio resets can be ignored.
+Temporary menu changes were restored; no production timing change is included.
+
+Reconstruction and ownership contracts
+The GPU backend harness was rerun against the installed renderer library,
+packaged shaders and drivers, without a development-library search path. Both
+the general and specialized 12-case suites pass: 208,896 component comparisons
+each with zero differences. Pending-frame identity, metadata-mismatch rejection,
+sample-error recovery and polynomial/cache transitions also pass. These are
+synthetic reference tests, not licensed-player conformance or all-media proof.
+Public-source CPU tests also pass under strict Clang C11/O2 with assertions:
+20 specialization-admission checks, 138,276 geometry intervals, and 1,000 output
+ownership transitions including failure quarantine and stale-lease rejection.
+
+P8.4 startup with isolated shader caches
+Empty-cache startup first observed commit: 8.14 s; renderer setup: 7.22 s.
+Restart with verified populated Intel cache: 2.12 s; renderer setup: 1.20 s.
+Both start at PTS zero and pass the first 240 or more distinct commits, maximum
+PTS gap 41.667 ms, no failed/backwards commits. Normal caches were untouched.
+An earlier cache harness omitted creation of Intel's cache directory and
+therefore recompiled twice; those runs are not counted as a warm-cache result.
+This P8.4 result does not close the separate passthrough P7 startup issue.
+
+Setup failure recovery and YBLOD feature smoke
+Injected failures at buffers, engine creation and attachment each recover to
+the native copy-output route. All nine clean/controls/closed windows pass with
+101 unique successful commits and maximum PTS gap 41.667 ms. Pause, paused seek
+and resume pass at all three failure points. This does not simulate a physical
+GPU reset or late driver rejection; those ownership contracts have unit and
+backend evidence, not live hardware-failure certification.
+DV menu -> P7 movie -> DV menu succeeds with passthrough enabled. Hardware
+readback confirms 594 MHz link clock throughout, movie adjusted totals
+4400x5630 versus menu 4400x2250, RGB 8-bit output, no dithering and no plane
+scaling. The software's requested movie mode remains the expected 23.976 Hz
+timing. This exercises the QMS-adjusted timing path, not optical blackout or
+general VRR-range certification. Menu brightness/saturation/gamma/wide-colour
+settings accept test values; original settings are restored afterward. Actual
+colour appearance and physical audio synchronization were not measured.
+
+Remaining qualification boundaries
+- Early P7 startup with SDR menus and audio passthrough remains unresolved.
+- Optical menu appearance/transition blackout and physical audio sync are not
+  certified by software state, timestamps or accepted settings.
+- Selected media and synthetic tests do not establish all-stream/profile or
+  licensed Dolby conformance; missing genuine profile fixtures remain a limit.
+- Final publication/release review. No main merge or prerelease is implied.
+
+No old-pipeline GPU timing comparison was performed for this baseline.
+The earlier CB1 measurements describe other adapters, not this YBLOD image.

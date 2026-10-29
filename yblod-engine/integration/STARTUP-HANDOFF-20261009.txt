@@ -1,0 +1,68 @@
+Native Dolby Vision startup handoff
+==================================
+
+Code: 59b57fc3c392038700b9447c968be41ab2774c4f
+
+The Generic Kodi integration now commits a valid black DV transport frame
+during the native refresh transition, before display-reset releases decoding.
+The movie inherits that signal without another HDMI change at its first frame.
+The reconstruction library, shaders, movie metadata and packing math are unchanged.
+There is no fixed playback delay. Cancellation and a bounded startup timeout
+restore ordinary output; normal DV-menu and HDR10 paths retain their policies.
+DV_PRIVATE_STARTUP_SIGNAL=0 disables the change for diagnostic A/B comparison.
+
+Controlled N150/B4 comparison
+---------------------------
+Same Kodi binary, Saving Private Ryan from 08:00, three starts per configuration,
+three seconds between stop and replay, no Kodi restart within each group.
+QMS enabled; DV menus disabled; audio passthrough enabled. Both Match Dolby
+hardware levels and Quick Sync scaling disabled in both comparison groups.
+Asynchronous profiling and synchronous pixel verification disabled.
+
+                         Start 1    Replay 1    Replay 2
+Old handoff: omitted          1           1           2
+Old handoff: max PTS gap    84 ms       83 ms       84 ms
+New handoff: omitted          0           0           0
+New handoff: max PTS gap    42 ms       42 ms       42 ms
+
+All commits succeeded. HDMI audio capability loss/recovery still occurred, but
+with the new handoff it finished around 0.61-0.63 seconds after opening instead
+of 2.12-2.20 seconds, ahead of the first movie frame and clock release.
+An earlier prototype incorrectly treated the temporary modeset hint as a
+playback-lifetime flag and restored the signal immediately; it was rejected.
+
+Short regression checks passed for P7 and P8.4: clean/controls/controls-closed,
+101 unique frames per measured window, no failed/backwards commits, normal
+PTS spacing, and pause/seek-while-paused/resume. DV-menu/movie/menu hardware
+timings and QMS transition checks passed. Menu settings were restored afterward.
+This is bounded software/device qualification, not physical lip-sync or an
+independent Dolby pixel-conformance test.
+
+4K59.94 stress sample
+--------------------
+Gemini Man, Profile 7, from 08:00, both optional settings still disabled:
+  Clean:           611 unique frames / 10.18 seconds; zero omissions; max 17 ms.
+  Controls open:   337 unique frames /  6.13 seconds; 32 omissions; max 50 ms.
+  Controls closed: 364 unique frames /  6.06 seconds; zero omissions; max 17 ms.
+The 59.94 Hz output mode and native engine were active. Counts come from actual
+successful display-commit PTS, not the less complete Kodi skip counter. Short
+wall-clock windows introduce small fps measurement error; they do not imply
+the source became exactly 60 fps. Startup also had no missing consecutive PTS.
+This sample qualifies clean playback only; 4K59.94 OSD performance remains a
+known limitation. It does not qualify an entire movie or all 60 fps content.
+
+Update package
+--------------
+LibreELEC-Generic.x86_64-13.0-yblod-native-startup-20261009.tar
+SHA256: 13419e2162f923d8687125a9c857fc191bcd8b5e57ad025ad80ee701833cb1b1
+Incremental repack of the previously qualified native integration image with
+the rebuilt, CMake-installed Kodi binary and updated release identification.
+Kernel, drivers, reconstruction library and shader resources are unchanged.
+SYSTEM SHA256: a9991762e945be0dfef0122f7b3977b9af2d5c40321d2e04df1bfc0a086a332e
+Installed Kodi SHA256: 722bdd31f759e38b3e61d425079a7c41acec1bf50f16a9c2ee5f1d8c4f2830ee
+The install step removes the build-tree RPATH, as in a normal Kodi package.
+The packaged image booted successfully on the N150; the installed executable
+matched the hash above. Three further start/replay tests with both settings off
+had zero omitted frames, zero failed commits and maximum PTS gaps of 42 ms.
+Filesystem comparison against the base image found only Kodi, /etc/os-release
+and /etc/issue changed; both update-payload MD5 checks passed.

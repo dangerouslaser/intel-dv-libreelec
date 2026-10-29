@@ -13,7 +13,9 @@
  *     --flip            CB1's flip_y (default off: row 0 is the HDMI top row)
  *     --dump DIR        on a mismatch, both frames as DIR/{cb1,vk}-N.bgra
  *     --node PATH       render node (default /dev/dri/renderD128)
- *     --only cb1|vk     time one engine alone (no comparison)
+ *     --engine vk|cl    YBLOD's engine: Vulkan (default) or OpenCL (Intel NEO;
+ *                       its production settings, /usr/lib/kodi/native-dv.env)
+ *     --only cb1|vk     time one engine alone (no comparison; vk = YBLOD's)
  *     --warmup N        frames left out of the timing (default 12)
  *
  * Timing is per picture on the CPU clock, synchronous (each engine finishes
@@ -30,6 +32,7 @@
 #include "decode.h"
 #include <libavutil/dovi_meta.h>
 #include "../include/dv_engine_vk.h"
+#include <native-dv/dv_source_renderer.h>
 #include "dvbridge_render.h"
 #include "dvbridge_dmabuf.h"
 #include "dvbridge_gl_frame.h"
@@ -61,6 +64,56 @@ static struct {
     void (*reset)(dvvk_engine *);
     void (*destroy)(dvvk_engine *);
 } vk;
+
+/* YBLOD's OpenCL engine, dlopened too. */
+static struct {
+    void *(*create)(uintptr_t, uintptr_t, uintptr_t, unsigned, const char *, unsigned);
+    int (*set_el_scaler)(void *, unsigned);
+    int (*set_fel)(void *, int);
+    int (*submit)(void *, unsigned, unsigned, unsigned, unsigned, const void *, size_t, uint64_t, int64_t,
+                  const dv_source_geometry *, const dv_source_input *);
+    int (*present)(void *, uint64_t, int64_t, unsigned, int);
+    int (*drain)(void *);
+    int (*destroy)(void *);
+} cl;
+
+static int load_opencl(void)
+{
+    void *lib = dlopen("libdv_source_private.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) {
+        fprintf(stderr, "dlopen: %s\n", dlerror());
+        return -1;
+    }
+    cl.create = dlsym(lib, "dv_source_renderer_create_storage");
+    cl.set_el_scaler = dlsym(lib, "dv_source_renderer_set_el_scaler");
+    cl.set_fel = dlsym(lib, "dv_source_renderer_set_fel");
+    cl.submit = dlsym(lib, "dv_source_renderer_submit_input");
+    cl.present = dlsym(lib, "dv_source_renderer_present");
+    cl.drain = dlsym(lib, "dv_source_renderer_drain");
+    cl.destroy = dlsym(lib, "dv_source_renderer_destroy");
+    return cl.create && cl.set_el_scaler && cl.set_fel && cl.submit && cl.present && cl.drain && cl.destroy ? 0 : -1;
+}
+
+/* mpv-yblod's engine_yblod.c load_env_file: KEY=VALUE, no overwrite. */
+static void load_env(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *k = line;
+        while (*k == ' ' || *k == '\t')
+            k++;
+        char *eq = strchr(k, '=');
+        if (*k == '#' || !eq)
+            continue;
+        *eq = 0;
+        eq[1 + strcspn(eq + 1, "\r\n")] = 0;
+        setenv(k, eq + 1, 0);
+    }
+    fclose(f);
+}
 
 static int load_engine(void)
 {
@@ -179,7 +232,7 @@ static void dump_frame(const char *dir, const char *name, int n, const uint8_t *
 int main(int argc, char **argv)
 {
     int frames = 48, fel = 1, ipt = 0, contract = 1, flip = 0, warmup = 12;
-    int run_cb1 = 1, run_vk = 1;
+    int run_cb1 = 1, run_vk = 1, opencl = 0;
     double start = 0;
     const char *file = NULL, *dump = NULL, *node = "/dev/dri/renderD128";
     for (int i = 1; i < argc; i++) {
@@ -193,6 +246,8 @@ int main(int argc, char **argv)
             dump = argv[++i];
         else if (!strcmp(argv[i], "--node") && i + 1 < argc)
             node = argv[++i];
+        else if (!strcmp(argv[i], "--engine") && i + 1 < argc)
+            opencl = !strcmp(argv[++i], "cl");
         else if (!strcmp(argv[i], "--only") && i + 1 < argc) {
             const char *e = argv[++i];
             run_cb1 = !strcmp(e, "cb1");
@@ -213,7 +268,15 @@ int main(int argc, char **argv)
                         "[--flip] [--dump DIR] [--node PATH] FILE\n");
         return 2;
     }
-    if (load_engine())
+    if (opencl) {
+        load_env("/usr/lib/kodi/native-dv.env");
+        setenv("NEO_CACHE_DIR", "/tmp/neo-cache", 0);
+        if (load_opencl())
+            return 1;
+        if (contract)
+            fprintf(stderr, "OpenCL engine: no CB1 contract mode yet; comparing YBLOD's own filters\n");
+        contract = 0;
+    } else if (load_engine())
         return 1;
 
     struct dv_decoder dec;
@@ -276,7 +339,27 @@ int main(int argc, char **argv)
     }
 
     dvvk_engine *vke = NULL;
-    if (vk.create(drm, dec.display, &vke) || vk.set_output(vke, 0, out.fd, out.stride)) {
+    void *ocl = NULL;
+    if (opencl) {
+        /* The OpenCL engine writes a GL texture (CL-GL interop): the output bo's. */
+        const EGLint out_attr[] = {EGL_WIDTH, W, EGL_HEIGHT, H, EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
+                                   EGL_DMA_BUF_PLANE0_FD_EXT, out.fd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+                                   EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)out.stride, EGL_NONE};
+        EGLImageKHR out_image = create_image(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, out_attr);
+        GLuint out_tex;
+        glGenTextures(1, &out_tex);
+        glBindTexture(GL_TEXTURE_2D, out_tex);
+        image_target(GL_TEXTURE_2D, out_image);
+        glFinish();
+        ocl = out_image ? cl.create((uintptr_t)dec.display, (uintptr_t)dpy, (uintptr_t)ctx, out_tex,
+                                    "/usr/share/native-dv", DV_SOURCE_OUTPUT_BGRA) : NULL;
+        if (!ocl) {
+            fprintf(stderr, "OpenCL engine didn't start\n");
+            return 1;
+        }
+        cl.set_el_scaler(ocl, 1);   /* Annex B, Master's EL filter */
+        cl.set_fel(ocl, fel);
+    } else if (vk.create(drm, dec.display, &vke) || vk.set_output(vke, 0, out.fd, out.stride)) {
         fprintf(stderr, "Vulkan engine didn't start\n");
         return 1;
     }
@@ -376,7 +459,21 @@ int main(int argc, char **argv)
         f.plan.refresh = (uint32_t)refresh;
         uint32_t flags = 0;
         t0 = now_ms();
-        int rv = run_vk ? vk.render_sync(vke, &f, &flags) : -1;
+        int rv = -1;
+        if (run_vk && opencl) {
+            dv_source_geometry g = {.width = w, .height = h, .canvas_width = W, .canvas_height = H, .x = x, .y = y,
+                                    .chroma_siting = !el && top_left ? DV_SOURCE_CHROMA_TOP_LEFT
+                                                                     : DV_SOURCE_CHROMA_CENTER_LEFT,
+                                    .destination_width = w, .destination_height = h};
+            dv_source_input in = {sizeof(in), DV_SOURCE_INPUT_P010, 10u};
+            rv = cl.submit(ocl, p.bl_surface, el ? p.el_surface : 0xffffffffu, w, h, meta, meta_size, (uint64_t)n,
+                           p.bl->pts, &g, &in);
+            if (!rv)
+                rv = cl.present(ocl, (uint64_t)n, p.bl->pts, packet_id, refresh);
+            if (cl.drain(ocl))
+                rv = -8;
+        } else if (run_vk)
+            rv = vk.render_sync(vke, &f, &flags);
         dt = now_ms() - t0;
         vk_ms += dt;
         if (run_vk && n > warmup)
@@ -475,7 +572,10 @@ int main(int argc, char **argv)
            total_px, meta_px, border_px, luma_px, luma_max, luma_hist[0], luma_hist[1], luma_hist[2], luma_hist[3],
            luma_hist[4], chroma_px, chroma_max, chroma_hist[0], chroma_hist[1], chroma_hist[2], chroma_hist[3],
            chroma_hist[4], n ? cb1_ms / n : 0, n ? vk_ms / n : 0);
-    vk.destroy(vke);
+    if (vke)
+        vk.destroy(vke);
+    if (ocl)
+        cl.destroy(ocl);
     dvbridge_renderer_destroy(cb1);
     dvbridge_retirement_owner_destroy(&owner);
     pl_tex_destroy(gl->gpu, &target);
