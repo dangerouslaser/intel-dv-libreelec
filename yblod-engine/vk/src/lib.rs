@@ -8,3 +8,4 @@ pub mod gpu;
 pub mod interop;
 pub mod overlay;
 pub mod plan;
+pub mod power;

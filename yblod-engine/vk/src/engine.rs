@@ -215,6 +215,8 @@ impl Profile {
 pub const RING: usize = 4;
 
 pub struct Engine {
+    /// AMD: the COMPUTE power profile while frames come (power.rs).
+    boost: Option<crate::power::Boost>,
     pub d: Device,
     ring: Vec<Ctx>,
     next: usize,
@@ -532,6 +534,7 @@ impl Engine {
             reference_pass: std::cell::Cell::new(false),
             w32: !std::env::var("DVVK_W32").map(|v| v == "0").unwrap_or(false),
             va: va_display,
+            boost: crate::power::Boost::new(drm_fd),
             d,
         })
     }
@@ -860,6 +863,9 @@ impl Engine {
         self.last_plan_ms = plan_start.elapsed().as_secs_f64() * 1e3;
         if status != 0 {
             return Ok((status, 0));
+        }
+        if let Some(b) = &self.boost {
+            b.frame();
         }
         let p = &*self.plan;
         if std::env::var_os("DVVK_TRACE").is_some() {
