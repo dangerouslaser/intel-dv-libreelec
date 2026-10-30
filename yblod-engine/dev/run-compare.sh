@@ -21,5 +21,5 @@ if [ ! -f mr/image.stamp ] || [ "$NEWEST" -nt mr/image.stamp ]; then
 fi
 exec docker run --rm --device /dev/dri/renderD128 --group-add 109 --group-add 44 \
   -v /media-merged:/media-merged:ro -v $PWD/mr/clips:/clips:ro -v "$PWD/mr/dump":/dump \
-  -e LIBVA_DRIVER_NAME=iHD -e DVVK_PROFILE -e DVVK_ANNEXB_FUSED \
+  -e LIBVA_DRIVER_NAME=iHD -e DVVK_PROFILE -e DVVK_ANNEXB_FUSED -e INTEL_MEASURE -e DVVK_CB1_FRAME_QUERY \
   cb1-vk-root:latest /usr/bin/dvvk-mr-compare "$@"
