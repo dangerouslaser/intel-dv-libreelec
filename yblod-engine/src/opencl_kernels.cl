@@ -33,7 +33,8 @@ ushort input_sample(read_only image2d_t src,uint w,uint x,uint y,uint channel,gl
 #endif
 kernel void phase(INPUT_PLANE src,global ushort *dst,uint w,uint h,uint method INPUT_EXTRA){
     uint x=GRID_X(w),y=GRID_Y(w),i=y*w+x;if(i>=w*h)return;int v=0;
-    /* method 2: none, the decoded chroma (CB1's Master Reference contract) */
+    /* method 2: none, the decoded chroma (CB1's Master Reference contract, which
+     * Kodi always uses in this tree); methods 0 and 1 are YBLOD's own pre-filters */
     if(method==2){dst[i]=min(INPUT_AT(src,w,x,y),(ushort)1023);return;}
     if(!method)v=3*(int)INPUT_AT(src,w,x,y)+INPUT_AT(src,w,x,(uint)edge((int)y+1,h));
     else {int c[4]={-9,111,29,-3};for(int k=0;k<4;k++)v+=c[k]*(int)INPUT_AT(src,w,x,(uint)edge((int)y+k-1,h));}

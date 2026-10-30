@@ -14,9 +14,11 @@ the GUI, about 0.2 % of pixels differ by at most one luma or two chroma codes
 (`pow` in the sRGB/PQ conversion). big-fella's docs/vulkan-engine.md has the
 design and the results. Its nearest EL scaler patch is folded into `../src`.
 
-Kodi uses it when Settings > Player > Dolby Vision > Engine is Vulkan
-(packages/graphics/yblod-engine-vk; Kodi patch yblod-23). The OpenCL engine
-stays installed as the fallback.
+In this tree Kodi uses it when *Master Reference engine* is YBLOD (Vulkan)
+(packages/graphics/yblod-engine-vk; Kodi patch
+`kodi-9999-zzzzz-yblod-master-engines.patch`), always with `cb1_contract` set:
+CB1's Master Reference processing, byte for byte. YBLOD's own processing
+(contract unset) stays in the code but isn't used here; see `../README.md`.
 
 Test tools (`tools/`): `dvvk-compare` (OpenCL vs Vulkan on decoded frames),
 `dvvk-routes`, `dvvk-fence`, `vkprobe`, `regress.sh`, and the `dvvk-interop`

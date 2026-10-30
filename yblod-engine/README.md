@@ -1,5 +1,47 @@
 # Native source-domain renderer — work in progress
 
+## In this tree: engines for CB1's Master Reference
+
+Here YBLOD's engines are alternative renderers for CroqueMr's CB1 **Master
+Reference** (setting *Master Reference engine*: CB1, YBLOD Vulkan, YBLOD
+OpenCL). Kodi always runs them in **CB1's contract**:
+
+- Vulkan: `dvvk_plan_in.cb1_contract = 1` (Kodi patch `kodi-9999-zzzzz-yblod-master-engines.patch`, `DVYblodEngine.cpp`)
+- OpenCL: `DV_CB1_CONTRACT=1` (set by the same adapter)
+
+In the contract every step that shapes the picture is CB1's:
+- the stream's chroma siting (left or top-left), also with an EL;
+- 4:2:0 reshaping;
+- no chroma phase pre-filter;
+- CB1's Annex B 4:2:2 output filters (six-tap for left siting; for top-left, aligned rows copied and the eight-tap half phase);
+- the Annex B eight-tap EL upsampling;
+- CB1's metadata serializer (extension block order, L5 always sent, the packet id advancing on a payload change, CB1's refresh rule);
+- for the Vulkan engine, CB1's GUI overlay mix.
+
+`vk/tools/dvvk-mr-compare` checks this byte for byte against CB1 on the same
+decoded frames.
+
+The engines also keep YBLOD's own processing, so that they stay one codebase
+with YBLOD:
+- its siting rule;
+- its chroma pre-filters;
+- its two-tap 4:2:2 blend;
+- resizing;
+- its own GUI colour model.
+
+**Kodi never takes those paths here.** They run only with `dvvk-mr-compare
+--yblod`. When reading the code, the forks are:
+
+| Where | CB1's Master Reference (Kodi) | YBLOD's own (not used here) |
+|---|---|---|
+| `vk/yblod/plan.c` | `in->cb1_contract` set | unset |
+| `vk/shaders/pack.comp` | `chroma_filter != 0` (Annex B), `ANNEXB`, `OVERLAY 3` | `chroma_filter == 0` (two-tap blend), `OVERLAY 1`/`2` |
+| `src/dv_source_renderer.c` | `r->contract` (`DV_CB1_CONTRACT=1`) | not set |
+| `src/source_tunnel.cl` | `SOURCE_ANNEXB` | the `#else` blend |
+| `src/opencl_kernels.cl` `phase` | `method 2` (none) | methods 0 and 1 |
+
+The rest of this file is YBLOD's own notes on the engine.
+
 See [LICENSE](LICENSE) and [source references](SOURCES.md) for distribution
 terms, implementation scope and limitations.
 

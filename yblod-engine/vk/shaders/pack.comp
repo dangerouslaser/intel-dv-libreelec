@@ -403,6 +403,8 @@ uvec2 reconstruct(uint x, uint y, bool odd, uvec2 chroma_rows[8])
             int r[8];
             for (uint i = 0; i < 8; i++)
                 r[i] = int(odd ? chroma_rows[i].y : chroma_rows[i].x);
+            // Kodi always takes the first branch (CB1's Master Reference, the
+            // contract); the 2-tap blend after it is YBLOD's own, unused here.
             if (chroma_filter != 0u) {
                 // CB1 (ETSI GS CCM 001 Annex B): left sited, the six-tap phases;
                 // top-left, aligned rows copied and the half-phase eight-tap

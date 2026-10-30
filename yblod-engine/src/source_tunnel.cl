@@ -298,7 +298,9 @@ kernel void source_tunnel(global const ushort *yplane,
 #else
  global const ushort *chroma=(x&1)?cr:cb;
 #ifdef SOURCE_ANNEXB
- /* CB1's Master Reference (ETSI GS CCM 001 Annex B): left siting, the six-tap
+ /* Kodi's Master Reference always builds this (DV_CB1_CONTRACT=1); the #else
+  * blend is YBLOD's own, unused in this tree.
+  * CB1's Master Reference (ETSI GS CCM 001 Annex B): left siting, the six-tap
   * phases; top-left, aligned rows copied and the half-phase eight-tap between
   * them. Rows clamped to the plane, results to 12 bits. */
  {int r[8],k=(int)(ly/2),last=(int)(sh/2)-1,s;

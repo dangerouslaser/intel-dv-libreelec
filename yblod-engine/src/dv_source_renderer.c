@@ -24,7 +24,9 @@ typedef struct {
     dv_piecewise_surface_settings piecewise_settings;int piecewise_enabled,piecewise,space2_enabled,full_enabled,nv12_enabled,active_rows;
     /* DV_CB1_CONTRACT=1: CB1 Master Reference's spatial contract (the stream's
      * siting with an EL too, 4:2:0 reshaping, no chroma phase pre-filter and
-     * the Annex B 4:2:2 output filters), as yblod-engine-vk's cb1_contract. */
+     * the Annex B 4:2:2 output filters), as yblod-engine-vk's cb1_contract.
+     * Kodi's Master Reference adapter always sets it in this tree; without it
+     * the engine runs YBLOD's own processing (dvvk-mr-compare --yblod only). */
     int contract;dv_packet_sequence sequence;
     cl_program full_program;cl_kernel full_kernel;
     int submitted;unsigned char dm[512];size_t dm_bytes;int overlay_visible;unsigned wait_profiles;

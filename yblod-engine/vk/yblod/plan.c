@@ -167,7 +167,9 @@ int dvvk_plan_frame(const dvvk_plan_in *in, const void *metadata, size_t metadat
         .destination_width = in->dw, .destination_height = in->dh,
     };
     unsigned w = in->width, h = in->height, depth = in->nv12 ? 8 : 10;
-    /* DV_SINGLE_FULL_HEIGHT; CB1 reshapes at 4:2:0 and resamples the result */
+    /* `contract`: CB1's Master Reference processing, which Kodi always asks for
+     * in this tree; without it, YBLOD's own (dvvk-mr-compare --yblod only).
+     * DV_SINGLE_FULL_HEIGHT; CB1 reshapes at 4:2:0 and resamples the result */
     int contract = in->cb1_contract != 0, nv12 = in->nv12 != 0, full = !nv12 && !contract;
     if (!dv_source_geometry_valid(&g))
         return DV_INVALID;
